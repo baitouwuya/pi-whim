@@ -1,0 +1,47 @@
+[workspace]
+members = [
+  "crates/pi-whim-app",
+  "crates/pi-whim-core",
+  "crates/pi-whim-persistence",
+  "crates/pi-whim-pi-rpc",
+  "crates/pi-whim-runtime",
+  "crates/pi-whim-tool-protocol",
+  "crates/pi-whim-ui",
+  "xtask",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Pi-Whim contributors"]
+repository = "https://github.com/pi-whim/pi-whim"
+
+[workspace.dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+crossbeam-channel = "0.5"
+dirs = "6.0"
+eframe = { version = "0.31", default-features = true }
+egui_commonmark = { version = "0.20", default-features = false }
+egui_extras = { version = "0.31", default-features = false }
+fluent-bundle = "0.16"
+keyring = { version = "3.6", features = ["apple-native"] }
+parking_lot = "0.12"
+pulldown-cmark = { version = "0.12", default-features = false }
+rfd = "0.15"
+rusqlite = { version = "0.35", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+ureq = { version = "3.1", features = ["json"] }
+thiserror = "2.0"
+unic-langid = "0.9"
+unicode-segmentation = "1.12"
+uuid = { version = "1.15", features = ["v4", "v5", "serde"] }
+walkdir = "2.5"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

@@ -1,0 +1,9 @@
+/target/
+/.tools/
+/dist/
+/.idea/
+/.DS_Store
+/.env
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal

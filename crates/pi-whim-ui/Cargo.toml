@@ -1,0 +1,15 @@
+[package]
+name = "pi-whim-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+eframe.workspace = true
+egui_commonmark.workspace = true
+egui_extras.workspace = true
+fluent-bundle.workspace = true
+pi-whim-core = { path = "../pi-whim-core" }
+pulldown-cmark.workspace = true
+unic-langid.workspace = true
+uuid.workspace = true
