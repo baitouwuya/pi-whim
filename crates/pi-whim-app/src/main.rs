@@ -29,7 +29,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use attachment_store::AttachmentStore;
-use macos_paste::FinderPasteMonitor;
+use macos_paste::{ClipboardAttachment, FinderPasteMonitor};
 use model_capabilities::ModelCapabilityResolver;
 
 fn main() -> eframe::Result<()> {
@@ -156,7 +156,11 @@ impl Default for PiWhimApplication<PiRpcRuntime> {
 
 impl<R: AgentRuntime> eframe::App for PiWhimApplication<R> {
     fn raw_input_hook(&mut self, context: &egui::Context, raw_input: &mut egui::RawInput) {
-        if !self.workbench.composer_has_focus(context) {
+        let composer_focused = self.workbench.composer_has_focus(context);
+        if let Some(monitor) = self.finder_paste_monitor.as_ref() {
+            monitor.set_composer_focused(composer_focused);
+        }
+        if !composer_focused {
             return;
         }
         raw_input.events.retain(|event| match event {
@@ -205,16 +209,15 @@ impl<R: AgentRuntime> eframe::App for PiWhimApplication<R> {
 
 impl<R: AgentRuntime> PiWhimApplication<R> {
     fn consume_finder_paste(&mut self, context: &egui::Context) {
-        if !self.workbench.composer_has_focus(context) {
-            return;
-        }
-        let paths = self
+        let attachments = self
             .finder_paste_monitor
             .as_ref()
-            .map(FinderPasteMonitor::drain_paths)
+            .map(FinderPasteMonitor::drain_attachments)
             .unwrap_or_default();
-        if !paths.is_empty() {
-            self.add_attachments(paths);
+        for attachment in attachments {
+            if self.workbench.composer_has_focus(context) {
+                self.add_clipboard_attachment(attachment);
+            }
         }
     }
 
@@ -1294,6 +1297,25 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         }
     }
 
+    fn add_clipboard_attachment(&mut self, attachment: ClipboardAttachment) {
+        match attachment {
+            ClipboardAttachment::Paths(paths) => self.add_attachments(paths),
+            ClipboardAttachment::Image {
+                width,
+                height,
+                rgba,
+            } => match self
+                .attachment_store
+                .create_pasted_image(width, height, &rgba)
+            {
+                Ok(attachment) => self
+                    .workbench
+                    .apply(Action::AddComposerAttachment(attachment)),
+                Err(error) => self.error = Some(error),
+            },
+        }
+    }
+
     fn remove_composer_attachment(&mut self, path: &str) {
         let attachment = self
             .workbench
@@ -1304,7 +1326,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             .cloned();
         self.workbench
             .apply(Action::RemoveComposerAttachment(path.to_owned()));
-        if attachment.is_some_and(|attachment| attachment.generated_pasted_text)
+        if attachment.is_some_and(|attachment| attachment.generated_by_app)
             && let Err(error) = self.attachment_store.remove_generated(path)
         {
             self.error = Some(error);
@@ -1317,6 +1339,16 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             && !paths.is_empty()
         {
             self.add_attachments(paths);
+            return true;
+        }
+        if let Ok(mut clipboard) = arboard::Clipboard::new()
+            && let Ok(image) = clipboard.get_image()
+        {
+            self.add_clipboard_attachment(ClipboardAttachment::Image {
+                width: image.width,
+                height: image.height,
+                rgba: image.bytes.into_owned(),
+            });
             return true;
         }
         if is_large_paste(text) {
@@ -2741,7 +2773,7 @@ fn assistant_text(message: &Value) -> String {
     }
 }
 
-fn attachment_from_path(path: &Path, generated_pasted_text: bool) -> Result<Attachment, String> {
+fn attachment_from_path(path: &Path, generated_by_app: bool) -> Result<Attachment, String> {
     let path = path.canonicalize().map_err(|error| error.to_string())?;
     let metadata = path.metadata().map_err(|error| error.to_string())?;
     let kind = if metadata.is_dir() {
@@ -2757,7 +2789,7 @@ fn attachment_from_path(path: &Path, generated_pasted_text: bool) -> Result<Atta
             .into(),
         path: path.to_string_lossy().into_owned(),
         kind,
-        generated_pasted_text,
+        generated_by_app,
     })
 }
 

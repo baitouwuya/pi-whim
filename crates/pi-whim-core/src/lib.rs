@@ -362,10 +362,10 @@ pub struct Attachment {
     /// A canonical absolute path. This is the value supplied to the model.
     pub path: String,
     pub kind: AttachmentKind,
-    /// Only files created by the application's long-paste flow may be deleted
-    /// when an unsent attachment is removed.
-    #[serde(default)]
-    pub generated_pasted_text: bool,
+    /// Only application-created clipboard artifacts may be deleted when an
+    /// unsent attachment is removed.
+    #[serde(default, alias = "generated_pasted_text")]
+    pub generated_by_app: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -813,7 +813,7 @@ mod tests {
             name: "example.txt".into(),
             path: path.into(),
             kind: AttachmentKind::File,
-            generated_pasted_text: false,
+            generated_by_app: false,
         }
     }
 
