@@ -226,10 +226,7 @@ impl FileCoordinator {
         }
         let bytes = fs::read(&path).map_err(|error| io_error("file_not_found", &path, error))?;
         if bytes.len() > MAX_REQUEST_BYTES && arguments.mode == "raw" {
-            return Err(FileError::simple(
-                "file_too_large",
-                format!("raw read exceeds the {} byte limit", MAX_REQUEST_BYTES),
-            ));
+            return Err(raw_read_too_large(&path, bytes.len(), "file"));
         }
         let revision = revision(&bytes);
         let expected_snapshot = arguments
@@ -247,14 +244,29 @@ impl FileCoordinator {
         }
         let queue = json!({ "waited_ms": started.elapsed().as_millis() as u64 });
         if let Some(mime_type) = image_mime(&path, &bytes) {
-            if bytes.len() > MAX_IMAGE_RESPONSE_BYTES {
-                return Err(FileError::simple(
-                    "file_too_large",
-                    format!(
-                        "image exceeds the {} byte coordinator response limit",
-                        MAX_IMAGE_RESPONSE_BYTES
+            if bytes.len() > MAX_REQUEST_BYTES {
+                return Err(raw_read_too_large(&path, bytes.len(), "image"));
+            }
+            if bytes.len() > MAX_IMAGE_RESPONSE_BYTES && arguments.mode != "raw" {
+                let retry = json!({ "path": path, "mode": "raw" });
+                return Err(FileError {
+                    code: "file_too_large",
+                    message: format!(
+                        "image is {} bytes and exceeds the normal {} byte response limit; prefer a subagent for large-file inspection, or retry read with {} to return the complete image (up to {} bytes)",
+                        bytes.len(),
+                        MAX_IMAGE_RESPONSE_BYTES,
+                        retry,
+                        MAX_REQUEST_BYTES
                     ),
-                ));
+                    details: json!({
+                        "path": path,
+                        "bytes": bytes.len(),
+                        "normal_limit_bytes": MAX_IMAGE_RESPONSE_BYTES,
+                        "raw_limit_bytes": MAX_REQUEST_BYTES,
+                        "recommended_action": "delegate large-file inspection to a subagent",
+                        "retry": retry,
+                    }),
+                });
             }
             self.observe(actor, &path, &revision);
             let details = json!({
@@ -264,6 +276,7 @@ impl FileCoordinator {
                 "format": "binary",
                 "mime_type": mime_type,
                 "bytes": bytes.len(),
+                "complete": arguments.mode == "raw" || bytes.len() <= MAX_IMAGE_RESPONSE_BYTES,
                 "queue": queue,
             });
             return Ok(json!({
@@ -841,6 +854,21 @@ fn compression_error(error: file_compression::CompressionError) -> FileError {
     FileError::simple(error.code, error.message)
 }
 
+fn raw_read_too_large(path: &Path, bytes: usize, kind: &str) -> FileError {
+    FileError {
+        code: "file_too_large",
+        message: format!(
+            "{kind} is {bytes} bytes and exceeds the {MAX_REQUEST_BYTES} byte raw-read hard limit; delegate large-file inspection to a subagent"
+        ),
+        details: json!({
+            "path": path,
+            "bytes": bytes,
+            "raw_limit_bytes": MAX_REQUEST_BYTES,
+            "recommended_action": "delegate large-file inspection to a subagent",
+        }),
+    }
+}
+
 impl FileError {
     fn simple(code: &'static str, message: impl Into<String>) -> Self {
         Self {
@@ -1321,6 +1349,61 @@ mod tests {
         assert_eq!(result["details"]["format"], "metadata");
         assert_eq!(result["details"]["size"], 3);
         assert_eq!(result["details"]["file_type"], "file");
+    }
+
+    #[test]
+    fn large_images_recommend_raw_or_subagent_and_raw_returns_all_bytes() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("large.png");
+        let mut image = vec![0; MAX_IMAGE_RESPONSE_BYTES + 1];
+        image[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        fs::write(&path, &image).unwrap();
+        let coordinator = FileCoordinator::for_project(directory.path().to_path_buf());
+
+        let error = coordinator
+            .read(
+                &actor(),
+                "large-image-auto",
+                ReadArguments {
+                    path: path.to_string_lossy().into_owned(),
+                    offset: None,
+                    limit: None,
+                    mode: "auto".into(),
+                    max_tokens: None,
+                    max_bytes: None,
+                    snapshot_id: None,
+                    cursor: None,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "file_too_large");
+        assert!(error.message.contains("mode"));
+        assert!(error.message.contains("raw"));
+        assert!(error.message.contains("subagent"));
+        assert_eq!(error.details["retry"]["mode"], "raw");
+
+        let result = coordinator
+            .read(
+                &actor(),
+                "large-image-raw",
+                ReadArguments {
+                    path: path.to_string_lossy().into_owned(),
+                    offset: None,
+                    limit: None,
+                    mode: "raw".into(),
+                    max_tokens: None,
+                    max_bytes: None,
+                    snapshot_id: None,
+                    cursor: None,
+                },
+            )
+            .unwrap();
+        let returned = BASE64
+            .decode(result["image"]["data"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(returned, image);
+        assert_eq!(result["details"]["bytes"], MAX_IMAGE_RESPONSE_BYTES + 1);
+        assert_eq!(result["details"]["complete"], true);
     }
 
     #[test]

@@ -2,7 +2,8 @@ import * as net from "node:net";
 import { randomUUID } from "node:crypto";
 
 const PROTOCOL_VERSION = 1;
-const MAX_RESPONSE_BYTES = 1024 * 1024;
+// A raw read may carry an 8 MiB image as Base64 plus JSON framing.
+const MAX_RESPONSE_BYTES = 12 * 1024 * 1024;
 
 interface ToolResponse {
 	version: number;
@@ -59,7 +60,7 @@ export async function callAgentHost(
 		socket.on("data", (chunk) => {
 			buffer += chunk.toString("utf8");
 			if (Buffer.byteLength(buffer, "utf8") > MAX_RESPONSE_BYTES) {
-				finish(new Error("Agent supervisor response exceeded 1 MiB"));
+				finish(new Error("Agent supervisor response exceeded 12 MiB"));
 				return;
 			}
 			const newline = buffer.indexOf("\n");

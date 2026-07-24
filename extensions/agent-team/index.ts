@@ -394,10 +394,12 @@ export default function agentTeamExtension(pi: ExtensionAPI) {
 		name: "read",
 		label: "read (coordinated)",
 		description:
-			"The single entry point for reading text, images, directories, and file metadata through the Rust coordinator. UTF-8 text supports bounded paginated reads; PNG, JPEG, GIF, WebP, and BMP return image content; directories return sorted immediate children; unsupported or binary files return metadata.",
+			"The single entry point for reading text, images, directories, and file metadata through the Rust coordinator. UTF-8 text supports bounded paginated reads; PNG, JPEG, GIF, WebP, and BMP return image content; directories return sorted immediate children; unsupported or binary files return metadata. Large images recommend subagent inspection and may be returned completely with mode=raw.",
 		promptSnippet: "Read text, images, directories, or file metadata through the coordinated Rust file gateway",
 		promptGuidelines: [
 			"Use this instead of an image-specific reader; it returns supported image content directly.",
+			"Prefer delegating large-file inspection to a subagent so the parent context stays focused.",
+			"When a large supported image must be returned completely in the current context, retry with mode=raw; raw reads have an 8 MiB hard limit.",
 			"Use offset and limit for exact text ranges or a directory page; directories are immediate children only.",
 			"When the result includes next_cursor, pass it back as cursor; use snapshot_id to detect a stale file or directory.",
 			"Use mode=raw when exact uncompressed content is required.",
