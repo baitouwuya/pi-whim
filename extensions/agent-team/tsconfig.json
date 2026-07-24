@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "allowImportingTsExtensions": true,
+    "baseUrl": "../../vendor/pi-mono",
+    "paths": {
+      "@earendil-works/pi-coding-agent": ["packages/coding-agent/src/index.ts"],
+      "typebox": ["node_modules/typebox"]
+    },
+    "types": ["node"],
+    "typeRoots": ["../../vendor/pi-mono/node_modules/@types"]
+  },
+  "include": ["./*.ts"]
+}

@@ -10,12 +10,13 @@ use pulldown_cmark::{Alignment, Event, Options, Parser, Tag, TagEnd};
 
 const TEXT: Color32 = Color32::from_rgb(37, 47, 61);
 const LINK: Color32 = Color32::from_rgb(58, 101, 151);
-const BORDER: Color32 = Color32::from_rgb(180, 186, 190);
-const TABLE_HEADER: Color32 = Color32::from_rgb(222, 229, 234);
-const TABLE_STRIPE: Color32 = Color32::from_rgb(237, 240, 241);
-const CODE_BACKGROUND: Color32 = Color32::from_rgb(225, 229, 232);
+const BORDER: Color32 = Color32::from_rgb(214, 209, 200);
+const TABLE_HEADER: Color32 = Color32::from_rgb(236, 231, 222);
+const TABLE_STRIPE: Color32 = Color32::from_rgb(244, 241, 235);
+const CODE_BACKGROUND: Color32 = Color32::from_rgb(233, 229, 221);
 const HEADER_HEIGHT: f32 = 38.0;
 const CELL_HORIZONTAL_PADDING: f32 = 10.0;
+const MAX_TABLE_WIDTH: f32 = 760.0;
 
 #[derive(Default)]
 pub(crate) struct MarkdownRenderer {
@@ -258,97 +259,112 @@ fn render_table(ui: &mut Ui, table: &MarkdownTable) {
     }
 
     ui.add_space(8.0);
-    let available_width = ui.available_width().max(240.0);
+    let outer_width = ui.available_width().max(240.0);
+    let available_width = outer_width.min(MAX_TABLE_WIDTH);
+    let left_padding = ((outer_width - available_width) / 2.0).max(0.0);
     let first_column_width = if column_count == 2 {
         (available_width * 0.28).clamp(120.0, 220.0)
     } else {
         available_width / column_count as f32
     };
 
-    let frame = Frame::new()
-        .fill(Color32::from_rgb(247, 247, 245))
-        .stroke(Stroke::new(1.0_f32, BORDER))
-        .corner_radius(4)
-        .inner_margin(Margin::ZERO)
-        .show(ui, |ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
-            ui.set_min_width(ui.available_width());
+    let mut frame_rect = None;
+    ui.horizontal(|ui| {
+        ui.add_space(left_padding);
+        ui.allocate_ui_with_layout(
+            egui::vec2(available_width, 0.0),
+            Layout::top_down(Align::Min),
+            |ui| {
+                let frame = Frame::new()
+                    .fill(Color32::from_rgb(247, 247, 245))
+                    .stroke(Stroke::new(1.0_f32, BORDER))
+                    .inner_margin(Margin::ZERO)
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        ui.set_min_width(ui.available_width());
 
-            let mut builder = TableBuilder::new(ui)
-                .id_salt("markdown-table")
-                .striped(true)
-                .vscroll(false)
-                .resizable(false)
-                .cell_layout(Layout::left_to_right(Align::Center));
+                        let mut builder = TableBuilder::new(ui)
+                            .id_salt("markdown-table")
+                            .striped(true)
+                            .vscroll(false)
+                            .resizable(false)
+                            .cell_layout(Layout::left_to_right(Align::Center));
 
-            if column_count == 1 {
-                builder = builder.column(Column::remainder());
-            } else if column_count == 2 {
-                builder = builder
-                    .column(Column::initial(first_column_width).at_least(100.0))
-                    .column(Column::remainder().at_least(140.0));
-            } else {
-                builder = builder.columns(Column::remainder().at_least(72.0), column_count);
-            }
+                        if column_count == 1 {
+                            builder = builder.column(Column::remainder());
+                        } else if column_count == 2 {
+                            builder = builder
+                                .column(Column::initial(first_column_width).at_least(100.0))
+                                .column(Column::remainder().at_least(140.0));
+                        } else {
+                            builder =
+                                builder.columns(Column::remainder().at_least(72.0), column_count);
+                        }
 
-            builder
-                .header(HEADER_HEIGHT, |mut header| {
-                    for column in 0..column_count {
-                        header.col(|ui| {
-                            ui.painter().rect_filled(ui.max_rect(), 0.0, TABLE_HEADER);
-                            if let Some(cell) = table.header.get(column) {
-                                render_cell(
-                                    ui,
-                                    cell,
-                                    true,
-                                    table
-                                        .alignments
-                                        .get(column)
-                                        .copied()
-                                        .unwrap_or(Alignment::None),
-                                );
-                            }
-                        });
-                    }
-                })
-                .body(|mut body| {
-                    for row in &table.rows {
-                        let height = estimate_row_height(
-                            row,
-                            available_width,
-                            first_column_width,
-                            column_count,
-                        );
-                        body.row(height, |mut table_row| {
-                            for column in 0..column_count {
-                                table_row.col(|ui| {
-                                    if let Some(cell) = row.get(column) {
-                                        render_cell(
-                                            ui,
-                                            cell,
-                                            false,
-                                            table
-                                                .alignments
-                                                .get(column)
-                                                .copied()
-                                                .unwrap_or(Alignment::None),
-                                        );
-                                    }
-                                });
-                            }
-                        });
-                    }
-                });
-        });
+                        builder
+                            .header(HEADER_HEIGHT, |mut header| {
+                                for column in 0..column_count {
+                                    header.col(|ui| {
+                                        ui.painter().rect_filled(ui.max_rect(), 0.0, TABLE_HEADER);
+                                        if let Some(cell) = table.header.get(column) {
+                                            render_cell(
+                                                ui,
+                                                cell,
+                                                true,
+                                                table
+                                                    .alignments
+                                                    .get(column)
+                                                    .copied()
+                                                    .unwrap_or(Alignment::None),
+                                            );
+                                        }
+                                    });
+                                }
+                            })
+                            .body(|mut body| {
+                                for row in &table.rows {
+                                    let height = estimate_row_height(
+                                        row,
+                                        available_width,
+                                        first_column_width,
+                                        column_count,
+                                    );
+                                    body.row(height, |mut table_row| {
+                                        for column in 0..column_count {
+                                            table_row.col(|ui| {
+                                                if let Some(cell) = row.get(column) {
+                                                    render_cell(
+                                                        ui,
+                                                        cell,
+                                                        false,
+                                                        table
+                                                            .alignments
+                                                            .get(column)
+                                                            .copied()
+                                                            .unwrap_or(Alignment::None),
+                                                    );
+                                                }
+                                            });
+                                        }
+                                    });
+                                }
+                            });
+                    });
+                frame_rect = Some(frame.response.rect);
+            },
+        );
+    });
 
-    let separator_y = frame.response.rect.top() + HEADER_HEIGHT;
-    ui.painter().line_segment(
-        [
-            egui::pos2(frame.response.rect.left(), separator_y),
-            egui::pos2(frame.response.rect.right(), separator_y),
-        ],
-        Stroke::new(1.0_f32, BORDER),
-    );
+    if let Some(frame_rect) = frame_rect {
+        let separator_y = frame_rect.top() + HEADER_HEIGHT;
+        ui.painter().line_segment(
+            [
+                egui::pos2(frame_rect.left(), separator_y),
+                egui::pos2(frame_rect.right(), separator_y),
+            ],
+            Stroke::new(1.0_f32, BORDER),
+        );
+    }
     ui.add_space(8.0);
 }
 

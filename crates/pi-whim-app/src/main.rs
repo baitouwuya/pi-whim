@@ -1,3 +1,7 @@
+mod model_capabilities;
+#[cfg(test)]
+mod session_report;
+
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -10,16 +14,19 @@ use eframe::egui;
 use pi_whim_core::{
     Action, AgentStatus, BashPolicy, ConversationItem, ConversationRole, ImageAttachment,
     ModelOption, Project, ProjectId, ProviderId, ProviderModel, ProviderProfile, ProviderProtocol,
-    QueueMode, SessionMetrics, SessionSummary,
+    QueueMode, SearchEngineProfile, SessionMetrics, SessionSummary, SlashCommandInfo,
+    ThinkingLevel, normalize_provider_display_name, provider_name_key, stable_session_id,
 };
 use pi_whim_persistence::{
     AppPreferences, MacosKeychainStore, PreferencesRepository, ProjectRepository,
-    ProviderRepository, SecretStore, SessionRepository, SqliteStore,
+    ProviderRepository, SearchEngineRepository, SecretStore, SessionRepository, SqliteStore,
 };
 use pi_whim_runtime::{AgentRuntime, PiRpcRuntime, RuntimeEvent, RuntimeStart};
 use pi_whim_ui::{SubmitMode, UiIntent, Workbench, install_fonts};
 use serde_json::{Value, json};
 use uuid::Uuid;
+
+use model_capabilities::ModelCapabilityResolver;
 
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
@@ -39,38 +46,74 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-struct PiWhimApplication {
+struct PiWhimApplication<R: AgentRuntime = PiRpcRuntime> {
     workbench: Workbench,
     store: Option<SqliteStore>,
     secrets: MacosKeychainStore,
-    runtime: PiRpcRuntime,
+    runtime: R,
     runtime_events: crossbeam_channel::Receiver<RuntimeEvent>,
     assistant_message_id: Option<String>,
     pending_extension_request: Option<Value>,
+    pending_interactions: Vec<Value>,
+    capability_resolver: ModelCapabilityResolver,
+    running_project: Option<ProjectId>,
+    sessions_root_override: Option<PathBuf>,
+    agent_directory_override: Option<PathBuf>,
+    pending_prompt: Option<(String, Vec<ImageAttachment>, SubmitMode)>,
+    conversation_compacted: bool,
+    /// Item id of the in-progress compaction call card, so compaction_end can
+    /// update the same conversation entry with the result instead of adding a
+    /// second card.
+    compaction_item_id: Option<String>,
     error: Option<String>,
+    notice: Option<String>,
 }
 
-impl Default for PiWhimApplication {
+impl Default for PiWhimApplication<PiRpcRuntime> {
     fn default() -> Self {
         let mut workbench = Workbench::default();
+        let capability_resolver = ModelCapabilityResolver::default();
         let store = SqliteStore::open_default()
             .map_err(|error| error.to_string())
             .ok();
         if let Some(store) = store.as_ref()
             && let Ok(projects) = store.list_projects()
         {
+            let project_ids = projects
+                .iter()
+                .map(|project| project.id)
+                .collect::<Vec<_>>();
             workbench.apply(Action::ProjectsLoaded(projects));
+            for project_id in project_ids {
+                if let Ok(sessions) = store.list_sessions(project_id) {
+                    workbench.apply(Action::SessionsLoaded {
+                        project_id,
+                        sessions,
+                    });
+                }
+            }
         }
         if let Some(store) = store.as_ref()
             && let Ok(preferences) = store.load_preferences()
         {
             workbench.apply(Action::SetLanguage(preferences.language));
             workbench.apply(Action::SetBashPolicy(preferences.bash_policy));
+            workbench.apply(Action::SetBashBlockedPatterns(
+                preferences.bash_blocked_patterns,
+            ));
+            workbench.apply(Action::SetAgentTeamConfig(preferences.agent_team_config));
+        }
+        if let Some(store) = store.as_ref()
+            && let Ok(profiles) = store.list_search_engine_profiles()
+        {
+            workbench.apply(Action::SearchEngineProfilesLoaded(profiles));
         }
         if let Some(store) = store.as_ref()
             && let Ok(mut profiles) = store.list_provider_profiles()
         {
             for profile in &mut profiles {
+                capability_resolver.enrich_profile(profile);
+                let _ = store.save_provider_profile(profile);
                 profile.has_api_key = MacosKeychainStore::default()
                     .get(&provider_keychain_account(profile.id))
                     .ok()
@@ -89,19 +132,30 @@ impl Default for PiWhimApplication {
             runtime_events,
             assistant_message_id: None,
             pending_extension_request: None,
+            pending_interactions: Vec::new(),
+            capability_resolver,
+            running_project: None,
+            sessions_root_override: None,
+            agent_directory_override: None,
+            pending_prompt: None,
+            conversation_compacted: false,
+            compaction_item_id: None,
             error: None,
+            notice: None,
         }
     }
 }
 
-impl eframe::App for PiWhimApplication {
+impl<R: AgentRuntime> eframe::App for PiWhimApplication<R> {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.consume_runtime_events();
+        self.consume_capability_catalog();
         self.workbench.show(context);
         for intent in self.workbench.take_intents() {
             self.handle_intent(intent);
         }
         self.extension_dialog(context);
+        self.interaction_dialog(context);
         if let Some(error) = self.error.clone() {
             let mut open = true;
             egui::Window::new("Pi-Whim error")
@@ -114,15 +168,51 @@ impl eframe::App for PiWhimApplication {
                 self.error = None;
             }
         }
+        if let Some(notice) = self.notice.clone() {
+            let mut open = true;
+            egui::Window::new("Pi-Whim")
+                .open(&mut open)
+                .collapsible(false)
+                .show(context, |ui| {
+                    ui.label(notice);
+                });
+            if !open {
+                self.notice = None;
+            }
+        }
         context.request_repaint_after(std::time::Duration::from_millis(16));
     }
 }
 
-impl PiWhimApplication {
+impl<R: AgentRuntime> PiWhimApplication<R> {
+    fn consume_capability_catalog(&mut self) {
+        if !self.capability_resolver.online_refresh_completed() {
+            return;
+        }
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        let Ok(mut profiles) = store.list_provider_profiles() else {
+            return;
+        };
+        for profile in &mut profiles {
+            let previous = profile.clone();
+            self.capability_resolver.enrich_profile(profile);
+            if *profile != previous {
+                let _ = store.save_provider_profile(profile);
+            }
+        }
+        self.reload_provider_profiles();
+    }
+
     fn handle_intent(&mut self, intent: UiIntent) {
         match intent {
             UiIntent::AddProject => self.add_project(),
             UiIntent::RemoveProject(project_id) => {
+                if self.running_project == Some(project_id) {
+                    let _ = self.runtime.stop();
+                    self.running_project = None;
+                }
                 if let Some(store) = self.store.as_ref()
                     && let Err(error) = store.delete_project(project_id)
                 {
@@ -136,30 +226,15 @@ impl PiWhimApplication {
                 }
             }
             UiIntent::StartProject(project_id) => self.start_project(project_id),
-            UiIntent::StartNewSession => {
-                if self.workbench.state.selected_project.is_none() {
-                    self.error = Some("Select a project before creating a session.".into());
-                    return;
-                }
-                if !self
-                    .workbench
-                    .state
-                    .conversation
-                    .iter()
-                    .any(|message| message.role == ConversationRole::User)
-                {
-                    return;
-                }
-                if let Err(error) = self.runtime.command(json!({"type":"new_session"})) {
-                    self.error = Some(error.to_string());
-                }
-                self.workbench.apply(Action::ClearConversation);
-            }
-            UiIntent::SwitchSession(path) => self.switch_session(path),
+            UiIntent::StartNewSession(project_id) => self.start_new_session(project_id),
+            UiIntent::SwitchSession { project_id, path } => self.switch_session(project_id, path),
             UiIntent::RenameSession { path, title } => self.rename_session(path, title),
             UiIntent::CloneSession => self.clone_session(),
             UiIntent::ForkSession(entry_id) => self.fork_session(entry_id),
             UiIntent::DeleteSession(path) => self.delete_session(path),
+            UiIntent::SetSessionName(name) => self.set_current_session_name(name),
+            UiIntent::ExportSession(path) => self.export_session(path),
+            UiIntent::ShareSession => self.share_session(),
             UiIntent::AddImageAttachment => {
                 if self.workbench.state.selected_project.is_some() {
                     self.add_image_attachment();
@@ -172,6 +247,8 @@ impl PiWhimApplication {
                 attachments,
                 mode,
             } => self.submit_prompt(content, attachments, mode),
+            UiIntent::Compact => self.compact_session(),
+            UiIntent::SetAutoCompaction(enabled) => self.set_auto_compaction(enabled),
             UiIntent::Stop => {
                 if let Err(error) = self.runtime.command(json!({"type":"abort"})) {
                     self.error = Some(error.to_string());
@@ -186,7 +263,18 @@ impl PiWhimApplication {
                 self.save_preferences();
                 self.restart_selected_project();
             }
-            UiIntent::SetModel(model) => self.set_model(model),
+            UiIntent::SetBashBlockedPatterns(patterns) => {
+                self.workbench
+                    .apply(Action::SetBashBlockedPatterns(patterns));
+                self.save_preferences();
+                self.restart_selected_project();
+            }
+            UiIntent::SetAgentTeamConfig(config) => {
+                self.workbench.apply(Action::SetAgentTeamConfig(config));
+                self.save_preferences();
+                self.restart_selected_project();
+            }
+            UiIntent::SetModel(model) => self.queue_model_switch(model),
             UiIntent::SetThinkingLevel(level) => self.set_thinking_level(level),
             UiIntent::SetQueueModes {
                 steering,
@@ -194,12 +282,21 @@ impl PiWhimApplication {
             } => self.set_queue_modes(steering, follow_up),
             UiIntent::SaveProvider { profile, api_key } => self.save_provider(profile, api_key),
             UiIntent::DeleteProvider(profile_id) => self.delete_provider(profile_id),
+            UiIntent::SaveSearchEngines(profiles) => self.save_search_engines(profiles),
+            UiIntent::TestSearchEngine(profile) => self.test_search_engine(profile),
             UiIntent::DiscoverProviderModels {
                 profile_id,
+                provider_name,
                 base_url,
                 protocol,
                 api_key,
-            } => self.discover_provider_models(profile_id, base_url, protocol, api_key),
+            } => self.discover_provider_models(
+                profile_id,
+                provider_name,
+                base_url,
+                protocol,
+                api_key,
+            ),
             UiIntent::RespondExtensionUi {
                 request_id,
                 confirmed,
@@ -243,7 +340,21 @@ impl PiWhimApplication {
     fn reload_projects(&mut self) {
         if let Some(store) = self.store.as_ref() {
             match store.list_projects() {
-                Ok(projects) => self.workbench.apply(Action::ProjectsLoaded(projects)),
+                Ok(projects) => {
+                    let project_ids = projects
+                        .iter()
+                        .map(|project| project.id)
+                        .collect::<Vec<_>>();
+                    self.workbench.apply(Action::ProjectsLoaded(projects));
+                    for project_id in project_ids {
+                        if let Ok(sessions) = store.list_sessions(project_id) {
+                            self.workbench.apply(Action::SessionsLoaded {
+                                project_id,
+                                sessions,
+                            });
+                        }
+                    }
+                }
                 Err(error) => self.error = Some(error.to_string()),
             }
         }
@@ -253,6 +364,8 @@ impl PiWhimApplication {
         let preferences = AppPreferences {
             language: self.workbench.state.language,
             bash_policy: self.workbench.state.bash_policy,
+            bash_blocked_patterns: self.workbench.state.bash_blocked_patterns.clone(),
+            agent_team_config: self.workbench.state.agent_team_config.clone(),
         };
         if let Some(store) = self.store.as_ref()
             && let Err(error) = store.save_preferences(preferences)
@@ -268,6 +381,7 @@ impl PiWhimApplication {
         match store.list_provider_profiles() {
             Ok(mut profiles) => {
                 for profile in &mut profiles {
+                    self.capability_resolver.enrich_profile(profile);
                     profile.has_api_key = self
                         .secrets
                         .get(&provider_keychain_account(profile.id))
@@ -283,6 +397,7 @@ impl PiWhimApplication {
     }
 
     fn save_provider(&mut self, mut profile: ProviderProfile, api_key: Option<String>) {
+        profile.name = normalize_provider_display_name(&profile.name);
         if profile.name.trim().is_empty()
             || profile.base_url.trim().is_empty()
             || profile.models.is_empty()
@@ -290,7 +405,24 @@ impl PiWhimApplication {
             self.error = Some("A provider needs a name, base URL, and at least one model.".into());
             return;
         }
+        if self
+            .workbench
+            .state
+            .provider_profiles
+            .iter()
+            .any(|existing| {
+                existing.id != profile.id
+                    && provider_name_key(&existing.name) == provider_name_key(&profile.name)
+            })
+        {
+            self.error = Some(format!(
+                "A provider named '{}' already exists.",
+                profile.name
+            ));
+            return;
+        }
         profile.base_url = normalize_base_url(&profile.base_url);
+        self.capability_resolver.enrich_profile(&mut profile);
         profile.updated_at_ms = now_ms();
         if let Some(api_key) = api_key {
             if let Err(error) = self
@@ -354,16 +486,71 @@ impl PiWhimApplication {
         self.restart_selected_project();
     }
 
+    fn save_search_engines(&mut self, profiles: Vec<SearchEngineProfile>) {
+        if let Some(invalid) = profiles.iter().find(|profile| {
+            profile.name.trim().is_empty() || !valid_search_engine_url(&profile.base_url)
+        }) {
+            self.error = Some(format!(
+                "Search engine '{}' needs a name and a valid HTTP or HTTPS base URL.",
+                invalid.name
+            ));
+            return;
+        }
+        let profiles = profiles
+            .into_iter()
+            .enumerate()
+            .map(|(position, profile)| {
+                let mut profile = profile.normalized();
+                profile.position = position as u32;
+                profile
+            })
+            .collect::<Vec<_>>();
+        if let Some(store) = self.store.as_ref()
+            && let Err(error) = store.save_search_engine_profiles(&profiles)
+        {
+            self.error = Some(error.to_string());
+            return;
+        }
+        self.workbench
+            .apply(Action::SearchEngineProfilesLoaded(profiles));
+        self.restart_selected_project();
+    }
+
+    fn test_search_engine(&mut self, profile: SearchEngineProfile) {
+        if profile.name.trim().is_empty() || !valid_search_engine_url(&profile.base_url) {
+            self.error =
+                Some("Enter a name and valid HTTP or HTTPS base URL before testing.".into());
+            return;
+        }
+        match test_searxng_engine(&profile) {
+            Ok(()) => {
+                self.notice = Some(format!(
+                    "{} is reachable and returned valid SearXNG JSON.",
+                    profile.name
+                ))
+            }
+            Err(error) => self.error = Some(format!("{} test failed: {error}", profile.name)),
+        }
+    }
+
     fn prepare_pi_configuration(&self) -> Result<HashMap<String, String>, String> {
-        let agent_directory = pi_agent_directory()?;
+        const PI_COMPACTION_KEEP_RECENT_TOKENS: u64 = 100;
+        let agent_directory = self
+            .agent_directory_override
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(pi_agent_directory)?;
         fs::create_dir_all(&agent_directory).map_err(|error| error.to_string())?;
-        let profiles = self
+        let mut profiles = self
             .store
             .as_ref()
             .map(ProviderRepository::list_provider_profiles)
             .transpose()
             .map_err(|error| error.to_string())?
             .unwrap_or_default();
+        for profile in &mut profiles {
+            self.capability_resolver.enrich_profile(profile);
+        }
         let (configured_profiles, mut environment) =
             configured_provider_environment(profiles, |profile_id| {
                 self.secrets
@@ -377,6 +564,29 @@ impl PiWhimApplication {
         )
         .map_err(|error| error.to_string())?;
 
+        // Lower pi-mono's keepRecentTokens (default 20000) so small sessions can be compacted.
+        let settings_path = agent_directory.join("settings.json");
+        let mut settings: Value = fs::read(&settings_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_else(|| json!({}));
+        if let Some(obj) = settings.as_object_mut() {
+            let compaction = obj
+                .entry("compaction".to_string())
+                .or_insert_with(|| json!({}));
+            if let Some(compaction) = compaction.as_object_mut() {
+                compaction.insert(
+                    "keepRecentTokens".to_string(),
+                    Value::from(PI_COMPACTION_KEEP_RECENT_TOKENS),
+                );
+            }
+        }
+        fs::write(
+            &settings_path,
+            serde_json::to_vec_pretty(&settings).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+
         environment.insert(
             "PI_CODING_AGENT_DIR".into(),
             agent_directory.to_string_lossy().into_owned(),
@@ -387,6 +597,7 @@ impl PiWhimApplication {
     fn discover_provider_models(
         &mut self,
         profile_id: Option<ProviderId>,
+        provider_name: String,
         base_url: String,
         protocol: ProviderProtocol,
         supplied_key: Option<String>,
@@ -400,7 +611,11 @@ impl PiWhimApplication {
             })
         });
         match discover_models(&base_url, protocol, key.as_deref()) {
-            Ok(models) if !models.is_empty() => self.workbench.set_discovered_models(models),
+            Ok(mut models) if !models.is_empty() => {
+                self.capability_resolver
+                    .enrich_models(&provider_name, &base_url, &mut models);
+                self.workbench.set_discovered_models(models);
+            }
             Ok(_) => {
                 self.error =
                     Some("The provider returned no models; add a model ID manually.".into())
@@ -419,10 +634,22 @@ impl PiWhimApplication {
     }
 
     fn start_project(&mut self, project_id: ProjectId) {
+        if self.running_project == Some(project_id) {
+            return;
+        }
+        self.launch_project(project_id);
+    }
+
+    fn launch_project(&mut self, project_id: ProjectId) {
         let Some(project) = self.find_project(project_id) else {
             return;
         };
-        let sessions_path = match SqliteStore::sessions_root() {
+        let sessions_path = match self
+            .sessions_root_override
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(SqliteStore::sessions_root)
+        {
             Ok(root) => root.join(project.id.to_string()),
             Err(error) => {
                 self.error = Some(error.to_string());
@@ -442,24 +669,38 @@ impl PiWhimApplication {
         };
         self.workbench
             .apply(Action::SetAgentStatus(AgentStatus::Starting));
-        let extension_path = match ensure_bash_extension(&sessions_path) {
-            Ok(path) => Some(path.to_string_lossy().into_owned()),
+        self.running_project = None;
+        let mut extension_paths = Vec::new();
+        match ensure_agent_team_extension(&sessions_path) {
+            Ok(path) => extension_paths.push(path.to_string_lossy().into_owned()),
             Err(error) => {
+                self.workbench
+                    .apply(Action::SetAgentStatus(AgentStatus::Failed(
+                        error.to_string(),
+                    )));
                 self.error = Some(error.to_string());
-                None
+                return;
             }
-        };
+        }
         environment.insert(
             "PI_WHIM_BASH_POLICY".into(),
             bash_policy_name(&self.workbench.state.bash_policy).into(),
         );
+        environment.insert(
+            "PI_WHIM_BASH_BLOCKED_PATTERNS".into(),
+            serde_json::to_string(&self.workbench.state.bash_blocked_patterns)
+                .unwrap_or_else(|_| "[]".into()),
+        );
         match self.runtime.start(RuntimeStart {
             project_path: project.path,
             sessions_path: sessions_path.to_string_lossy().into_owned(),
-            extension_path,
+            extension_paths,
             environment,
+            agent_team_config: self.workbench.state.agent_team_config.clone(),
+            search_engines: self.workbench.state.search_engine_profiles.clone(),
         }) {
             Ok(()) => {
+                self.running_project = Some(project.id);
                 self.workbench
                     .apply(Action::SetAgentStatus(AgentStatus::Ready));
                 self.discover_sessions(project.id, &sessions_path);
@@ -477,6 +718,13 @@ impl PiWhimApplication {
     }
 
     fn refresh_runtime_controls(&mut self) {
+        let provider_names = self
+            .workbench
+            .state
+            .provider_profiles
+            .iter()
+            .map(|profile| (provider_config_key(profile.id), profile.name.clone()))
+            .collect::<HashMap<_, _>>();
         let state = match self.runtime.command(json!({"type":"get_state"})) {
             Ok(state) => state,
             Err(error) => {
@@ -494,7 +742,7 @@ impl PiWhimApplication {
                 .and_then(|models| serde_json::from_value::<Vec<Value>>(models).ok())
                 .unwrap_or_default()
                 .into_iter()
-                .filter_map(|model| model_option(&model))
+                .filter_map(|model| model_option(&model, &provider_names))
                 .collect(),
             Err(error) => {
                 self.workbench
@@ -504,13 +752,32 @@ impl PiWhimApplication {
                 Vec::new()
             }
         };
-        let thinking_levels = self
+        let mut thinking_levels = self
             .runtime
             .command(json!({"type":"get_available_thinking_levels"}))
             .ok()
             .and_then(|response| response.get("levels").cloned())
             .and_then(|levels| serde_json::from_value::<Vec<String>>(levels).ok())
+            .map(|levels| {
+                levels
+                    .iter()
+                    .filter_map(|level| ThinkingLevel::try_from(level.as_str()).ok())
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
+        if thinking_levels.is_empty() {
+            thinking_levels.push(ThinkingLevel::Off);
+        }
+        let requested_thinking_level = state
+            .get("thinkingLevel")
+            .and_then(Value::as_str)
+            .and_then(|level| ThinkingLevel::try_from(level).ok())
+            .unwrap_or_default();
+        let thinking_level = if thinking_levels.contains(&requested_thinking_level) {
+            requested_thinking_level
+        } else {
+            thinking_levels.first().copied().unwrap_or_default()
+        };
         let steering_mode = state
             .get("steeringMode")
             .and_then(Value::as_str)
@@ -521,21 +788,49 @@ impl PiWhimApplication {
             .and_then(Value::as_str)
             .map(queue_mode)
             .unwrap_or_default();
+        let auto_compaction_enabled = state
+            .get("autoCompactionEnabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
         self.workbench.apply(Action::RuntimeControlsUpdated {
-            current_model: state.get("model").and_then(model_option),
+            current_model: state
+                .get("model")
+                .and_then(|model| model_option(model, &provider_names)),
             available_models: models,
-            thinking_level: state
-                .get("thinkingLevel")
-                .and_then(Value::as_str)
-                .unwrap_or("off")
-                .into(),
+            thinking_level,
             available_thinking_levels: thinking_levels,
+            auto_compaction_enabled,
             steering_mode,
             follow_up_mode,
         });
         if let Ok(metrics) = self.runtime.command(json!({"type":"get_session_stats"})) {
             self.workbench
                 .apply(Action::SessionMetricsUpdated(session_metrics(&metrics)));
+        }
+        if let Ok(response) = self.runtime.command(json!({"type":"get_commands"})) {
+            let commands = response
+                .get("commands")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|command| {
+                    Some(SlashCommandInfo {
+                        name: command.get("name")?.as_str()?.to_owned(),
+                        description: command
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        source: command
+                            .get("source")
+                            .and_then(Value::as_str)
+                            .unwrap_or("command")
+                            .to_owned(),
+                    })
+                })
+                .collect();
+            self.workbench
+                .apply(Action::RuntimeCommandsUpdated(commands));
         }
     }
 
@@ -551,15 +846,53 @@ impl PiWhimApplication {
         self.refresh_runtime_controls();
     }
 
-    fn set_thinking_level(&mut self, level: String) {
+    /// Defer a model switch until the next prompt so the prior model can compact
+    /// the conversation first (cache-friendly). The UI shows the pending model
+    /// immediately while Pi keeps using the old one until the prompt lands.
+    fn queue_model_switch(&mut self, model: ModelOption) {
+        self.workbench.apply(Action::SetPendingModel(Some(model)));
+    }
+
+    /// Apply a deferred model switch: send set_model and refresh controls.
+    fn apply_pending_model(&mut self) {
+        if let Some(model) = self.workbench.state.pending_model.clone() {
+            self.set_model(model);
+            self.workbench.apply(Action::SetPendingModel(None));
+        }
+    }
+
+    fn set_thinking_level(&mut self, level: ThinkingLevel) {
         if let Err(error) = self
             .runtime
-            .command(json!({"type":"set_thinking_level", "level": level}))
+            .command(json!({"type":"set_thinking_level", "level": level.as_str()}))
         {
             self.error = Some(error.to_string());
             return;
         }
         self.refresh_runtime_controls();
+    }
+
+    fn set_auto_compaction(&mut self, enabled: bool) {
+        if let Err(error) = self
+            .runtime
+            .command(json!({"type":"set_auto_compaction", "enabled": enabled}))
+        {
+            self.error = Some(error.to_string());
+            return;
+        }
+        self.refresh_runtime_controls();
+    }
+
+    fn compact_session(&mut self) {
+        if !matches!(self.workbench.state.agent_status, AgentStatus::Ready) {
+            return;
+        }
+        if let Err(error) = self.runtime.send(json!({"type":"compact"})) {
+            self.error = Some(error.to_string());
+            return;
+        }
+        self.workbench
+            .apply(Action::SetAgentStatus(AgentStatus::Compacting));
     }
 
     fn set_queue_modes(&mut self, steering: QueueMode, follow_up: QueueMode) {
@@ -664,7 +997,71 @@ impl PiWhimApplication {
         }
     }
 
-    fn switch_session(&mut self, path: String) {
+    fn start_new_session(&mut self, project_id: ProjectId) {
+        let changed_project = self.running_project != Some(project_id);
+        self.workbench.apply(Action::SelectProject(project_id));
+        if changed_project {
+            self.start_project(project_id);
+            if self.running_project == Some(project_id) {
+                self.workbench.apply(Action::ClearConversation);
+            }
+            return;
+        }
+        if !self
+            .workbench
+            .state
+            .conversation
+            .iter()
+            .any(|message| message.role == ConversationRole::User)
+        {
+            return;
+        }
+        if let Err(error) = self.runtime.command(json!({"type":"new_session"})) {
+            self.error = Some(error.to_string());
+            return;
+        }
+        self.workbench.apply(Action::ClearConversation);
+        // pi-mono defers writing the session JSONL until the first assistant
+        // response (its newSession contract), so the sidebar's disk scan would
+        // not see the new session. Persist a placeholder summary so it shows up
+        // immediately; a later refresh replaces it once the file is written.
+        let placeholder_path = self
+            .runtime
+            .command(json!({"type":"get_state"}))
+            .ok()
+            .and_then(|state| {
+                state
+                    .get("sessionFile")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
+        if let (Some(store), Some(path)) = (self.store.as_ref(), placeholder_path) {
+            let summary = SessionSummary {
+                id: stable_session_id(&path),
+                project_id,
+                pi_path: path,
+                title: String::new(),
+                preview: String::new(),
+                updated_at_ms: now_ms(),
+            };
+            let session_id = summary.id;
+            let _ = store.save_session(&summary);
+            if let Ok(sessions) = store.list_sessions(project_id) {
+                self.workbench
+                    .apply(Action::SessionsLoaded { project_id, sessions });
+            }
+            self.workbench.apply(Action::SelectSession(session_id));
+        }
+    }
+
+    fn switch_session(&mut self, project_id: ProjectId, path: String) {
+        self.workbench.apply(Action::SelectProject(project_id));
+        if self.running_project != Some(project_id) {
+            self.start_project(project_id);
+            if self.running_project != Some(project_id) {
+                return;
+            }
+        }
         if let Err(error) = self
             .runtime
             .command(json!({"type":"switch_session", "sessionPath": path}))
@@ -674,6 +1071,9 @@ impl PiWhimApplication {
         }
         self.workbench.apply(Action::ClearConversation);
         let _ = self.load_current_entries();
+        // Pi restores the session's last recorded model during switch_session.
+        // Refresh the picker so it reflects that restored model immediately.
+        self.refresh_runtime_controls();
     }
 
     fn rename_session(&mut self, path: String, title: String) {
@@ -693,6 +1093,65 @@ impl PiWhimApplication {
         }
         if let Some(project_id) = self.workbench.state.selected_project {
             self.index_session(project_id, &path, Some(&title));
+        }
+        self.refresh_runtime_controls();
+    }
+
+    fn set_current_session_name(&mut self, name: String) {
+        let Some(state) = self.runtime.command(json!({"type":"get_state"})).ok() else {
+            return;
+        };
+        let Some(path) = state.get("sessionFile").and_then(Value::as_str) else {
+            self.error = Some("No active session to name.".into());
+            return;
+        };
+        let name = name.trim().to_owned();
+        if name.is_empty() {
+            self.error = Some("Usage: /name <name>".into());
+            return;
+        }
+        self.rename_session(path.to_owned(), name);
+    }
+
+    fn export_session(&mut self, requested_path: Option<String>) {
+        let output_path = requested_path.filter(|path| !path.trim().is_empty());
+        let mut command = json!({"type": "export_html"});
+        if let Some(output_path) = output_path {
+            command["outputPath"] = Value::String(output_path);
+        }
+        let response = self.runtime.command(command);
+        match response {
+            Ok(value) => {
+                if let Some(path) = value.get("path").and_then(Value::as_str) {
+                    self.error = Some(format!("Session exported to {path}"));
+                }
+            }
+            Err(error) => self.error = Some(error.to_string()),
+        }
+    }
+
+    fn share_session(&mut self) {
+        let Some(path) = self
+            .runtime
+            .command(json!({"type":"export_html"}))
+            .ok()
+            .and_then(|value| value.get("path").and_then(Value::as_str).map(str::to_owned))
+        else {
+            self.error = Some("Could not export the session for sharing.".into());
+            return;
+        };
+        let output = std::process::Command::new("gh")
+            .args(["gist", "create", "--public=false", &path])
+            .output();
+        match output {
+            Ok(output) if output.status.success() => {
+                let url = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                self.error = Some(format!("Share URL: {url}"));
+            }
+            Ok(output) => {
+                self.error = Some(String::from_utf8_lossy(&output.stderr).trim().to_string());
+            }
+            Err(error) => self.error = Some(format!("GitHub CLI unavailable: {error}")),
         }
     }
 
@@ -803,16 +1262,53 @@ impl PiWhimApplication {
             reveal_credit: 0.0,
             streaming: false,
             tool_name: None,
+            tool_report: None,
             tool_details: None,
             is_error: false,
+            model: None,
             attachments: attachments.clone(),
         };
         self.workbench.apply(Action::UpsertConversation(item));
+        // A deferred model switch waits until the prompt that continues the
+        // conversation, so the prior model compacts the existing history first
+        // (cache-friendly). Skip when there's nothing to compact or it just did.
+        if matches!(mode, SubmitMode::Prompt)
+            && self.workbench.state.pending_model.is_some()
+            && !self.conversation_compacted
+            && self
+                .workbench
+                .state
+                .conversation
+                .iter()
+                .any(|message| message.role != ConversationRole::User)
+        {
+            self.pending_prompt = Some((content, attachments, mode));
+            if let Err(error) = self.runtime.send(json!({"type":"compact"})) {
+                self.error = Some(error.to_string());
+                self.pending_prompt = None;
+                return;
+            }
+            self.workbench
+                .apply(Action::SetAgentStatus(AgentStatus::Compacting));
+            return;
+        }
+        if self.workbench.state.pending_model.is_some() {
+            self.apply_pending_model();
+        }
+        self.send_prompt(content, attachments, mode);
+    }
+
+    fn send_prompt(
+        &mut self,
+        content: String,
+        attachments: Vec<ImageAttachment>,
+        mode: SubmitMode,
+    ) {
         let result = match mode {
             SubmitMode::Prompt => {
                 let mut command = json!({"type":"prompt", "message": content});
                 if !attachments.is_empty() {
-                    command["images"] = Value::Array(attachments.iter().map(|attachment| json!({"type":"image", "data":attachment.base64_data, "mimeType":attachment.mime_type})).collect());
+                    command["images"] = Value::Array(attachments.iter().map(|attachment| json!({"type":"image","data":attachment.base64_data,"mimeType":attachment.mime_type})).collect());
                 }
                 self.runtime.send(command)
             }
@@ -870,6 +1366,7 @@ impl PiWhimApplication {
             match event {
                 RuntimeEvent::Agent(value) => self.apply_agent_event(value),
                 RuntimeEvent::ExtensionUi(value) => self.pending_extension_request = Some(value),
+                RuntimeEvent::Interaction(value) => self.pending_interactions.push(value),
                 RuntimeEvent::Stderr(message) => {
                     if !message.trim().is_empty() {
                         self.error = Some(message);
@@ -877,6 +1374,7 @@ impl PiWhimApplication {
                 }
                 RuntimeEvent::Exited { generation, code } => {
                     if generation == self.runtime.generation() {
+                        self.running_project = None;
                         self.workbench
                             .apply(Action::SetAgentStatus(AgentStatus::Failed(format!(
                                 "Pi exited: {code:?}"
@@ -894,6 +1392,9 @@ impl PiWhimApplication {
             Some("message_start") | Some("message_update") => {
                 let message = event.get("message").cloned().unwrap_or(Value::Null);
                 if message.get("role").and_then(Value::as_str) == Some("assistant") {
+                    // A new assistant reply means the conversation grew past the
+                    // last compaction; a later model switch should compact again.
+                    self.conversation_compacted = false;
                     let id = message
                         .get("id")
                         .and_then(Value::as_str)
@@ -921,8 +1422,13 @@ impl PiWhimApplication {
                             reveal_credit: 0.0,
                             streaming: true,
                             tool_name: None,
+                            tool_report: None,
                             tool_details: None,
                             is_error: false,
+                            model: message
+                                .get("model")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
                             attachments: Vec::new(),
                         }));
                 }
@@ -986,12 +1492,84 @@ impl PiWhimApplication {
                 }
             }
             Some("thinking_level_changed") => self.refresh_runtime_controls(),
-            Some("compaction_start") => self
-                .workbench
-                .apply(Action::SetAgentStatus(AgentStatus::Compacting)),
-            Some("compaction_end") => self
-                .workbench
-                .apply(Action::SetAgentStatus(AgentStatus::Ready)),
+            Some("compaction_start") => {
+                let item_id = format!("compaction-{}", now_ms());
+                self.compaction_item_id = Some(item_id.clone());
+                self.workbench
+                    .apply(Action::UpsertConversation(ConversationItem {
+                        id: item_id,
+                        role: ConversationRole::Tool,
+                        full_text: "Compacting…".into(),
+                        revealed_graphemes: 0,
+                        reveal_credit: 0.0,
+                        streaming: false,
+                        tool_name: Some("compact".into()),
+                        tool_report: None,
+                        tool_details: None,
+                        is_error: false,
+                        model: None,
+                        attachments: Vec::new(),
+                    }));
+                self.workbench
+                    .apply(Action::SetAgentStatus(AgentStatus::Compacting));
+            }
+            Some("compaction_end") => {
+                let error = event.get("errorMessage").and_then(Value::as_str);
+                self.conversation_compacted = error.is_none();
+                let benign = error.is_some_and(|e| e.contains("Nothing to compact"));
+                let status = match error {
+                    Some(_) if benign => AgentStatus::Ready,
+                    Some(e) => AgentStatus::Failed(e.to_owned()),
+                    None => AgentStatus::Ready,
+                };
+                self.workbench.apply(Action::SetAgentStatus(status));
+                if let Some(item_id) = self.compaction_item_id.take() {
+                    let (text, is_error) = match error {
+                        Some(_) if benign => {
+                            ("Nothing to compact (session too small)".to_owned(), false)
+                        }
+                        Some(e) => (e.to_owned(), true),
+                        None => {
+                            let result = event.get("result");
+                            let before = result
+                                .and_then(|r| r.get("tokensBefore"))
+                                .and_then(Value::as_i64);
+                            let after = result
+                                .and_then(|r| r.get("estimatedTokensAfter"))
+                                .and_then(Value::as_i64);
+                            match (before, after) {
+                                (Some(b), Some(a)) => {
+                                    (format!("Compacted context · {b} → {a} tokens"), false)
+                                }
+                                _ => ("Compacted context".to_owned(), false),
+                            }
+                        }
+                    };
+                    self.workbench
+                        .apply(Action::UpsertConversation(ConversationItem {
+                            id: item_id,
+                            role: ConversationRole::Tool,
+                            full_text: text,
+                            revealed_graphemes: 0,
+                            reveal_credit: 0.0,
+                            streaming: false,
+                            tool_name: Some("compact".into()),
+                            tool_report: None,
+                            tool_details: None,
+                            is_error,
+                            model: None,
+                            attachments: Vec::new(),
+                        }));
+                }
+                // After a switch-triggered compaction, apply the pending model
+                // and send the prompt that was held back.
+                if let Some((content, attachments, mode)) = self.pending_prompt.take() {
+                    if self.workbench.state.pending_model.is_some() {
+                        self.apply_pending_model();
+                    }
+                    self.send_prompt(content, attachments, mode);
+                }
+            }
             Some("entry_appended") => {
                 if let Some(entry) = event.get("entry") {
                     self.apply_session_entry(entry);
@@ -1011,10 +1589,31 @@ impl PiWhimApplication {
             .and_then(Value::as_str)
             .unwrap_or(name)
             .to_owned();
-        let content = event
-            .get("result")
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| format!("{name} is running…"));
+        let is_error = event
+            .get("isError")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let previous = self
+            .workbench
+            .state
+            .conversation
+            .iter()
+            .find(|message| message.id == id.as_str())
+            .map(|message| (message.tool_report.clone(), message.tool_details.clone()));
+        let previous_report = previous.as_ref().and_then(|(report, _)| report.as_deref());
+        let previous_details = previous
+            .as_ref()
+            .and_then(|(_, details)| details.as_deref());
+        let (content, tool_report) = match event.get("type").and_then(Value::as_str) {
+            Some("tool_execution_end") => {
+                let result_content = event.get("result").and_then(|result| result.get("content"));
+                (
+                    tool_result_summary(Some(name), result_content, is_error),
+                    tool_result_report(Some(name), result_content, previous_report, is_error),
+                )
+            }
+            _ => ("Running…".into(), tool_call_report(name, event.get("args"))),
+        };
         self.workbench
             .apply(Action::UpsertConversation(ConversationItem {
                 id,
@@ -1024,8 +1623,10 @@ impl PiWhimApplication {
                 reveal_credit: 0.0,
                 streaming: false,
                 tool_name: Some(name.into()),
-                tool_details: Some(event.to_string()),
-                is_error: false,
+                tool_report: Some(tool_report),
+                tool_details: Some(tool_event_details(event, previous_details)),
+                is_error,
+                model: None,
                 attachments: Vec::new(),
             }));
     }
@@ -1045,8 +1646,20 @@ impl PiWhimApplication {
             .and_then(Value::as_str)
             .unwrap_or("entry")
             .to_owned();
+        let is_tool = role == ConversationRole::Tool;
+        let tool_name = message
+            .get("toolName")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let is_error = message
+            .get("isError")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let text = match role {
             ConversationRole::Assistant => assistant_text(message),
+            ConversationRole::Tool => {
+                tool_result_summary(tool_name.as_deref(), message.get("content"), is_error)
+            }
             _ => content_text(message.get("content")).unwrap_or_else(|| message.to_string()),
         };
         self.workbench
@@ -1057,22 +1670,28 @@ impl PiWhimApplication {
                 revealed_graphemes: 0,
                 reveal_credit: 0.0,
                 streaming: false,
-                tool_name: message
-                    .get("toolName")
+                tool_name,
+                tool_report: is_tool.then(|| {
+                    tool_result_report(
+                        message.get("toolName").and_then(Value::as_str),
+                        message.get("content"),
+                        None,
+                        is_error,
+                    )
+                }),
+                tool_details: is_tool.then(|| message.to_string()),
+                is_error,
+                model: message
+                    .get("model")
                     .and_then(Value::as_str)
                     .map(str::to_owned),
-                tool_details: None,
-                is_error: message
-                    .get("isError")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
                 attachments: Vec::new(),
             }));
     }
 
     fn restart_selected_project(&mut self) {
         if let Some(project) = self.workbench.state.selected_project {
-            self.start_project(project);
+            self.launch_project(project);
         }
     }
 
@@ -1118,6 +1737,66 @@ impl PiWhimApplication {
         });
         if !open {
             self.pending_extension_request = None;
+        }
+    }
+
+    /// This is the single native chooser used for root-owned approvals and
+    /// questions. Pi's extension confirmations keep using their RPC response,
+    /// while supervisor interactions return through the team tool host.
+    fn interaction_dialog(&mut self, context: &egui::Context) {
+        let Some(request) = self.pending_interactions.first().cloned() else {
+            return;
+        };
+        let request_id = request["request_id"].as_str().unwrap_or_default();
+        let kind = request["kind"].as_str().unwrap_or("question");
+        let title = request["title"].as_str().unwrap_or("Agent request");
+        let message = request["message"].as_str().unwrap_or_default();
+        let options = request["options"].as_array().cloned().unwrap_or_default();
+        let cancel_decision = request["default_option"]
+            .as_str()
+            .filter(|option| {
+                options
+                    .iter()
+                    .any(|candidate| candidate.as_str() == Some(*option))
+            })
+            .unwrap_or(if kind == "approval" { "deny" } else { "cancel" });
+        let mut open = true;
+        egui::Window::new(title)
+            .open(&mut open)
+            .collapsible(false)
+            .show(context, |ui| {
+                ui.label(message);
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    for option in &options {
+                        let Some(option) = option.as_str() else {
+                            continue;
+                        };
+                        let label = match (kind, option) {
+                            ("approval", "approve") => "Allow once",
+                            ("approval", "deny") => "Deny",
+                            _ => option,
+                        };
+                        if ui.button(label).clicked() {
+                            if let Err(error) = self
+                                .runtime
+                                .resolve_user_interaction(request_id.to_owned(), option.to_owned())
+                            {
+                                self.error = Some(error.to_string());
+                            }
+                            self.pending_interactions.remove(0);
+                        }
+                    }
+                });
+            });
+        if !open {
+            if let Err(error) = self
+                .runtime
+                .resolve_user_interaction(request_id.to_owned(), cancel_decision.into())
+            {
+                self.error = Some(error.to_string());
+            }
+            self.pending_interactions.remove(0);
         }
     }
 }
@@ -1174,6 +1853,39 @@ fn normalize_base_url(value: &str) -> String {
     value.trim().trim_end_matches('/').to_owned()
 }
 
+fn valid_search_engine_url(value: &str) -> bool {
+    let value = normalize_base_url(value);
+    let Some((scheme, rest)) = value.split_once("://") else {
+        return false;
+    };
+    matches!(scheme, "http" | "https") && !rest.is_empty() && !rest.starts_with('/')
+}
+
+fn test_searxng_engine(profile: &SearchEngineProfile) -> Result<(), String> {
+    let endpoint = format!("{}/search", normalize_base_url(&profile.base_url));
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(6)))
+        .max_redirects(0)
+        .build()
+        .new_agent();
+    let mut response = agent
+        .get(&endpoint)
+        .query("q", "pi-whim")
+        .query("format", "json")
+        .query("categories", "general")
+        .header("Accept", "application/json")
+        .call()
+        .map_err(|error| error.to_string())?;
+    let body: Value = response
+        .body_mut()
+        .read_json()
+        .map_err(|error| format!("invalid JSON response: {error}"))?;
+    if body.get("results").and_then(Value::as_array).is_none() {
+        return Err("response has no results array".into());
+    }
+    Ok(())
+}
+
 /// Pi accepts an environment reference here, keeping API keys out of models.json.
 fn pi_models_json(profiles: &[ProviderProfile]) -> Value {
     let providers = profiles
@@ -1187,6 +1899,7 @@ fn pi_models_json(profiles: &[ProviderProfile]) -> Value {
                         "id": model.id,
                         "name": model.name,
                         "reasoning": model.reasoning,
+                        "thinkingLevelMap": model.thinking_level_map,
                         "input": if model.supports_images { json!(["text", "image"]) } else { json!(["text"]) },
                         "contextWindow": 128000,
                         "maxTokens": 16384,
@@ -1327,13 +2040,20 @@ fn join_api_path(base_url: &str, suffix: &str) -> String {
         format!("{base_url}/{suffix}")
     }
 }
-fn stable_session_id(path: &str) -> Uuid {
-    Uuid::new_v5(&Uuid::NAMESPACE_URL, path.as_bytes())
-}
-
-fn model_option(value: &Value) -> Option<ModelOption> {
+fn model_option(value: &Value, provider_names: &HashMap<String, String>) -> Option<ModelOption> {
+    let provider = value.get("provider")?.as_str()?.to_owned();
     Some(ModelOption {
-        provider: value.get("provider")?.as_str()?.into(),
+        provider_name: provider_names
+            .get(&provider)
+            .cloned()
+            .or_else(|| {
+                value
+                    .get("providerName")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| provider.clone()),
+        provider,
         id: value.get("id")?.as_str()?.into(),
         name: value
             .get("name")
@@ -1390,6 +2110,524 @@ fn content_text(value: Option<&Value>) -> Option<String> {
         _ => None,
     }
 }
+
+fn tool_result_summary(tool_name: Option<&str>, content: Option<&Value>, is_error: bool) -> String {
+    let text = content_text(content).unwrap_or_default();
+    if !is_error
+        && let Some(summary) = tool_name.and_then(|name| agent_team_tool_summary(name, &text))
+    {
+        return summary;
+    }
+    let text = compact_tool_text(&text);
+    match (is_error, text.is_empty()) {
+        (true, true) => "Failed".into(),
+        (true, false) => format!("Failed: {text}"),
+        (false, true) => "Completed".into(),
+        (false, false) => text,
+    }
+}
+
+fn tool_call_report(name: &str, arguments: Option<&Value>) -> String {
+    let argument = |key| {
+        arguments
+            .and_then(|value| value.get(key))
+            .and_then(Value::as_str)
+    };
+    match name {
+        "bash" => {
+            let command = argument("command")
+                .map(compact_tool_text)
+                .unwrap_or_default();
+            let background = arguments
+                .and_then(|value| value.get("background"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if command.is_empty() {
+                "Running Bash command.".into()
+            } else if background {
+                format!("Starting background command: {command}")
+            } else {
+                format!("Running command: {command}")
+            }
+        }
+        "list_processes" => "Listing background processes.".into(),
+        "read_process" => format!(
+            "Reading process {}.",
+            argument("process_id").unwrap_or("unknown")
+        ),
+        "stop_process" => format!(
+            "Stopping process {}.",
+            argument("process_id").unwrap_or("unknown")
+        ),
+        "read" => format!("Reading {}.", argument("path").unwrap_or("file")),
+        "write" => format!("Writing {}.", argument("path").unwrap_or("file")),
+        "edit" => format!("Editing {}.", argument("path").unwrap_or("file")),
+        "spawn_agent" => {
+            let agent = argument("name").unwrap_or("subagent");
+            let task = argument("task").map(compact_tool_text).unwrap_or_default();
+            if task.is_empty() {
+                format!("Starting {agent}.")
+            } else {
+                format!("Starting {agent}:\n{task}")
+            }
+        }
+        "send_message" => {
+            let target = argument("target").unwrap_or("agent");
+            let message = argument("message").unwrap_or_default();
+            if message.is_empty() {
+                format!("Sending a message to {target}.")
+            } else {
+                format!("Sending to {target}:\n{message}")
+            }
+        }
+        "wait_agent" => format!("Waiting for {}.", argument("target").unwrap_or("agent")),
+        "interrupt_agent" => format!("Interrupting {}.", argument("target").unwrap_or("agent")),
+        "list_agents" => "Listing visible agents.".into(),
+        "read_messages" => "Reading queued messages.".into(),
+        "read_session" => format!(
+            "Reading session {}.",
+            argument("session_id").unwrap_or("unknown")
+        ),
+        "list_sessions" => "Discovering retained sessions.".into(),
+        "search_sessions" => {
+            let query = argument("query").unwrap_or_default();
+            if query.is_empty() {
+                "Searching retained sessions.".into()
+            } else {
+                format!("Searching sessions for: {}", compact_tool_text(query))
+            }
+        }
+        _ => "Running.".into(),
+    }
+}
+
+fn tool_result_report(
+    tool_name: Option<&str>,
+    content: Option<&Value>,
+    initial_report: Option<&str>,
+    is_error: bool,
+) -> String {
+    let text = content_text(content).unwrap_or_default();
+    if tool_name == Some("bash") && !is_error {
+        let result = compact_tool_text(&text);
+        let prefix = initial_report.unwrap_or("Bash command");
+        return if result.is_empty() {
+            format!("{prefix}\nCompleted.")
+        } else {
+            format!("{prefix}\nResult: {result}")
+        };
+    }
+    if !is_error
+        && let Some(report) =
+            tool_name.and_then(|name| agent_team_tool_report(name, &text, initial_report))
+    {
+        return report;
+    }
+    if text.trim().is_empty() {
+        return if is_error {
+            "Failed without a reported message.".into()
+        } else {
+            "Completed.".into()
+        };
+    }
+    if is_error {
+        format!("Failed:\n{text}")
+    } else {
+        text
+    }
+}
+
+fn agent_team_tool_report(name: &str, text: &str, initial_report: Option<&str>) -> Option<String> {
+    let result: Value = serde_json::from_str(text).ok()?;
+    match name {
+        "list_processes" => {
+            let processes = result.get("processes")?.as_array()?;
+            let running = processes
+                .iter()
+                .filter(|process| process.get("status").and_then(Value::as_str) == Some("running"))
+                .count();
+            Some(format!(
+                "{} background process(es), {running} running",
+                processes.len()
+            ))
+        }
+        "read_process" => {
+            let process = result.get("process")?;
+            let id = process.get("id")?.as_str()?;
+            let status = process
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            Some(format!("Process {id} · {status}"))
+        }
+        "stop_process" => {
+            let id = result
+                .get("process")
+                .and_then(|process| process.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or("process");
+            Some(format!("Stopped process {id}"))
+        }
+        "spawn_agent" => {
+            let agent = result.get("name")?.as_str()?;
+            let level = result.get("level")?.as_u64()?;
+            Some(format!("Created {agent} at level {level}."))
+        }
+        "send_message" => {
+            let mut report = initial_report
+                .map(str::to_owned)
+                .unwrap_or_else(|| "Sending an agent message.".into());
+            if result.get("delivered").and_then(Value::as_bool) == Some(true) {
+                let count = result.get("count").and_then(Value::as_u64).unwrap_or(1);
+                if result.get("queued").and_then(Value::as_bool) == Some(true) {
+                    report.push_str("\n\nQueued for delivery when the level-0 session resumes.");
+                } else {
+                    report.push_str(&format!("\n\nDelivered to {count} agent(s)."));
+                }
+            }
+            Some(report)
+        }
+        "list_agents" => {
+            let agents = result.get("agents")?.as_array()?;
+            let lines: Vec<_> = agents
+                .iter()
+                .filter_map(|agent| {
+                    let name = agent.get("name")?.as_str()?;
+                    let level = agent.get("level")?.as_u64()?;
+                    let status = agent
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    let session_id = agent
+                        .get("session_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    Some(format!(
+                        "- {name} · level {level} · {status} · session {session_id}"
+                    ))
+                })
+                .collect();
+            Some(if lines.is_empty() {
+                "No agents are visible.".into()
+            } else {
+                format!("Visible agents:\n{}", lines.join("\n"))
+            })
+        }
+        "read_messages" => {
+            let messages = result.get("messages")?.as_array()?;
+            Some(agent_message_report(messages, "No queued messages."))
+        }
+        "read_session" => {
+            let agent = result.get("agent")?;
+            let name = agent.get("name")?.as_str()?;
+            let level = agent.get("level")?.as_u64()?;
+            let session_id = result.get("session_id")?.as_str()?;
+            let messages = result.get("conversation")?.as_array()?;
+            let selection = result.get("selection");
+            let detail = selection
+                .and_then(|selection| selection.get("detail"))
+                .and_then(Value::as_str)
+                .unwrap_or("report");
+            let truncated = selection
+                .and_then(|selection| selection.get("truncated"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let access = result
+                .get("access")
+                .and_then(|access| access.get("send_message"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            Some(format!(
+                "Session {session_id}\n{name} · level {level} · {}\n{}",
+                if access {
+                    "message allowed"
+                } else {
+                    "read-only"
+                },
+                if messages.is_empty() {
+                    "No conversation entries.".into()
+                } else {
+                    format!(
+                        "{} {detail} entries returned{}.",
+                        messages.len(),
+                        if truncated { " (truncated)" } else { "" }
+                    )
+                }
+            ))
+        }
+        "list_sessions" => {
+            let sessions = result.get("sessions")?.as_array()?;
+            let total = result
+                .get("pagination")
+                .and_then(|pagination| pagination.get("total"))
+                .and_then(Value::as_u64)
+                .unwrap_or(sessions.len() as u64);
+            let lines: Vec<_> = sessions
+                .iter()
+                .map(|session| {
+                    let name = session
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("session");
+                    let session_id = session
+                        .get("session_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    let level = session.get("level").and_then(Value::as_u64).unwrap_or(0);
+                    let status = session
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    format!("- {name} · level {level} · {status} · {session_id}")
+                })
+                .collect();
+            Some(if lines.is_empty() {
+                format!("No retained sessions found (0 of {total}).")
+            } else {
+                format!(
+                    "Retained sessions ({} of {total}):\n{}",
+                    lines.len(),
+                    lines.join("\n")
+                )
+            })
+        }
+        "search_sessions" => {
+            let matches = result.get("matches")?.as_array()?;
+            let total = result
+                .get("pagination")
+                .and_then(|pagination| pagination.get("total"))
+                .and_then(Value::as_u64)
+                .unwrap_or(matches.len() as u64);
+            let lines: Vec<_> = matches
+                .iter()
+                .map(|item| {
+                    let session_id = item
+                        .get("session_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    let role = item.get("role").and_then(Value::as_str).unwrap_or("entry");
+                    let snippet = item.get("snippet").and_then(Value::as_str).unwrap_or("");
+                    let entry_id = item
+                        .get("entry_id")
+                        .and_then(Value::as_str)
+                        .map(|id| format!(" · entry {id}"))
+                        .unwrap_or_default();
+                    format!("- {session_id}{entry_id} · {role}: {snippet}")
+                })
+                .collect();
+            Some(if lines.is_empty() {
+                format!("No matches found (0 of {total}).")
+            } else {
+                format!(
+                    "Session matches ({} of {total}):\n{}",
+                    lines.len(),
+                    lines.join("\n")
+                )
+            })
+        }
+        "wait_agent" => {
+            let agent = result.get("agent")?;
+            let agent_name = agent.get("name")?.as_str()?;
+            let wait_status = result.get("wait_status")?.as_str()?;
+            let mut sections = vec![match wait_status {
+                "message" => format!("Received an update from {agent_name}."),
+                "completed" => format!("{agent_name} finished."),
+                "timeout" => format!("{agent_name} is still running."),
+                _ => format!("{agent_name}: {wait_status}"),
+            }];
+            if let Some(messages) = result.get("messages").and_then(Value::as_array)
+                && !messages.is_empty()
+            {
+                sections.push(format!("Messages:\n{}", agent_message_report(messages, "")));
+            }
+            if let Some(outcome) = result.get("outcome") {
+                if let Some(output) = outcome.get("output").and_then(Value::as_str)
+                    && !output.trim().is_empty()
+                {
+                    sections.push(format!("Returned:\n{}", output.trim()));
+                }
+                if let Some(error) = outcome.get("error").and_then(Value::as_str)
+                    && !error.trim().is_empty()
+                {
+                    sections.push(format!("Error:\n{}", error.trim()));
+                }
+            }
+            if let Some(descendants) = result.get("descendants").and_then(Value::as_array) {
+                for descendant in descendants {
+                    let Some(agent) = descendant.get("agent") else {
+                        continue;
+                    };
+                    let name = agent
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("descendant");
+                    let Some(outcome) = descendant.get("outcome") else {
+                        continue;
+                    };
+                    if let Some(output) = outcome.get("output").and_then(Value::as_str)
+                        && !output.trim().is_empty()
+                    {
+                        sections.push(format!("{name} returned:\n{}", output.trim()));
+                    }
+                    if let Some(error) = outcome.get("error").and_then(Value::as_str)
+                        && !error.trim().is_empty()
+                    {
+                        sections.push(format!("{name} error:\n{}", error.trim()));
+                    }
+                }
+            }
+            Some(sections.join("\n\n"))
+        }
+        "interrupt_agent" => result
+            .get("target")
+            .and_then(Value::as_str)
+            .map(|target| format!("Interrupted {target}.")),
+        _ => None,
+    }
+}
+
+fn agent_message_report(messages: &[Value], empty_message: &str) -> String {
+    let lines: Vec<_> = messages
+        .iter()
+        .filter_map(|message| {
+            let sender = message.get("sender_name")?.as_str()?;
+            let content = message.get("content")?.as_str()?.trim();
+            Some(format!("- {sender}: {content}"))
+        })
+        .collect();
+    if lines.is_empty() {
+        empty_message.into()
+    } else {
+        lines.join("\n")
+    }
+}
+
+fn tool_event_details(event: &Value, previous_details: Option<&str>) -> String {
+    let details = if event.get("type").and_then(Value::as_str) == Some("tool_execution_end") {
+        let input = previous_details
+            .and_then(|details| serde_json::from_str::<Value>(details).ok())
+            .and_then(|details| {
+                details
+                    .get("input")
+                    .cloned()
+                    .or_else(|| details.get("args").cloned())
+            })
+            .unwrap_or(Value::Null);
+        json!({
+            "input": input,
+            "result": event.get("result").cloned().unwrap_or(Value::Null),
+            "is_error": event.get("isError").and_then(Value::as_bool).unwrap_or(false),
+        })
+    } else {
+        event.clone()
+    };
+    serde_json::to_string_pretty(&details).unwrap_or_else(|_| details.to_string())
+}
+
+fn agent_team_tool_summary(name: &str, text: &str) -> Option<String> {
+    if name == "bash" {
+        let result = compact_tool_text(text);
+        return Some(if result.is_empty() {
+            "Bash command completed".into()
+        } else {
+            format!("Bash: {result}")
+        });
+    }
+    let result: Value = serde_json::from_str(text).ok()?;
+    match name {
+        "list_processes" => {
+            let processes = result.get("processes")?.as_array()?;
+            let running = processes
+                .iter()
+                .filter(|process| process.get("status").and_then(Value::as_str) == Some("running"))
+                .count();
+            Some(format!(
+                "{} process(es), {running} running",
+                processes.len()
+            ))
+        }
+        "read_process" => {
+            let process = result.get("process")?;
+            let status = process
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            Some(format!("Process {status}"))
+        }
+        "stop_process" => Some("Process stopped".into()),
+        "spawn_agent" => {
+            let name = result.get("name")?.as_str()?;
+            let level = result.get("level")?.as_u64()?;
+            Some(format!("Started {name} (level {level})"))
+        }
+        "send_message" => result.get("count").and_then(Value::as_u64).map(|count| {
+            if result.get("queued").and_then(Value::as_bool) == Some(true) {
+                "Message queued for level-0 session".into()
+            } else {
+                format!("Message delivered to {count} agent(s)")
+            }
+        }),
+        "list_agents" => result
+            .get("agents")
+            .and_then(Value::as_array)
+            .map(|agents| format!("{} agents visible", agents.len())),
+        "read_messages" => result
+            .get("messages")
+            .and_then(Value::as_array)
+            .map(|messages| format!("{} messages received", messages.len())),
+        "read_session" => {
+            let agent = result.get("agent")?;
+            let name = agent.get("name")?.as_str()?;
+            let level = agent.get("level")?.as_u64()?;
+            Some(format!("Read {name} session (level {level})"))
+        }
+        "list_sessions" => result
+            .get("sessions")
+            .and_then(Value::as_array)
+            .map(|sessions| format!("{} retained sessions found", sessions.len())),
+        "search_sessions" => result
+            .get("matches")
+            .and_then(Value::as_array)
+            .map(|matches| format!("{} session matches found", matches.len())),
+        "wait_agent" => {
+            let agent = result.get("agent")?;
+            let agent_name = agent.get("name")?.as_str()?;
+            match result.get("wait_status")?.as_str()? {
+                "message" => Some(format!("{agent_name} sent a message")),
+                "completed" => {
+                    let failed = result
+                        .get("outcome")
+                        .and_then(|outcome| outcome.get("error"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|error| !error.trim().is_empty());
+                    Some(if failed {
+                        format!("{agent_name} failed")
+                    } else {
+                        format!("{agent_name} completed")
+                    })
+                }
+                "timeout" => Some(format!("{agent_name} is still running")),
+                _ => None,
+            }
+        }
+        "interrupt_agent" => result
+            .get("target")
+            .and_then(Value::as_str)
+            .map(|target| format!("Interrupted {target}")),
+        _ => None,
+    }
+}
+
+fn compact_tool_text(text: &str) -> String {
+    const MAX_SUMMARY_CHARS: usize = 84;
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= MAX_SUMMARY_CHARS {
+        return compact;
+    }
+    let prefix: String = compact.chars().take(MAX_SUMMARY_CHARS).collect();
+    format!("{prefix}…")
+}
+
 fn assistant_text(message: &Value) -> String {
     content_text(message.get("content")).unwrap_or_default()
 }
@@ -1502,38 +2740,131 @@ fn bash_policy_name(policy: &BashPolicy) -> &'static str {
     }
 }
 
-fn ensure_bash_extension(sessions_path: &Path) -> std::io::Result<PathBuf> {
-    let extension_path = sessions_path.join("pi-whim-bash-policy.ts");
-    if !extension_path.exists() {
-        fs::write(&extension_path, BASH_EXTENSION_SOURCE)?;
-    }
-    Ok(extension_path)
+fn ensure_agent_team_extension(sessions_path: &Path) -> std::io::Result<PathBuf> {
+    let directory = sessions_path.join(".pi-whim-agent-team-extension");
+    fs::create_dir_all(&directory)?;
+    fs::write(
+        directory.join("client.ts"),
+        include_str!("../../../extensions/agent-team/client.ts"),
+    )?;
+    let entrypoint = directory.join("index.ts");
+    fs::write(
+        &entrypoint,
+        include_str!("../../../extensions/agent-team/index.ts"),
+    )?;
+    Ok(entrypoint)
 }
-
-const BASH_EXTENSION_SOURCE: &str = r#"import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
-
-export default function(pi: ExtensionAPI) {
-  pi.on('tool_call', async (event, ctx) => {
-    if (event.toolName !== 'bash') return;
-    const policy = process.env.PI_WHIM_BASH_POLICY ?? 'allow';
-    if (policy === 'deny') return { block: true, reason: 'Blocked by Pi-Whim Bash policy' };
-    if (policy === 'ask') {
-      const command = String(event.input.command ?? '');
-      const allowed = await ctx.ui.confirm('Pi-Whim Bash confirmation', command);
-      if (!allowed) return { block: true, reason: 'Blocked by user' };
-    }
-  });
-}
-"#;
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        configured_provider_environment, pi_models_json, provider_environment_name,
-        session_title_and_preview,
-    };
-    use pi_whim_core::{ProviderModel, ProviderProfile, ProviderProtocol};
-    use uuid::Uuid;
+    use super::*;
+    use pi_whim_core::{ConversationItem, ModelCapabilitySource, ThinkingLevelMap};
+    use pi_whim_runtime::FakeRuntime;
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    fn test_application(
+        directory: &TempDir,
+        runtime: FakeRuntime,
+    ) -> PiWhimApplication<FakeRuntime> {
+        let runtime_events = runtime.events();
+        PiWhimApplication {
+            workbench: Workbench::default(),
+            store: Some(SqliteStore::open(directory.path().join("test.sqlite")).unwrap()),
+            secrets: MacosKeychainStore::default(),
+            runtime,
+            runtime_events,
+            assistant_message_id: None,
+            pending_extension_request: None,
+            pending_interactions: Vec::new(),
+            capability_resolver: ModelCapabilityResolver::new(false),
+            running_project: None,
+            sessions_root_override: Some(directory.path().join("sessions")),
+            agent_directory_override: Some(directory.path().join("agent")),
+            pending_prompt: None,
+            conversation_compacted: false,
+            compaction_item_id: None,
+            error: None,
+            notice: None,
+        }
+    }
+
+    fn project(name: &str, path: &Path) -> Project {
+        Project {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            path: path.to_string_lossy().into_owned(),
+            pinned: false,
+            last_opened_ms: 1,
+        }
+    }
+
+    #[test]
+    fn agent_team_tool_results_have_a_compact_summary() {
+        let result = json!({
+            "agent": { "name": "worker-alpha" },
+            "wait_status": "message",
+        });
+        let content = json!([{ "type": "text", "text": result.to_string() }]);
+
+        assert_eq!(
+            tool_result_summary(Some("wait_agent"), Some(&content), false),
+            "worker-alpha sent a message"
+        );
+    }
+
+    #[test]
+    fn waiting_report_shows_messages_and_the_child_result_without_raw_json() {
+        let result = json!({
+            "agent": { "name": "worker-alpha" },
+            "messages": [{ "sender_name": "worker-alpha", "content": "Need approval." }],
+            "outcome": { "output": "Task complete.", "error": "" },
+            "wait_status": "completed",
+        });
+        let report = agent_team_tool_report("wait_agent", &result.to_string(), None).unwrap();
+
+        assert!(report.contains("worker-alpha finished."));
+        assert!(report.contains("worker-alpha: Need approval."));
+        assert!(report.contains("Returned:\nTask complete."));
+        assert!(!report.contains("\"wait_status\""));
+    }
+
+    #[test]
+    fn bash_and_process_tools_use_compact_operation_reports() {
+        let args = json!({
+            "command": "cargo test --workspace",
+            "background": true,
+        });
+        let initial = tool_call_report("bash", Some(&args));
+        assert_eq!(
+            initial,
+            "Starting background command: cargo test --workspace"
+        );
+        let content = json!([{ "type": "text", "text": "Background process 123 started." }]);
+        let report = tool_result_report(Some("bash"), Some(&content), Some(&initial), false);
+        assert!(report.contains("Starting background command"));
+        assert!(report.contains("Background process 123 started."));
+        assert!(!report.contains("\"command\""));
+
+        let processes = json!({
+            "processes": [{
+                "id": "123",
+                "status": "running"
+            }]
+        });
+        let process_report =
+            agent_team_tool_report("list_processes", &processes.to_string(), None).unwrap();
+        assert_eq!(process_report, "1 background process(es), 1 running");
+    }
+
+    #[test]
+    fn generic_tool_summaries_are_single_line_and_bounded() {
+        assert_eq!(
+            compact_tool_text("first\n second\tthird"),
+            "first second third"
+        );
+        assert!(compact_tool_text(&"x ".repeat(200)).ends_with('…'));
+    }
 
     #[test]
     fn history_uses_the_latest_pi_session_info_title() {
@@ -1583,12 +2914,19 @@ mod tests {
 
     #[test]
     fn generated_pi_models_config_only_references_a_key_environment_variable() {
+        let mut model = ProviderModel::new("gpt-example");
+        model.reasoning = true;
+        model.thinking_level_map = ThinkingLevelMap::from_entries([
+            (ThinkingLevel::Minimal, None),
+            (ThinkingLevel::Xhigh, Some("xhigh".into())),
+        ]);
+        model.capability_source = ModelCapabilitySource::BundledCatalog;
         let profile = ProviderProfile {
             id: Uuid::new_v4(),
             name: "Private gateway".into(),
             base_url: "https://gateway.example/v1/".into(),
             protocol: ProviderProtocol::OpenAiCompletions,
-            models: vec![ProviderModel::new("gpt-example")],
+            models: vec![model],
             updated_at_ms: 1,
             has_api_key: true,
         };
@@ -1605,6 +2943,12 @@ mod tests {
             format!("${}", provider_environment_name(profile.id))
         );
         assert!(!config.to_string().contains("sk-"));
+        assert_eq!(provider["models"][0]["reasoning"], true);
+        assert_eq!(
+            provider["models"][0]["thinkingLevelMap"]["minimal"],
+            Value::Null
+        );
+        assert_eq!(provider["models"][0]["thinkingLevelMap"]["xhigh"], "xhigh");
     }
 
     #[test]
@@ -1634,5 +2978,237 @@ mod tests {
             Some(&"secret-key".to_owned())
         );
         assert!(!environment.contains_key(&provider_environment_name(missing_id)));
+    }
+
+    #[test]
+    fn search_engine_urls_accept_local_http_and_secure_https_only() {
+        assert!(valid_search_engine_url("http://localhost:8080"));
+        assert!(valid_search_engine_url("https://search.example/"));
+        assert!(!valid_search_engine_url("search.example"));
+        assert!(!valid_search_engine_url("ftp://search.example"));
+        assert!(!valid_search_engine_url("https:///search.example"));
+    }
+
+    #[test]
+    fn project_targeted_sessions_reuse_cross_project_startup_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = FakeRuntime::default();
+        let observer = runtime.clone();
+        let mut app = test_application(&directory, runtime);
+        let first = project("first", &directory.path().join("first"));
+        let second = project("second", &directory.path().join("second"));
+        fs::create_dir_all(&first.path).unwrap();
+        fs::create_dir_all(&second.path).unwrap();
+        app.store.as_ref().unwrap().save_project(&first).unwrap();
+        app.store.as_ref().unwrap().save_project(&second).unwrap();
+        app.workbench
+            .apply(Action::ProjectsLoaded(vec![first.clone(), second.clone()]));
+
+        app.start_new_session(first.id);
+        assert_eq!(observer.starts().len(), 1);
+        assert!(
+            !observer.commands().iter().any(|command| {
+                command.get("type").and_then(Value::as_str) == Some("new_session")
+            })
+        );
+
+        app.workbench
+            .apply(Action::UpsertConversation(ConversationItem {
+                id: "user-1".into(),
+                role: ConversationRole::User,
+                full_text: "hello".into(),
+                revealed_graphemes: 5,
+                reveal_credit: 0.0,
+                streaming: false,
+                tool_name: None,
+                tool_report: None,
+                tool_details: None,
+                is_error: false,
+                model: None,
+                attachments: Vec::new(),
+            }));
+        app.start_new_session(first.id);
+        assert_eq!(
+            observer
+                .commands()
+                .iter()
+                .filter(|command| {
+                    command.get("type").and_then(Value::as_str) == Some("new_session")
+                })
+                .count(),
+            1
+        );
+
+        app.start_new_session(second.id);
+        assert_eq!(observer.starts().len(), 2);
+        assert_eq!(
+            observer
+                .commands()
+                .iter()
+                .filter(|command| {
+                    command.get("type").and_then(Value::as_str) == Some("new_session")
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn model_switch_refreshes_and_clamps_thinking_levels_from_rpc() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = FakeRuntime::default();
+        runtime.set_response(
+            "get_state",
+            json!({
+                "model": {"provider":"provider-key", "id":"model-a", "name":"Model A"},
+                "thinkingLevel":"xhigh"
+            }),
+        );
+        runtime.set_response(
+            "get_available_models",
+            json!({"models":[{"provider":"provider-key", "id":"model-a", "name":"Model A"}]}),
+        );
+        runtime.set_response(
+            "get_available_thinking_levels",
+            json!({"levels":["off", "low", "high"]}),
+        );
+        let observer = runtime.clone();
+        let mut app = test_application(&directory, runtime);
+
+        app.set_model(ModelOption {
+            provider: "provider-key".into(),
+            provider_name: "Configured provider".into(),
+            id: "model-a".into(),
+            name: "Model A".into(),
+        });
+
+        assert_eq!(app.workbench.state.thinking_level, ThinkingLevel::Off);
+        assert_eq!(
+            app.workbench.state.available_thinking_levels,
+            vec![ThinkingLevel::Off, ThinkingLevel::Low, ThinkingLevel::High]
+        );
+        let recorded_commands = observer.commands();
+        let command_types = recorded_commands
+            .iter()
+            .filter_map(|command| command.get("type").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            command_types,
+            vec![
+                "set_model",
+                "get_state",
+                "get_available_models",
+                "get_available_thinking_levels",
+                "get_session_stats",
+                "get_commands",
+            ]
+        );
+    }
+
+    #[test]
+    fn model_switch_defers_set_model_until_prompt_compacts_first() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = FakeRuntime::default();
+        let observer = runtime.clone();
+        let mut app = test_application(&directory, runtime);
+
+        app.queue_model_switch(ModelOption {
+            provider: "provider-key".into(),
+            provider_name: "Configured provider".into(),
+            id: "model-b".into(),
+            name: "Model B".into(),
+        });
+
+        // Switch is deferred: the pending model is recorded but no set_model
+        // RPC is sent until the next prompt triggers compaction.
+        assert_eq!(
+            app.workbench.state.pending_model.as_ref().unwrap().id,
+            "model-b"
+        );
+        assert!(
+            observer
+                .commands()
+                .iter()
+                .all(|command| command.get("type").and_then(Value::as_str) != Some("set_model"))
+        );
+    }
+
+    #[test]
+    fn auto_compaction_setting_round_trips_through_pi_rpc() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = FakeRuntime::default();
+        runtime.set_response("get_state", json!({"autoCompactionEnabled": false}));
+        let observer = runtime.clone();
+        let mut app = test_application(&directory, runtime);
+
+        app.set_auto_compaction(false);
+
+        assert!(!app.workbench.state.auto_compaction_enabled);
+        assert_eq!(
+            observer.commands()[0].get("type").and_then(Value::as_str),
+            Some("set_auto_compaction")
+        );
+        assert_eq!(
+            observer.commands()[0]
+                .get("enabled")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn switching_sessions_refreshes_the_model_restored_by_pi() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = FakeRuntime::default();
+        runtime.set_response(
+            "get_state",
+            json!({
+                "model": {"provider":"provider-b", "id":"model-b", "name":"Model B"},
+                "thinkingLevel":"off"
+            }),
+        );
+        runtime.set_response(
+            "get_available_models",
+            json!({"models":[{"provider":"provider-b", "id":"model-b", "name":"Model B"}]}),
+        );
+        runtime.set_response("get_available_thinking_levels", json!({"levels":["off"]}));
+        let observer = runtime.clone();
+        let mut app = test_application(&directory, runtime);
+        let project_id = Uuid::new_v4();
+        app.running_project = Some(project_id);
+
+        app.switch_session(project_id, "/sessions/agent-model-b.jsonl".into());
+
+        assert_eq!(
+            app.workbench
+                .state
+                .current_model
+                .as_ref()
+                .map(|model| (model.provider.clone(), model.id.clone())),
+            Some(("provider-b".into(), "model-b".into()))
+        );
+        let commands = observer.commands();
+        let command_types = commands
+            .iter()
+            .filter_map(|command| command.get("type").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            command_types,
+            vec![
+                "switch_session",
+                "get_entries",
+                "get_state",
+                "get_available_models",
+                "get_available_thinking_levels",
+                "get_session_stats",
+                "get_commands",
+            ]
+        );
+        assert!(
+            !observer
+                .commands()
+                .iter()
+                .any(|command| command.get("type").and_then(Value::as_str) == Some("set_model"))
+        );
     }
 }

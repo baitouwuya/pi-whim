@@ -17,16 +17,20 @@ the application looks for the Pi build under `vendor/pi-mono`.
 ## Architecture
 
 - `pi-whim-core`: application domain and reducer.
+- `pi-whim-agent-team`: authenticated team topology, routing, quotas, and Pi process supervision.
 - `pi-whim-persistence`: SQLite project/session index and Keychain secrets.
 - `pi-whim-pi-rpc`: strict LF JSONL transport for Pi RPC mode.
 - `pi-whim-runtime`: UI-facing `AgentRuntime` abstraction and Pi adapter.
-- `pi-whim-tool-protocol`: reserved Rust tool-host protocol, not active yet.
+- `pi-whim-tool-protocol`: versioned JSONL protocol used by the local agent tool host.
 - `pi-whim-ui`: egui workbench and Fluent resources.
 - `pi-whim-app`: native executable composition root.
 
 Pi is kept as a Git submodule in `vendor/pi-mono`. The initial checkout uses upstream
 unchanged; a project-owned fork can later replace its `origin` while `upstream` stays
 pointed to the official repository.
+
+See [Agent teams](docs/agent-teams.md) for hierarchy, communication, model selection,
+and concurrency rules.
 
 ## Providers
 
@@ -48,3 +52,19 @@ always be added manually. Provider metadata and model IDs are stored in SQLite; 
 API key is stored only in macOS Keychain. Before Pi starts, Pi-Whim writes an
 application-owned `models.json` containing environment-variable references, then
 injects each key only into that Pi process.
+
+## Web Search
+
+Open Settings > Web Search to add one or more SearXNG base URLs. Engines are tried in
+the displayed order: temporary errors (including timeouts, HTTP 429, and 5xx responses)
+fall through to the next enabled engine, while valid empty results are returned as-is.
+Use the test action to verify an endpoint before saving; the `web_search` agent tool
+returns only result titles, URLs, and snippets.
+
+## Network Fetch
+
+The agent `fetch` tool makes a bounded one-shot HTTP(S), TCP, UDP, or WebSocket request.
+It supports text and Base64 payloads, limits request bodies to 256 KiB and responses to 1 MiB,
+and caps a call at 30 seconds. WebSocket calls send at most one message and read one reply, so
+they do not retain sockets or state between agent tool calls. `fetch` is available to controlled
+and full agents; read-only agents retain access to `web_search` only.

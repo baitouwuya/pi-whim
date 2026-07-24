@@ -13,3 +13,6 @@ pi-whim-core = { path = "../pi-whim-core" }
 pulldown-cmark.workspace = true
 unic-langid.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
