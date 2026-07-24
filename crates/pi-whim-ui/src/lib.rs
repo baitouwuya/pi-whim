@@ -87,10 +87,12 @@ pub enum UiIntent {
     SetSessionName(String),
     ExportSession(Option<String>),
     ShareSession,
-    AddImageAttachment,
+    AddFileAttachments,
+    AddFolderAttachment,
+    RemoveComposerAttachment(String),
     SubmitPrompt {
         content: String,
-        attachments: Vec<pi_whim_core::ImageAttachment>,
+        attachments: Vec<pi_whim_core::Attachment>,
         mode: SubmitMode,
     },
     Compact,
@@ -367,6 +369,10 @@ impl Workbench {
         std::mem::take(&mut self.intents)
     }
 
+    pub fn composer_has_focus(&self, context: &egui::Context) -> bool {
+        context.memory(|memory| memory.has_focus(egui::Id::new("composer-input")))
+    }
+
     /// Used by the ui_preview example to screenshot the settings page.
     #[doc(hidden)]
     pub fn preview_open_settings(&mut self, providers: bool) {
@@ -483,8 +489,8 @@ impl Workbench {
                 }
                 self.state.composer.clear();
             }
-            SlashCommand::AddImage => {
-                self.intents.push(UiIntent::AddImageAttachment);
+            SlashCommand::AddAttachment => {
+                self.intents.push(UiIntent::AddFileAttachments);
                 self.state.composer.clear();
             }
             SlashCommand::ChooseModel => self.state.composer = "/model ".into(),
@@ -1503,20 +1509,7 @@ impl Workbench {
                                     ui.label(
                                         RichText::new(content).font(serif_font(16.0)).color(INK),
                                     );
-                                    if !message.attachments.is_empty() {
-                                        ui.horizontal_wrapped(|ui| {
-                                            for attachment in &message.attachments {
-                                                ui.label(
-                                                    RichText::new(format!(
-                                                        "[image] {}",
-                                                        attachment.name
-                                                    ))
-                                                    .font(mono_font(10.0))
-                                                    .color(BLUE),
-                                                );
-                                            }
-                                        });
-                                    }
+                                    sent_attachment_cards(ui, &message.attachments);
                                 });
                             });
                             // Action row sits under the bubble, not inside it:
@@ -1529,8 +1522,13 @@ impl Workbench {
                             });
                         }
                         ConversationRole::Assistant => {
-                            if !message.streaming && !message.full_text.trim().is_empty() {
+                            // Render markdown progressively while streaming so
+                            // headings, lists, tables, and thinking blocks take
+                            // shape live instead of appearing as raw text.
+                            if !content.trim().is_empty() {
                                 self.markdown.show(ui, &message.id, content);
+                            }
+                            if !message.streaming && !message.full_text.trim().is_empty() {
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     let copied =
                                         self.copied_message.as_ref().is_some_and(|(id, at)| {
@@ -1554,12 +1552,6 @@ impl Workbench {
                                         self.copied_message =
                                             Some((message.id.clone(), Instant::now()));
                                     }
-                                });
-                            } else {
-                                ui.with_layout(Layout::left_to_right(Align::TOP), |ui| {
-                                    ui.label(
-                                        RichText::new(content).font(serif_font(17.0)).color(INK),
-                                    );
                                 });
                             }
                         }
@@ -1728,17 +1720,30 @@ impl Workbench {
                                         );
                                         ui.add_space(2.0);
                                         ui.horizontal(|ui| {
-                                            if icons::button(
-                                                ui,
-                                                icons::Icon::Image,
-                                                tr(&self.state, "add-image"),
-                                                Vec2::splat(28.0),
-                                                false,
-                                            )
-                                            .clicked()
-                                            {
-                                                self.intents.push(UiIntent::AddImageAttachment);
-                                            }
+                                            let attachment_menu = ui.menu_button(
+                                                RichText::new("+").font(mono_font(18.0)),
+                                                |ui| {
+                                                    if ui
+                                                        .button(tr(&self.state, "choose-files"))
+                                                        .clicked()
+                                                    {
+                                                        self.intents
+                                                            .push(UiIntent::AddFileAttachments);
+                                                        ui.close_menu();
+                                                    }
+                                                    if ui
+                                                        .button(tr(&self.state, "choose-folder"))
+                                                        .clicked()
+                                                    {
+                                                        self.intents
+                                                            .push(UiIntent::AddFolderAttachment);
+                                                        ui.close_menu();
+                                                    }
+                                                },
+                                            );
+                                            attachment_menu
+                                                .response
+                                                .on_hover_text(tr(&self.state, "add-attachment"));
                                             self.runtime_controls(ui);
                                             ui.with_layout(
                                                 Layout::right_to_left(Align::Center),
@@ -1819,8 +1824,9 @@ impl Workbench {
         }
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = Vec2::new(6.0, 4.0);
-            for attachment in &self.state.composer_attachments {
-                chip(ui, &attachment.name, BLUE);
+            let attachments = self.state.composer_attachments.clone();
+            for attachment in attachments {
+                composer_attachment_card(ui, &attachment, &mut self.intents);
             }
             if steering > 0 {
                 chip(
@@ -2566,6 +2572,97 @@ fn chip(ui: &mut Ui, label: &str, color: Color32) {
         });
 }
 
+fn attachment_type(attachment: &pi_whim_core::Attachment) -> String {
+    match attachment.kind {
+        pi_whim_core::AttachmentKind::Directory => "FOLDER".into(),
+        pi_whim_core::AttachmentKind::File => attachment
+            .name
+            .rsplit_once('.')
+            .map(|(_, extension)| extension.to_ascii_uppercase())
+            .filter(|extension| !extension.is_empty())
+            .unwrap_or_else(|| "FILE".into()),
+    }
+}
+
+fn attachment_icon(attachment: &pi_whim_core::Attachment) -> icons::Icon {
+    match attachment.kind {
+        pi_whim_core::AttachmentKind::File => icons::Icon::File,
+        pi_whim_core::AttachmentKind::Directory => icons::Icon::Folder,
+    }
+}
+
+fn composer_attachment_card(
+    ui: &mut Ui,
+    attachment: &pi_whim_core::Attachment,
+    intents: &mut Vec<UiIntent>,
+) {
+    Frame::default()
+        .fill(tint(BLUE, 16))
+        .stroke(Stroke::new(1.0_f32, tint(BLUE, 72)))
+        .corner_radius(4)
+        .inner_margin(Margin::symmetric(7, 5))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                icons::display(ui, attachment_icon(attachment), Vec2::splat(16.0), BLUE);
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new(&attachment.name)
+                            .font(mono_font(10.0))
+                            .color(INK),
+                    );
+                    ui.label(
+                        RichText::new(attachment_type(attachment))
+                            .font(mono_font(8.0))
+                            .color(MUTED_INK),
+                    );
+                });
+                if icons::button(
+                    ui,
+                    icons::Icon::Close,
+                    "Remove attachment",
+                    Vec2::splat(18.0),
+                    false,
+                )
+                .clicked()
+                {
+                    intents.push(UiIntent::RemoveComposerAttachment(attachment.path.clone()));
+                }
+            });
+        });
+}
+
+fn sent_attachment_cards(ui: &mut Ui, attachments: &[pi_whim_core::Attachment]) {
+    if attachments.is_empty() {
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        for attachment in attachments {
+            Frame::default()
+                .fill(tint(BLUE, 14))
+                .stroke(Stroke::new(1.0_f32, tint(BLUE, 60)))
+                .corner_radius(4)
+                .inner_margin(Margin::symmetric(6, 4))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        icons::display(ui, attachment_icon(attachment), Vec2::splat(14.0), BLUE);
+                        ui.vertical(|ui| {
+                            ui.label(
+                                RichText::new(&attachment.name)
+                                    .font(mono_font(9.0))
+                                    .color(INK),
+                            );
+                            ui.label(
+                                RichText::new(attachment_type(attachment))
+                                    .font(mono_font(8.0))
+                                    .color(MUTED_INK),
+                            );
+                        });
+                    });
+                });
+        }
+    });
+}
+
 fn format_tokens(tokens: u64) -> String {
     if tokens >= 1_000_000 {
         format!("{:.1}M", tokens as f64 / 1_000_000.0)
@@ -2718,11 +2815,25 @@ fn tr(state: &AppState, key: &str) -> &'static str {
                 "Tell Pi what you want to do..."
             }
         }
-        "add-image" => {
+        "add-attachment" => {
             if zh {
-                "添加图片"
+                "添加附件"
             } else {
-                "Add image"
+                "Add attachment"
+            }
+        }
+        "choose-files" => {
+            if zh {
+                "选择文件..."
+            } else {
+                "Choose files..."
+            }
+        }
+        "choose-folder" => {
+            if zh {
+                "选择文件夹..."
+            } else {
+                "Choose folder..."
             }
         }
         "queued" => {

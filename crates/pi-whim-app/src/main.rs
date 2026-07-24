@@ -1,3 +1,5 @@
+mod attachment_store;
+mod macos_paste;
 mod model_capabilities;
 #[cfg(test)]
 mod session_report;
@@ -9,13 +11,13 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use base64::Engine;
 use eframe::egui;
 use pi_whim_core::{
-    Action, AgentStatus, BashPolicy, ConversationItem, ConversationRole, ImageAttachment,
-    ModelOption, Project, ProjectId, ProviderId, ProviderModel, ProviderProfile, ProviderProtocol,
-    QueueMode, SearchEngineProfile, SessionMetrics, SessionSummary, SlashCommandInfo,
-    ThinkingLevel, normalize_provider_display_name, provider_name_key, stable_session_id,
+    Action, AgentStatus, Attachment, AttachmentKind, BashPolicy, ConversationItem,
+    ConversationRole, ModelOption, Project, ProjectId, ProviderId, ProviderModel, ProviderProfile,
+    ProviderProtocol, QueueMode, SearchEngineProfile, SessionMetrics, SessionSummary,
+    SlashCommandInfo, ThinkingLevel, normalize_provider_display_name, provider_name_key,
+    stable_session_id,
 };
 use pi_whim_persistence::{
     AppPreferences, MacosKeychainStore, PreferencesRepository, ProjectRepository,
@@ -26,6 +28,8 @@ use pi_whim_ui::{SubmitMode, UiIntent, Workbench, install_fonts};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use attachment_store::AttachmentStore;
+use macos_paste::FinderPasteMonitor;
 use model_capabilities::ModelCapabilityResolver;
 
 fn main() -> eframe::Result<()> {
@@ -59,7 +63,9 @@ struct PiWhimApplication<R: AgentRuntime = PiRpcRuntime> {
     running_project: Option<ProjectId>,
     sessions_root_override: Option<PathBuf>,
     agent_directory_override: Option<PathBuf>,
-    pending_prompt: Option<(String, Vec<ImageAttachment>, SubmitMode)>,
+    pending_prompt: Option<(String, Vec<Attachment>, SubmitMode)>,
+    attachment_store: AttachmentStore,
+    finder_paste_monitor: Option<FinderPasteMonitor>,
     conversation_compacted: bool,
     /// Item id of the in-progress compaction call card, so compaction_end can
     /// update the same conversation entry with the result instead of adding a
@@ -138,6 +144,8 @@ impl Default for PiWhimApplication<PiRpcRuntime> {
             sessions_root_override: None,
             agent_directory_override: None,
             pending_prompt: None,
+            attachment_store: AttachmentStore::open_default(),
+            finder_paste_monitor: FinderPasteMonitor::install(),
             conversation_compacted: false,
             compaction_item_id: None,
             error: None,
@@ -147,7 +155,18 @@ impl Default for PiWhimApplication<PiRpcRuntime> {
 }
 
 impl<R: AgentRuntime> eframe::App for PiWhimApplication<R> {
+    fn raw_input_hook(&mut self, context: &egui::Context, raw_input: &mut egui::RawInput) {
+        if !self.workbench.composer_has_focus(context) {
+            return;
+        }
+        raw_input.events.retain(|event| match event {
+            egui::Event::Paste(text) => !self.capture_attachment_paste(text),
+            _ => true,
+        });
+    }
+
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        self.consume_finder_paste(context);
         self.consume_runtime_events();
         self.consume_capability_catalog();
         self.workbench.show(context);
@@ -185,6 +204,20 @@ impl<R: AgentRuntime> eframe::App for PiWhimApplication<R> {
 }
 
 impl<R: AgentRuntime> PiWhimApplication<R> {
+    fn consume_finder_paste(&mut self, context: &egui::Context) {
+        if !self.workbench.composer_has_focus(context) {
+            return;
+        }
+        let paths = self
+            .finder_paste_monitor
+            .as_ref()
+            .map(FinderPasteMonitor::drain_paths)
+            .unwrap_or_default();
+        if !paths.is_empty() {
+            self.add_attachments(paths);
+        }
+    }
+
     fn consume_capability_catalog(&mut self) {
         if !self.capability_resolver.online_refresh_completed() {
             return;
@@ -235,13 +268,21 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             UiIntent::SetSessionName(name) => self.set_current_session_name(name),
             UiIntent::ExportSession(path) => self.export_session(path),
             UiIntent::ShareSession => self.share_session(),
-            UiIntent::AddImageAttachment => {
+            UiIntent::AddFileAttachments => {
                 if self.workbench.state.selected_project.is_some() {
-                    self.add_image_attachment();
+                    self.add_file_attachments();
                 } else {
-                    self.error = Some("Select a project before adding an image.".into());
+                    self.error = Some("Select a project before adding attachments.".into());
                 }
             }
+            UiIntent::AddFolderAttachment => {
+                if self.workbench.state.selected_project.is_some() {
+                    self.add_folder_attachment();
+                } else {
+                    self.error = Some("Select a project before adding attachments.".into());
+                }
+            }
+            UiIntent::RemoveComposerAttachment(path) => self.remove_composer_attachment(&path),
             UiIntent::SubmitPrompt {
                 content,
                 attachments,
@@ -1047,8 +1088,10 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             let session_id = summary.id;
             let _ = store.save_session(&summary);
             if let Ok(sessions) = store.list_sessions(project_id) {
-                self.workbench
-                    .apply(Action::SessionsLoaded { project_id, sessions });
+                self.workbench.apply(Action::SessionsLoaded {
+                    project_id,
+                    sessions,
+                });
             }
             self.workbench.apply(Action::SelectSession(session_id));
         }
@@ -1222,27 +1265,74 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         Ok(())
     }
 
-    fn add_image_attachment(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp"])
-            .pick_file()
-        else {
-            return;
-        };
-        match image_attachment(&path) {
-            Ok(attachment) => self
-                .workbench
-                .apply(Action::AddComposerAttachment(attachment)),
-            Err(error) => self.error = Some(error),
+    fn add_file_attachments(&mut self) {
+        if let Some(paths) = rfd::FileDialog::new()
+            .set_title("Choose attachments")
+            .pick_files()
+        {
+            self.add_attachments(paths);
         }
     }
 
-    fn submit_prompt(
-        &mut self,
-        content: String,
-        attachments: Vec<ImageAttachment>,
-        mode: SubmitMode,
-    ) {
+    fn add_folder_attachment(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .set_title("Choose attachment folder")
+            .pick_folder()
+        {
+            self.add_attachments(vec![path]);
+        }
+    }
+
+    fn add_attachments(&mut self, paths: Vec<PathBuf>) {
+        for path in paths {
+            match attachment_from_path(&path, false) {
+                Ok(attachment) => self
+                    .workbench
+                    .apply(Action::AddComposerAttachment(attachment)),
+                Err(error) => self.error = Some(error),
+            }
+        }
+    }
+
+    fn remove_composer_attachment(&mut self, path: &str) {
+        let attachment = self
+            .workbench
+            .state
+            .composer_attachments
+            .iter()
+            .find(|attachment| attachment.path == path)
+            .cloned();
+        self.workbench
+            .apply(Action::RemoveComposerAttachment(path.to_owned()));
+        if attachment.is_some_and(|attachment| attachment.generated_pasted_text)
+            && let Err(error) = self.attachment_store.remove_generated(path)
+        {
+            self.error = Some(error);
+        }
+    }
+
+    fn capture_attachment_paste(&mut self, text: &str) -> bool {
+        if let Ok(mut clipboard) = arboard::Clipboard::new()
+            && let Ok(paths) = clipboard.get().file_list()
+            && !paths.is_empty()
+        {
+            self.add_attachments(paths);
+            return true;
+        }
+        if is_large_paste(text) {
+            match self.attachment_store.create_pasted_text(text) {
+                Ok(attachment) => {
+                    self.workbench
+                        .apply(Action::AddComposerAttachment(attachment));
+                    return true;
+                }
+                Err(error) => self.error = Some(error),
+            }
+        }
+        false
+    }
+
+    fn submit_prompt(&mut self, content: String, attachments: Vec<Attachment>, mode: SubmitMode) {
         if self.workbench.state.selected_project.is_none() {
             self.error = Some("Select a project before sending a message.".into());
             return;
@@ -1298,20 +1388,12 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         self.send_prompt(content, attachments, mode);
     }
 
-    fn send_prompt(
-        &mut self,
-        content: String,
-        attachments: Vec<ImageAttachment>,
-        mode: SubmitMode,
-    ) {
+    fn send_prompt(&mut self, content: String, attachments: Vec<Attachment>, mode: SubmitMode) {
         let result = match mode {
-            SubmitMode::Prompt => {
-                let mut command = json!({"type":"prompt", "message": content});
-                if !attachments.is_empty() {
-                    command["images"] = Value::Array(attachments.iter().map(|attachment| json!({"type":"image","data":attachment.base64_data,"mimeType":attachment.mime_type})).collect());
-                }
-                self.runtime.send(command)
-            }
+            SubmitMode::Prompt => self.runtime.send(json!({
+                "type": "prompt",
+                "message": prompt_with_attachment_paths(&content, &attachments),
+            })),
             SubmitMode::Steer => self
                 .runtime
                 .send(json!({"type":"steer", "message": content})),
@@ -2629,35 +2711,73 @@ fn compact_tool_text(text: &str) -> String {
 }
 
 fn assistant_text(message: &Value) -> String {
-    content_text(message.get("content")).unwrap_or_default()
+    match message.get("content") {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) => {
+            // Thinking blocks join the visible transcript wrapped in
+            // `<thinking>` tags; the UI markdown renderer recognizes the tags
+            // and renders the section muted instead of showing raw markup.
+            let mut blocks: Vec<String> = Vec::new();
+            for part in parts {
+                match part.get("type").and_then(Value::as_str) {
+                    Some("thinking") => {
+                        if let Some(thinking) = part.get("thinking").and_then(Value::as_str) {
+                            let thinking = thinking.trim();
+                            if !thinking.is_empty() {
+                                blocks.push(format!("<thinking>\n{thinking}\n</thinking>"));
+                            }
+                        }
+                    }
+                    _ => {
+                        if let Some(text) = part.get("text").and_then(Value::as_str) {
+                            blocks.push(text.to_owned());
+                        }
+                    }
+                }
+            }
+            blocks.join("\n\n")
+        }
+        _ => String::new(),
+    }
 }
 
-fn image_attachment(path: &Path) -> Result<ImageAttachment, String> {
-    let mime_type = match path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(str::to_lowercase)
-        .as_deref()
-    {
-        Some("png") => "image/png",
-        Some("jpg" | "jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("webp") => "image/webp",
-        _ => return Err("Unsupported image format".into()),
+fn attachment_from_path(path: &Path, generated_pasted_text: bool) -> Result<Attachment, String> {
+    let path = path.canonicalize().map_err(|error| error.to_string())?;
+    let metadata = path.metadata().map_err(|error| error.to_string())?;
+    let kind = if metadata.is_dir() {
+        AttachmentKind::Directory
+    } else {
+        AttachmentKind::File
     };
-    let bytes = fs::read(path).map_err(|error| error.to_string())?;
-    if bytes.len() > 10 * 1024 * 1024 {
-        return Err("Images must be 10 MB or smaller".into());
-    }
-    Ok(ImageAttachment {
+    Ok(Attachment {
         name: path
             .file_name()
             .and_then(|name| name.to_str())
-            .unwrap_or("image")
+            .unwrap_or("attachment")
             .into(),
-        mime_type: mime_type.into(),
-        base64_data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        path: path.to_string_lossy().into_owned(),
+        kind,
+        generated_pasted_text,
     })
+}
+
+fn is_large_paste(text: &str) -> bool {
+    text.chars().count() > 1_000 || text.lines().count() > 10
+}
+
+fn prompt_with_attachment_paths(content: &str, attachments: &[Attachment]) -> String {
+    let paths = attachments
+        .iter()
+        .map(|attachment| attachment.path.as_str())
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        return content.to_owned();
+    }
+    if content.is_empty() {
+        paths.join("\n")
+    } else {
+        format!("{content}\n{}", paths.join("\n"))
+    }
 }
 
 fn session_summary_from_jsonl(project_id: ProjectId, path: &Path) -> Option<SessionSummary> {
@@ -2782,6 +2902,8 @@ mod tests {
             sessions_root_override: Some(directory.path().join("sessions")),
             agent_directory_override: Some(directory.path().join("agent")),
             pending_prompt: None,
+            attachment_store: AttachmentStore::open(directory.path().join("attachments")).unwrap(),
+            finder_paste_monitor: None,
             conversation_compacted: false,
             compaction_item_id: None,
             error: None,
@@ -2797,6 +2919,35 @@ mod tests {
             pinned: false,
             last_opened_ms: 1,
         }
+    }
+
+    #[test]
+    fn assistant_text_wraps_thinking_blocks_in_tags() {
+        let message = json!({
+            "role": "assistant",
+            "content": [
+                { "type": "thinking", "thinking": "why" },
+                { "type": "text", "text": "answer" }
+            ]
+        });
+        assert_eq!(
+            assistant_text(&message),
+            "<thinking>\nwhy\n</thinking>\n\nanswer"
+        );
+    }
+
+    #[test]
+    fn assistant_text_skips_empty_thinking_and_reads_string_content() {
+        let message = json!({
+            "content": [
+                { "type": "thinking", "thinking": "   " },
+                { "type": "text", "text": "answer" }
+            ]
+        });
+        assert_eq!(assistant_text(&message), "answer");
+
+        let plain = json!({ "content": "plain" });
+        assert_eq!(assistant_text(&plain), "plain");
     }
 
     #[test]
@@ -3131,6 +3282,46 @@ mod tests {
                 .iter()
                 .all(|command| command.get("type").and_then(Value::as_str) != Some("set_model"))
         );
+    }
+
+    #[test]
+    fn prompt_appends_attachment_paths_without_images_rpc_field() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = FakeRuntime::default();
+        let observer = runtime.clone();
+        let mut app = test_application(&directory, runtime);
+        let project = project("test", directory.path());
+        app.workbench.state.selected_project = Some(project.id);
+        app.workbench
+            .apply(Action::SetAgentStatus(AgentStatus::Ready));
+        let attachment_path = directory.path().join("notes.txt");
+        fs::write(&attachment_path, "notes").unwrap();
+        let attachment = attachment_from_path(&attachment_path, false).unwrap();
+        let expected_path = attachment.path.clone();
+
+        app.submit_prompt(
+            "Please inspect this.".into(),
+            vec![attachment],
+            SubmitMode::Prompt,
+        );
+
+        let prompt = observer
+            .commands()
+            .into_iter()
+            .find(|command| command["type"] == "prompt")
+            .unwrap();
+        assert_eq!(
+            prompt["message"],
+            format!("Please inspect this.\n{expected_path}")
+        );
+        assert!(prompt.get("images").is_none());
+    }
+
+    #[test]
+    fn large_paste_threshold_matches_codex_attachment_behavior() {
+        assert!(!is_large_paste("short\ntext"));
+        assert!(is_large_paste(&"x".repeat(1_001)));
+        assert!(is_large_paste(&"line\n".repeat(11)));
     }
 
     #[test]

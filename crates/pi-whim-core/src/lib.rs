@@ -349,11 +349,23 @@ pub struct SessionSummary {
     pub updated_at_ms: i64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentKind {
+    File,
+    Directory,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ImageAttachment {
+pub struct Attachment {
     pub name: String,
-    pub mime_type: String,
-    pub base64_data: String,
+    /// A canonical absolute path. This is the value supplied to the model.
+    pub path: String,
+    pub kind: AttachmentKind,
+    /// Only files created by the application's long-paste flow may be deleted
+    /// when an unsent attachment is removed.
+    #[serde(default)]
+    pub generated_pasted_text: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -436,7 +448,7 @@ pub struct ConversationItem {
     /// Model id Pi reports for an assistant message; lets the UI confirm a
     /// model switch actually took effect per message.
     pub model: Option<String>,
-    pub attachments: Vec<ImageAttachment>,
+    pub attachments: Vec<Attachment>,
 }
 
 impl ConversationItem {
@@ -492,7 +504,7 @@ pub struct AppState {
     pub selected_session: Option<SessionId>,
     pub conversation: Vec<ConversationItem>,
     pub composer: String,
-    pub composer_attachments: Vec<ImageAttachment>,
+    pub composer_attachments: Vec<Attachment>,
     pub search: String,
     pub language: Language,
     pub bash_policy: BashPolicy,
@@ -539,7 +551,8 @@ pub enum Action {
     SelectProject(ProjectId),
     SelectSession(SessionId),
     SetComposer(String),
-    AddComposerAttachment(ImageAttachment),
+    AddComposerAttachment(Attachment),
+    RemoveComposerAttachment(String),
     ClearComposerAttachments,
     SetSearch(String),
     SetLanguage(Language),
@@ -602,7 +615,19 @@ impl AppState {
             }
             Action::SelectSession(session_id) => self.selected_session = Some(session_id),
             Action::SetComposer(value) => self.composer = value,
-            Action::AddComposerAttachment(attachment) => self.composer_attachments.push(attachment),
+            Action::AddComposerAttachment(attachment) => {
+                if !self
+                    .composer_attachments
+                    .iter()
+                    .any(|existing| existing.path == attachment.path)
+                {
+                    self.composer_attachments.push(attachment);
+                }
+            }
+            Action::RemoveComposerAttachment(path) => {
+                self.composer_attachments
+                    .retain(|attachment| attachment.path != path);
+            }
             Action::ClearComposerAttachments => self.composer_attachments.clear(),
             Action::SetSearch(value) => self.search = value,
             Action::SetLanguage(language) => self.language = language,
@@ -781,6 +806,30 @@ mod tests {
         assert!(item.advance_typewriter(0.1));
         item.reveal_all();
         assert_eq!(item.text_for_display(), "hello");
+    }
+
+    fn attachment(path: &str) -> Attachment {
+        Attachment {
+            name: "example.txt".into(),
+            path: path.into(),
+            kind: AttachmentKind::File,
+            generated_pasted_text: false,
+        }
+    }
+
+    #[test]
+    fn composer_attachments_are_deduplicated_and_removable_by_path() {
+        let mut state = AppState::default();
+        state.dispatch(Action::AddComposerAttachment(attachment(
+            "/tmp/example.txt",
+        )));
+        state.dispatch(Action::AddComposerAttachment(attachment(
+            "/tmp/example.txt",
+        )));
+        assert_eq!(state.composer_attachments.len(), 1);
+
+        state.dispatch(Action::RemoveComposerAttachment("/tmp/example.txt".into()));
+        assert!(state.composer_attachments.is_empty());
     }
 
     #[test]

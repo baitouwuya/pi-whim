@@ -21,6 +21,7 @@ repository = "https://github.com/pi-whim/pi-whim"
 
 [workspace.dependencies]
 anyhow = "1.0"
+arboard = "3.6"
 base64 = "0.22"
 crossbeam-channel = "0.5"
 dirs = "6.0"
@@ -44,6 +45,7 @@ unicode-segmentation = "1.12"
 url = "2.5"
 uuid = { version = "1.15", features = ["v4", "v5", "serde"] }
 walkdir = "2.5"
+
 
 [profile.dev]
 debug = "line-tables-only"

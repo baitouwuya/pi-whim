@@ -394,11 +394,12 @@ export default function agentTeamExtension(pi: ExtensionAPI) {
 		name: "read",
 		label: "read (coordinated)",
 		description:
-			"Read a project file through the Rust coordinator. Small files and exact ranges are returned verbatim; larger files use a bounded, location-preserving adaptive view.",
-		promptSnippet: "Read a file through the coordinated Rust file gateway",
+			"The single entry point for reading text, images, directories, and file metadata through the Rust coordinator. UTF-8 text supports bounded paginated reads; PNG, JPEG, GIF, WebP, and BMP return image content; directories return sorted immediate children; unsupported or binary files return metadata.",
+		promptSnippet: "Read text, images, directories, or file metadata through the coordinated Rust file gateway",
 		promptGuidelines: [
-			"Use offset and limit when an exact source range is needed.",
-			"When the result includes <read_metadata>, pass its next_cursor string back as cursor; use snapshot_id to detect a stale file.",
+			"Use this instead of an image-specific reader; it returns supported image content directly.",
+			"Use offset and limit for exact text ranges or a directory page; directories are immediate children only.",
+			"When the result includes next_cursor, pass it back as cursor; use snapshot_id to detect a stale file or directory.",
 			"Use mode=raw when exact uncompressed content is required.",
 		],
 		executionMode: "parallel",

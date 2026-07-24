@@ -9,11 +9,11 @@ use std::{
     fs,
     path::{Component, Path, PathBuf},
     sync::{Arc, Condvar, Mutex, OnceLock, Weak},
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -25,6 +25,8 @@ const DEFAULT_MAX_TOKENS: usize = 6_000;
 const DEFAULT_MAX_BYTES: usize = 48 * 1024;
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_IMAGE_RESPONSE_BYTES: usize = 700 * 1024;
+const DEFAULT_DIRECTORY_PAGE_SIZE: usize = 200;
+const MAX_DIRECTORY_PAGE_BYTES: usize = 48 * 1024;
 
 #[derive(Debug)]
 pub struct FileCoordinator {
@@ -114,6 +116,41 @@ pub struct ReadArguments {
     pub cursor: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct DirectoryCursor {
+    snapshot_id: String,
+    offset: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct DirectoryEntry {
+    name: String,
+    file_type: &'static str,
+    size: u64,
+    created_at_ms: Option<u128>,
+    modified_at_ms: Option<u128>,
+}
+
+impl DirectoryEntry {
+    fn value(&self) -> Value {
+        json!({
+            "name": self.name,
+            "type": self.file_type,
+            "size": self.size,
+            "created_at_ms": self.created_at_ms,
+            "modified_at_ms": self.modified_at_ms,
+        })
+    }
+}
+
+struct DirectoryEntries(Vec<DirectoryEntry>);
+
+impl DirectoryEntries {
+    fn snapshot_material(&self) -> String {
+        serde_json::to_string(&self.0).expect("directory entries serialize")
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct WriteArguments {
     pub path: String,
@@ -184,6 +221,9 @@ impl FileCoordinator {
         let lane = self.lane(&path);
         let started = Instant::now();
         let _permit = lane.acquire_read();
+        if path.is_dir() {
+            return self.read_directory(actor, &path, &arguments, started);
+        }
         let bytes = fs::read(&path).map_err(|error| io_error("file_not_found", &path, error))?;
         if bytes.len() > MAX_REQUEST_BYTES && arguments.mode == "raw" {
             return Err(FileError::simple(
@@ -232,12 +272,18 @@ impl FileCoordinator {
                 "details": details,
             }));
         }
-        let text = String::from_utf8(bytes).map_err(|_| {
-            FileError::simple(
-                "file_binary_unsupported",
-                "the file is not UTF-8 text or a supported image",
-            )
-        })?;
+        let text = match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(error) => {
+                self.observe(actor, &path, &revision);
+                return Ok(file_metadata_result(
+                    &path,
+                    error.into_bytes().len(),
+                    &revision,
+                    queue,
+                ));
+            }
+        };
         let rendered = file_compression::render_text(
             &path,
             &text,
@@ -258,6 +304,78 @@ impl FileCoordinator {
         self.observe(actor, &path, &revision);
         let _ = request_id;
         Ok(json!({ "text": rendered.text, "details": details }))
+    }
+
+    fn read_directory(
+        &self,
+        actor: &AgentDescriptor,
+        path: &Path,
+        arguments: &ReadArguments,
+        started: Instant,
+    ) -> FileResult {
+        let entries = directory_entries(path)?;
+        let snapshot_id = revision(entries.snapshot_material().as_bytes());
+        let expected_snapshot = arguments
+            .snapshot_id
+            .as_deref()
+            .map(str::to_owned)
+            .or(directory_cursor(arguments.cursor.as_deref())?.map(|cursor| cursor.snapshot_id));
+        if let Some(expected) = expected_snapshot.as_deref()
+            && expected != snapshot_id
+        {
+            return Err(FileError::simple(
+                "stale_snapshot",
+                "the directory changed before this snapshot could be read",
+            ));
+        }
+        let offset = directory_cursor(arguments.cursor.as_deref())?
+            .map(|cursor| cursor.offset)
+            .unwrap_or(0);
+        if offset > entries.0.len() {
+            return Err(FileError::simple(
+                "file_invalid_cursor",
+                "the continuation cursor is invalid",
+            ));
+        }
+        let requested = arguments
+            .limit
+            .unwrap_or(DEFAULT_DIRECTORY_PAGE_SIZE)
+            .min(DEFAULT_DIRECTORY_PAGE_SIZE);
+        let mut selected = Vec::new();
+        let mut rendered_bytes = 0;
+        for entry in entries.0.iter().skip(offset).take(requested) {
+            let value = entry.value();
+            let value_bytes = serde_json::to_vec(&value).map_or(0, |value| value.len());
+            if !selected.is_empty() && rendered_bytes + value_bytes > MAX_DIRECTORY_PAGE_BYTES {
+                break;
+            }
+            rendered_bytes += value_bytes;
+            selected.push(value);
+        }
+        let next_offset = offset + selected.len();
+        let next_cursor = (next_offset < entries.0.len()).then(|| {
+            serde_json::to_string(&DirectoryCursor {
+                snapshot_id: snapshot_id.clone(),
+                offset: next_offset,
+            })
+            .expect("directory cursor serializes")
+        });
+        self.observe(actor, path, &snapshot_id);
+        Ok(json!({
+            "text": format!("Directory {}: {} entries", path.display(), selected.len()),
+            "details": {
+                "path": path,
+                "name": path.file_name().and_then(|name| name.to_str()).unwrap_or("/"),
+                "file_type": "directory",
+                "entries": selected,
+                "offset": offset,
+                "total": entries.0.len(),
+                "revision": snapshot_id,
+                "snapshot_id": snapshot_id,
+                "next_cursor": next_cursor,
+                "queue": { "waited_ms": started.elapsed().as_millis() as u64 },
+            }
+        }))
     }
 
     #[cfg(test)]
@@ -759,6 +877,82 @@ fn cursor_snapshot_id(cursor: Option<&str>) -> Result<Option<String>, FileError>
         .map_err(|_| FileError::simple("file_invalid_cursor", "the continuation cursor is invalid"))
 }
 
+fn directory_cursor(cursor: Option<&str>) -> Result<Option<DirectoryCursor>, FileError> {
+    let Some(cursor) = cursor else {
+        return Ok(None);
+    };
+    serde_json::from_str(cursor)
+        .map(Some)
+        .map_err(|_| FileError::simple("file_invalid_cursor", "the continuation cursor is invalid"))
+}
+
+fn directory_entries(path: &Path) -> Result<DirectoryEntries, FileError> {
+    let entries = fs::read_dir(path).map_err(|error| io_error("file_not_found", path, error))?;
+    let mut entries = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let metadata = entry.metadata().ok()?;
+            let file_type = if metadata.is_dir() {
+                "directory"
+            } else if metadata.is_file() {
+                "file"
+            } else if metadata.file_type().is_symlink() {
+                "symlink"
+            } else {
+                "other"
+            };
+            Some(DirectoryEntry {
+                name: entry.file_name().to_string_lossy().into_owned(),
+                file_type,
+                size: metadata.len(),
+                created_at_ms: system_time_ms(metadata.created().ok()),
+                modified_at_ms: system_time_ms(metadata.modified().ok()),
+            })
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        left.name
+            .to_lowercase()
+            .cmp(&right.name.to_lowercase())
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(DirectoryEntries(entries))
+}
+
+fn file_metadata_result(path: &Path, size: usize, revision: &str, queue: Value) -> Value {
+    let metadata = fs::metadata(path).ok();
+    let file_type = metadata.as_ref().map_or("unknown", |metadata| {
+        if metadata.is_file() {
+            "file"
+        } else if metadata.is_dir() {
+            "directory"
+        } else {
+            "other"
+        }
+    });
+    let details = json!({
+        "path": path,
+        "name": path.file_name().and_then(|name| name.to_str()).unwrap_or("file"),
+        "file_type": file_type,
+        "size": size,
+        "created_at_ms": metadata.as_ref().and_then(|metadata| system_time_ms(metadata.created().ok())),
+        "modified_at_ms": metadata.as_ref().and_then(|metadata| system_time_ms(metadata.modified().ok())),
+        "revision": revision,
+        "snapshot_id": revision,
+        "format": "metadata",
+        "queue": queue,
+    });
+    json!({
+        "text": format!("File metadata for {}", path.display()),
+        "details": details,
+    })
+}
+
+fn system_time_ms(time: Option<SystemTime>) -> Option<u128> {
+    time.and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis())
+}
+
 fn changed_line_summary(before: &str, after: &str) -> String {
     let before_lines: Vec<_> = before.split_inclusive('\n').collect();
     let after_lines: Vec<_> = after.split_inclusive('\n').collect();
@@ -1056,6 +1250,77 @@ mod tests {
             )
             .unwrap();
         assert_eq!(allowed["text"], "host content");
+    }
+
+    #[test]
+    fn read_lists_directory_in_sorted_pages_and_rejects_stale_snapshots() {
+        let directory = tempdir().unwrap();
+        for name in ["zeta.txt", "Alpha.txt", "middle"] {
+            fs::write(directory.path().join(name), name).unwrap();
+        }
+        let coordinator = FileCoordinator::for_project(directory.path().to_path_buf());
+        let first = coordinator
+            .read(
+                &actor(),
+                "directory-first",
+                ReadArguments {
+                    path: ".".into(),
+                    offset: None,
+                    limit: Some(2),
+                    mode: "auto".into(),
+                    max_tokens: None,
+                    max_bytes: None,
+                    snapshot_id: None,
+                    cursor: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(first["details"]["entries"][0]["name"], "Alpha.txt");
+        let cursor = first["details"]["next_cursor"].as_str().unwrap().to_owned();
+        fs::write(directory.path().join("new.txt"), "new").unwrap();
+        let stale = coordinator
+            .read(
+                &actor(),
+                "directory-stale",
+                ReadArguments {
+                    path: ".".into(),
+                    offset: None,
+                    limit: None,
+                    mode: "auto".into(),
+                    max_tokens: None,
+                    max_bytes: None,
+                    snapshot_id: None,
+                    cursor: Some(cursor),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(stale.code, "stale_snapshot");
+    }
+
+    #[test]
+    fn read_returns_binary_file_metadata_instead_of_an_error() {
+        let directory = tempdir().unwrap();
+        fs::write(directory.path().join("archive.bin"), [0, 159, 255]).unwrap();
+        let coordinator = FileCoordinator::for_project(directory.path().to_path_buf());
+        let result = coordinator
+            .read(
+                &actor(),
+                "binary",
+                ReadArguments {
+                    path: "archive.bin".into(),
+                    offset: None,
+                    limit: None,
+                    mode: "auto".into(),
+                    max_tokens: None,
+                    max_bytes: None,
+                    snapshot_id: None,
+                    cursor: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(result["details"]["format"], "metadata");
+        assert_eq!(result["details"]["size"], 3);
+        assert_eq!(result["details"]["file_type"], "file");
     }
 
     #[test]

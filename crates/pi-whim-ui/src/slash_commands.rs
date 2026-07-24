@@ -5,7 +5,7 @@ use crate::icons::Icon;
 #[derive(Clone, Debug)]
 pub(crate) enum SlashCommand {
     NewSession,
-    AddImage,
+    AddAttachment,
     ChooseModel,
     ChooseThinkingLevel,
     Compact,
@@ -251,13 +251,13 @@ fn primary_options(state: &AppState, chinese: bool) -> Vec<SlashCommandOption> {
             chinese,
         ),
         builtin(
-            SlashCommand::AddImage,
+            SlashCommand::AddAttachment,
             "image",
-            "添加图片",
-            "Add image",
-            "从本机选择图片作为附件",
-            "Attach an image from this Mac",
-            Icon::Image,
+            "添加附件",
+            "Add attachment",
+            "从本机选择文件或文件夹作为附件",
+            "Attach files or folders from this Mac",
+            Icon::File,
             chinese,
         ),
     ];

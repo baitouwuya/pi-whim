@@ -17,7 +17,8 @@ pub enum Icon {
     Settings,
     Message,
     Send,
-    Image,
+    File,
+    Folder,
     Cube,
     Brain,
     Compress,
@@ -260,26 +261,18 @@ fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
                 stroke,
             );
         }
-        Icon::Image => {
-            let image = Rect::from_center_size(center, rect.size() * 0.82);
-            painter.rect_stroke(image, CornerRadius::same(2), stroke, StrokeKind::Inside);
-            painter.circle_filled(
-                pos2(
-                    image.right() - image.width() * 0.22,
-                    image.top() + image.height() * 0.25,
-                ),
-                rect.width() * 0.07,
-                color,
-            );
+        Icon::File => {
+            let page = Rect::from_center_size(center, rect.size() * 0.76);
+            painter.rect_stroke(page, CornerRadius::same(2), stroke, StrokeKind::Inside);
             painter.line_segment(
                 [
                     pos2(
-                        image.left() + image.width() * 0.13,
-                        image.bottom() - image.height() * 0.16,
+                        page.left() + page.width() * 0.2,
+                        page.top() + page.height() * 0.38,
                     ),
                     pos2(
-                        image.left() + image.width() * 0.42,
-                        image.top() + image.height() * 0.47,
+                        page.right() - page.width() * 0.2,
+                        page.top() + page.height() * 0.38,
                     ),
                 ],
                 stroke,
@@ -287,13 +280,24 @@ fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             painter.line_segment(
                 [
                     pos2(
-                        image.left() + image.width() * 0.42,
-                        image.top() + image.height() * 0.47,
+                        page.left() + page.width() * 0.2,
+                        page.top() + page.height() * 0.62,
                     ),
                     pos2(
-                        image.right() - image.width() * 0.12,
-                        image.bottom() - image.height() * 0.18,
+                        page.right() - page.width() * 0.34,
+                        page.top() + page.height() * 0.62,
                     ),
+                ],
+                stroke,
+            );
+        }
+        Icon::Folder => {
+            let folder = Rect::from_center_size(center + vec2(0.0, 1.0), rect.size() * 0.8);
+            painter.rect_stroke(folder, CornerRadius::same(2), stroke, StrokeKind::Inside);
+            painter.line_segment(
+                [
+                    pos2(folder.left() + folder.width() * 0.08, folder.top()),
+                    pos2(folder.left() + folder.width() * 0.36, folder.top()),
                 ],
                 stroke,
             );

@@ -395,7 +395,11 @@ impl AgentRuntime for FakeRuntime {
                 _ => Value::Null,
             }))
     }
-    fn send(&self, _command: Value) -> Result<(), RuntimeError> {
+    fn send(&self, command: Value) -> Result<(), RuntimeError> {
+        self.commands
+            .lock()
+            .expect("fake runtime commands")
+            .push(command);
         Ok(())
     }
     fn respond_extension_ui(&self, _response: Value) -> Result<(), RuntimeError> {
