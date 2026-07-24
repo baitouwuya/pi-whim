@@ -66,6 +66,7 @@ struct PiWhimApplication<R: AgentRuntime = PiRpcRuntime> {
     pending_prompt: Option<(String, Vec<Attachment>, SubmitMode)>,
     attachment_store: AttachmentStore,
     finder_paste_monitor: Option<FinderPasteMonitor>,
+    finder_paste_monitor_install_pending: bool,
     conversation_compacted: bool,
     /// Item id of the in-progress compaction call card, so compaction_end can
     /// update the same conversation entry with the result instead of adding a
@@ -145,7 +146,8 @@ impl Default for PiWhimApplication<PiRpcRuntime> {
             agent_directory_override: None,
             pending_prompt: None,
             attachment_store: AttachmentStore::open_default(),
-            finder_paste_monitor: FinderPasteMonitor::install(),
+            finder_paste_monitor: None,
+            finder_paste_monitor_install_pending: true,
             conversation_compacted: false,
             compaction_item_id: None,
             error: None,
@@ -157,9 +159,6 @@ impl Default for PiWhimApplication<PiRpcRuntime> {
 impl<R: AgentRuntime> eframe::App for PiWhimApplication<R> {
     fn raw_input_hook(&mut self, context: &egui::Context, raw_input: &mut egui::RawInput) {
         let composer_focused = self.workbench.composer_has_focus(context);
-        if let Some(monitor) = self.finder_paste_monitor.as_ref() {
-            monitor.set_composer_focused(composer_focused);
-        }
         if !composer_focused {
             return;
         }
@@ -170,6 +169,10 @@ impl<R: AgentRuntime> eframe::App for PiWhimApplication<R> {
     }
 
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.finder_paste_monitor_install_pending {
+            self.finder_paste_monitor = FinderPasteMonitor::install();
+            self.finder_paste_monitor_install_pending = false;
+        }
         self.consume_finder_paste(context);
         self.consume_runtime_events();
         self.consume_capability_catalog();
@@ -2936,6 +2939,7 @@ mod tests {
             pending_prompt: None,
             attachment_store: AttachmentStore::open(directory.path().join("attachments")).unwrap(),
             finder_paste_monitor: None,
+            finder_paste_monitor_install_pending: false,
             conversation_compacted: false,
             compaction_item_id: None,
             error: None,

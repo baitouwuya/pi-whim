@@ -43,6 +43,10 @@ pub const WARNING: Color32 = Color32::from_rgb(196, 143, 60);
 pub const ERROR_RED: Color32 = Color32::from_rgb(184, 107, 82);
 pub const ERROR_STRONG: Color32 = Color32::from_rgb(132, 79, 59);
 
+fn composer_input_id() -> egui::Id {
+    egui::Id::new("composer-input")
+}
+
 /// Semi-transparent tint of a palette color, used for banner and pill fills.
 pub fn tint(color: Color32, alpha: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
@@ -370,7 +374,7 @@ impl Workbench {
     }
 
     pub fn composer_has_focus(&self, context: &egui::Context) -> bool {
-        context.memory(|memory| memory.has_focus(egui::Id::new("composer-input")))
+        context.memory(|memory| memory.has_focus(composer_input_id()))
     }
 
     /// Used by the ui_preview example to screenshot the settings page.
@@ -1701,14 +1705,14 @@ impl Workbench {
                                             &mut self.composer_ime_composing,
                                             &context.input(|input| input.events.clone()),
                                         );
-                                        let composer_id = ui.make_persistent_id("composer-input");
+                                        let composer_id = composer_input_id();
                                         let composer_hint =
                                             tr(&self.state, "composer-placeholder").to_owned();
                                         // Consume toolbar navigation before TextEdit can turn Tab into focus traversal.
                                         let slash_open = self.slash_toolbar(context);
                                         let input = ui.add(
                                             TextEdit::multiline(&mut self.state.composer)
-                                                .id_source(composer_id)
+                                                .id(composer_id)
                                                 .hint_text(composer_hint)
                                                 .frame(false)
                                                 .desired_rows(3)

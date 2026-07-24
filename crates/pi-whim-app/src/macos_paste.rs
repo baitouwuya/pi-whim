@@ -1,10 +1,7 @@
 #[cfg(target_os = "macos")]
 use std::{
     ptr,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex},
 };
 
 #[cfg(target_os = "macos")]
@@ -28,7 +25,6 @@ pub enum ClipboardAttachment {
 
 #[cfg(target_os = "macos")]
 pub struct FinderPasteMonitor {
-    composer_focused: Arc<AtomicBool>,
     queued_attachments: Arc<Mutex<Vec<ClipboardAttachment>>>,
     _monitor: Retained<AnyObject>,
 }
@@ -36,8 +32,6 @@ pub struct FinderPasteMonitor {
 #[cfg(target_os = "macos")]
 impl FinderPasteMonitor {
     pub fn install() -> Option<Self> {
-        let composer_focused = Arc::new(AtomicBool::new(false));
-        let callback_focused = composer_focused.clone();
         let queued_attachments = Arc::new(Mutex::new(Vec::new()));
         let callback_attachments = queued_attachments.clone();
         let callback = RcBlock::new(move |event: std::ptr::NonNull<NSEvent>| {
@@ -51,49 +45,40 @@ impl FinderPasteMonitor {
             if !is_command_v {
                 return event as *const NSEvent as *mut NSEvent;
             }
-            if !callback_focused.load(Ordering::Relaxed) {
-                event as *const NSEvent as *mut NSEvent
-            } else {
-                let attachment = arboard::Clipboard::new().ok().and_then(|mut clipboard| {
-                    clipboard
-                        .get()
-                        .file_list()
-                        .ok()
-                        .filter(|paths| !paths.is_empty())
-                        .map(ClipboardAttachment::Paths)
-                        .or_else(|| {
-                            clipboard
-                                .get_image()
-                                .ok()
-                                .map(|image| ClipboardAttachment::Image {
-                                    width: image.width,
-                                    height: image.height,
-                                    rgba: image.bytes.into_owned(),
-                                })
-                        })
-                });
-                if let Some(attachment) = attachment {
-                    if let Ok(mut queued) = callback_attachments.lock() {
-                        queued.push(attachment);
-                    }
-                    ptr::null_mut()
-                } else {
-                    event as *const NSEvent as *mut NSEvent
+            let attachment = arboard::Clipboard::new().ok().and_then(|mut clipboard| {
+                clipboard
+                    .get()
+                    .file_list()
+                    .ok()
+                    .filter(|paths| !paths.is_empty())
+                    .map(ClipboardAttachment::Paths)
+                    .or_else(|| {
+                        clipboard
+                            .get_image()
+                            .ok()
+                            .map(|image| ClipboardAttachment::Image {
+                                width: image.width,
+                                height: image.height,
+                                rgba: image.bytes.into_owned(),
+                            })
+                    })
+            });
+            if let Some(attachment) = attachment {
+                if let Ok(mut queued) = callback_attachments.lock() {
+                    queued.push(attachment);
                 }
+                ptr::null_mut()
+            } else {
+                event as *const NSEvent as *mut NSEvent
             }
         });
         let monitor = unsafe {
             NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::KeyDown, &callback)
         }?;
         Some(Self {
-            composer_focused,
             queued_attachments,
             _monitor: monitor,
         })
-    }
-
-    pub fn set_composer_focused(&self, focused: bool) {
-        self.composer_focused.store(focused, Ordering::Relaxed);
     }
 
     pub fn drain_attachments(&self) -> Vec<ClipboardAttachment> {
@@ -112,8 +97,6 @@ impl FinderPasteMonitor {
     pub fn install() -> Option<Self> {
         None
     }
-
-    pub fn set_composer_focused(&self, _focused: bool) {}
 
     pub fn drain_attachments(&self) -> Vec<ClipboardAttachment> {
         Vec::new()
