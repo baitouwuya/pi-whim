@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::{file_compression, model::AgentDescriptor};
+use crate::{file_compression, image_compression, model::AgentDescriptor};
 #[cfg(test)]
 use pi_whim_core::AgentPermissionLevel;
 
@@ -244,44 +244,76 @@ impl FileCoordinator {
         }
         let queue = json!({ "waited_ms": started.elapsed().as_millis() as u64 });
         if let Some(mime_type) = image_mime(&path, &bytes) {
-            if bytes.len() > MAX_REQUEST_BYTES {
-                return Err(raw_read_too_large(&path, bytes.len(), "image"));
-            }
-            if bytes.len() > MAX_IMAGE_RESPONSE_BYTES && arguments.mode != "raw" {
-                let retry = json!({ "path": path, "mode": "raw" });
-                return Err(FileError {
-                    code: "file_too_large",
-                    message: format!(
-                        "image is {} bytes and exceeds the normal {} byte response limit; prefer a subagent for large-file inspection, or retry read with {} to return the complete image (up to {} bytes)",
-                        bytes.len(),
+            let original_bytes = bytes.len();
+            let compressed = if original_bytes > MAX_IMAGE_RESPONSE_BYTES && arguments.mode != "raw"
+            {
+                Some(
+                    image_compression::compress_to_limit(
+                        &bytes,
+                        mime_type,
                         MAX_IMAGE_RESPONSE_BYTES,
-                        retry,
-                        MAX_REQUEST_BYTES
-                    ),
-                    details: json!({
-                        "path": path,
-                        "bytes": bytes.len(),
-                        "normal_limit_bytes": MAX_IMAGE_RESPONSE_BYTES,
-                        "raw_limit_bytes": MAX_REQUEST_BYTES,
-                        "recommended_action": "delegate large-file inspection to a subagent",
-                        "retry": retry,
-                    }),
-                });
-            }
+                    )
+                    .map_err(|error| image_compression_error(&path, original_bytes, error))?,
+                )
+            } else {
+                None
+            };
+            let was_compressed = compressed.is_some();
+            let (
+                image_bytes,
+                delivered_mime,
+                original_width,
+                original_height,
+                width,
+                height,
+                quality,
+                has_transparency,
+            ) = match compressed {
+                Some(image) => (
+                    image.bytes,
+                    image.mime_type,
+                    Some(image.original_width),
+                    Some(image.original_height),
+                    Some(image.width),
+                    Some(image.height),
+                    image.quality,
+                    Some(image.has_transparency),
+                ),
+                None => (bytes, mime_type, None, None, None, None, None, None),
+            };
             self.observe(actor, &path, &revision);
             let details = json!({
                 "path": path,
                 "revision": revision,
                 "snapshot_id": revision,
                 "format": "binary",
-                "mime_type": mime_type,
-                "bytes": bytes.len(),
-                "complete": arguments.mode == "raw" || bytes.len() <= MAX_IMAGE_RESPONSE_BYTES,
+                "mime_type": delivered_mime,
+                "original_mime_type": mime_type,
+                "bytes": image_bytes.len(),
+                "original_bytes": original_bytes,
+                "compressed": was_compressed,
+                "complete": true,
+                "exact": !was_compressed,
+                "cropped": false,
+                "transparency_preserved": true,
+                "has_transparency": has_transparency,
+                "original_width": original_width,
+                "original_height": original_height,
+                "width": width,
+                "height": height,
+                "quality": quality,
                 "queue": queue,
             });
+            let text = if was_compressed {
+                format!(
+                    "Read complete image [{delivered_mime}], automatically compressed from {mime_type} without cropping"
+                )
+            } else {
+                format!("Read image file [{delivered_mime}]")
+            };
             return Ok(json!({
-                "text": format!("Read image file [{mime_type}]"),
-                "image": { "data": BASE64.encode(bytes), "mime_type": mime_type },
+                "text": text,
+                "image": { "data": BASE64.encode(image_bytes), "mime_type": delivered_mime },
                 "details": details,
             }));
         }
@@ -869,6 +901,27 @@ fn raw_read_too_large(path: &Path, bytes: usize, kind: &str) -> FileError {
     }
 }
 
+fn image_compression_error(path: &Path, bytes: usize, error: String) -> FileError {
+    let retry = (bytes <= MAX_REQUEST_BYTES).then(|| json!({ "path": path, "mode": "raw" }));
+    let retry_message = retry
+        .as_ref()
+        .map(|retry| format!(", or retry with {retry} for exact original bytes"))
+        .unwrap_or_default();
+    FileError {
+        code: "image_compression_failed",
+        message: format!(
+            "automatic whole-image compression failed: {error}; delegate inspection to a subagent{retry_message}"
+        ),
+        details: json!({
+            "path": path,
+            "bytes": bytes,
+            "raw_limit_bytes": MAX_REQUEST_BYTES,
+            "recommended_action": "delegate image inspection to a subagent",
+            "retry": retry,
+        }),
+    }
+}
+
 impl FileError {
     fn simple(code: &'static str, message: impl Into<String>) -> Self {
         Self {
@@ -1069,6 +1122,7 @@ fn lexical_normalize(path: &Path) -> Result<PathBuf, FileError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::{ExtendedColorType, ImageEncoder, ImageFormat, Rgb, RgbImage};
     use std::{sync::mpsc, thread, time::Duration};
     use tempfile::tempdir;
 
@@ -1352,15 +1406,32 @@ mod tests {
     }
 
     #[test]
-    fn large_images_recommend_raw_or_subagent_and_raw_returns_all_bytes() {
+    fn large_images_auto_compress_without_cropping_and_raw_returns_all_bytes() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("large.png");
-        let mut image = vec![0; MAX_IMAGE_RESPONSE_BYTES + 1];
-        image[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        let source = RgbImage::from_fn(768, 768, |x, y| {
+            let mut value = x
+                .wrapping_mul(0x9e37_79b9)
+                .wrapping_add(y.wrapping_mul(0x85eb_ca6b));
+            value ^= value >> 16;
+            value = value.wrapping_mul(0x7feb_352d);
+            value ^= value >> 15;
+            Rgb([value as u8, (value >> 8) as u8, (value >> 16) as u8])
+        });
+        let mut image = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut image)
+            .write_image(
+                source.as_raw(),
+                source.width(),
+                source.height(),
+                ExtendedColorType::Rgb8,
+            )
+            .unwrap();
+        assert!(image.len() > MAX_IMAGE_RESPONSE_BYTES);
         fs::write(&path, &image).unwrap();
         let coordinator = FileCoordinator::for_project(directory.path().to_path_buf());
 
-        let error = coordinator
+        let result = coordinator
             .read(
                 &actor(),
                 "large-image-auto",
@@ -1375,14 +1446,23 @@ mod tests {
                     cursor: None,
                 },
             )
-            .unwrap_err();
-        assert_eq!(error.code, "file_too_large");
-        assert!(error.message.contains("mode"));
-        assert!(error.message.contains("raw"));
-        assert!(error.message.contains("subagent"));
-        assert_eq!(error.details["retry"]["mode"], "raw");
+            .unwrap();
+        let returned = BASE64
+            .decode(result["image"]["data"].as_str().unwrap())
+            .unwrap();
+        assert!(returned.len() <= MAX_IMAGE_RESPONSE_BYTES);
+        assert_eq!(result["image"]["mime_type"], "image/jpeg");
+        assert_eq!(result["details"]["original_mime_type"], "image/png");
+        assert_eq!(result["details"]["original_bytes"], image.len());
+        assert_eq!(result["details"]["compressed"], true);
+        assert_eq!(result["details"]["complete"], true);
+        assert_eq!(result["details"]["exact"], false);
+        assert_eq!(result["details"]["cropped"], false);
+        assert_eq!(result["details"]["transparency_preserved"], true);
+        let decoded = image::load_from_memory_with_format(&returned, ImageFormat::Jpeg).unwrap();
+        assert_eq!(decoded.width(), decoded.height());
 
-        let result = coordinator
+        let raw = coordinator
             .read(
                 &actor(),
                 "large-image-raw",
@@ -1398,12 +1478,13 @@ mod tests {
                 },
             )
             .unwrap();
-        let returned = BASE64
-            .decode(result["image"]["data"].as_str().unwrap())
+        let raw_bytes = BASE64
+            .decode(raw["image"]["data"].as_str().unwrap())
             .unwrap();
-        assert_eq!(returned, image);
-        assert_eq!(result["details"]["bytes"], MAX_IMAGE_RESPONSE_BYTES + 1);
-        assert_eq!(result["details"]["complete"], true);
+        assert_eq!(raw_bytes, image);
+        assert_eq!(raw["details"]["bytes"], image.len());
+        assert_eq!(raw["details"]["compressed"], false);
+        assert_eq!(raw["details"]["exact"], true);
     }
 
     #[test]

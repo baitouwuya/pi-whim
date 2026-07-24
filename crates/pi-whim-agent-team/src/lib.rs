@@ -6,6 +6,7 @@ mod catalog;
 mod fetch;
 mod file_compression;
 mod file_dispatch;
+mod image_compression;
 mod model;
 mod process;
 mod routing;
