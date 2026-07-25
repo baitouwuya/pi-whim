@@ -2749,9 +2749,11 @@ dependencies = [
 name = "pi-whim-engine"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-channel",
  "dirs",
  "pi-whim-core",
  "pi-whim-persistence",
+ "pi-whim-runtime",
  "serde_json",
  "unicode-segmentation",
  "ureq",

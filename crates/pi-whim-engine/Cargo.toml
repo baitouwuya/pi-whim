@@ -5,9 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+crossbeam-channel.workspace = true
 dirs.workspace = true
 pi-whim-core = { path = "../pi-whim-core" }
 pi-whim-persistence = { path = "../pi-whim-persistence" }
+pi-whim-runtime = { path = "../pi-whim-runtime" }
 serde_json.workspace = true
 unicode-segmentation.workspace = true
 ureq.workspace = true

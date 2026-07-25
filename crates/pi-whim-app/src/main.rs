@@ -26,6 +26,7 @@ use uuid::Uuid;
 
 use macos_paste::{ClipboardAttachment, FinderPasteMonitor};
 use pi_whim_catalog::ModelCapabilityResolver;
+use pi_whim_engine::pool::{SessionPool, SessionRuntime, is_draft};
 use pi_whim_engine::protocol::{
     assistant_text, model_option, queue_mode, queue_mode_name, session_metrics, tool_call_report,
     tool_event_details, tool_result_report, tool_result_summary,
@@ -64,12 +65,7 @@ struct PiWhimApplication<R: AgentRuntime = PiRpcRuntime> {
     store: Option<SqliteStore>,
     secrets: MacosKeychainStore,
     runtime_factory: Box<dyn Fn() -> R + Send>,
-    /// One Pi process per session, keyed by session file path (or a `draft://`
-    /// key until Pi reports the file). Parallel sessions never share a
-    /// process, so switching the visible session cannot abort a running one.
-    sessions: HashMap<String, SessionRuntime<R>>,
-    /// Pool key of the session shown in the conversation view.
-    active_session: Option<String>,
+    sessions: SessionPool<R>,
     /// Extension confirmations and supervisor interactions are tagged with the
     /// owning session so background agents can still prompt the user.
     pending_extension_request: Option<(String, Value)>,
@@ -82,23 +78,6 @@ struct PiWhimApplication<R: AgentRuntime = PiRpcRuntime> {
     finder_paste_monitor_install_pending: bool,
     error: Option<String>,
     notice: Option<String>,
-}
-
-struct SessionRuntime<R: AgentRuntime> {
-    runtime: R,
-    events: crossbeam_channel::Receiver<RuntimeEvent>,
-    project_id: ProjectId,
-    /// True while the agent is streaming or compacting.
-    running: bool,
-    assistant_message_id: Option<String>,
-    conversation_compacted: bool,
-    /// Item id of the in-progress compaction call card, so compaction_end can
-    /// update the same conversation entry with the result instead of adding a
-    /// second card.
-    compaction_item_id: Option<String>,
-    pending_prompt: Option<(String, Vec<Attachment>, SubmitMode)>,
-    /// Last time the session was activated; drives most-recently-used picks.
-    last_used_ms: i64,
 }
 
 impl Default for PiWhimApplication<PiRpcRuntime> {
@@ -159,8 +138,7 @@ impl Default for PiWhimApplication<PiRpcRuntime> {
             store,
             secrets: MacosKeychainStore::default(),
             runtime_factory: Box::new(PiRpcRuntime::default),
-            sessions: HashMap::new(),
-            active_session: None,
+            sessions: SessionPool::new(),
             pending_extension_request: None,
             pending_interactions: Vec::new(),
             capability_resolver,
@@ -225,7 +203,7 @@ impl<R: AgentRuntime> eframe::App for PiWhimApplication<R> {
                 self.notice = None;
             }
         }
-        let session_running = self.sessions.values().any(|session| session.running);
+        let session_running = self.sessions.any_running();
         let agent_busy = matches!(
             self.workbench.state.session_status,
             SessionStatus::Starting | SessionStatus::Streaming | SessionStatus::Compacting
@@ -718,13 +696,11 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     }
 
     fn active(&self) -> Option<&SessionRuntime<R>> {
-        self.active_session
-            .as_ref()
-            .and_then(|key| self.sessions.get(key))
+        self.sessions.active()
     }
 
     fn active_mut(&mut self) -> Option<&mut SessionRuntime<R>> {
-        let key = self.active_session.clone()?;
+        let key = self.sessions.active_key().map(str::to_owned)?;
         self.sessions.get_mut(&key)
     }
 
@@ -748,12 +724,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     /// exists, otherwise resume the newest stored session, otherwise start a
     /// fresh one. Previously running sessions keep their processes untouched.
     fn start_project(&mut self, project_id: ProjectId) {
-        let mru_live = self
-            .sessions
-            .iter()
-            .filter(|(_, session)| session.project_id == project_id)
-            .max_by_key(|(_, session)| session.last_used_ms)
-            .map(|(key, _)| key.clone());
+        let mru_live = self.sessions.most_recent_in(project_id).map(str::to_owned);
         if let Some(key) = mru_live {
             self.activate_session(&key);
             return;
@@ -804,7 +775,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 return None;
             }
         };
-        if self.active_session.is_none() {
+        if self.sessions.active_key().is_none() {
             self.workbench
                 .apply(Action::SetSessionStatus(SessionStatus::Starting));
         }
@@ -812,7 +783,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         match ensure_agent_team_extension(&sessions_path) {
             Ok(path) => extension_paths.push(path.to_string_lossy().into_owned()),
             Err(error) => {
-                if self.active_session.is_none() {
+                if self.sessions.active_key().is_none() {
                     self.workbench
                         .apply(Action::SetSessionStatus(SessionStatus::Failed(
                             error.to_string(),
@@ -841,7 +812,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             agent_team_config: self.workbench.state.agent_team_config.clone(),
             search_engines: self.workbench.state.search_engine_profiles.clone(),
         }) {
-            if self.active_session.is_none() {
+            if self.sessions.active_key().is_none() {
                 self.workbench
                     .apply(Action::SetSessionStatus(SessionStatus::Failed(
                         error.to_string(),
@@ -884,15 +855,13 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     /// Bring a pooled session to the foreground: the conversation view binds to
     /// its process while every other session keeps running in the background.
     fn activate_session(&mut self, key: &str) {
-        let Some(session) = self.sessions.get_mut(key) else {
+        let Some(session) = self.sessions.activate(key, now_ms()) else {
             return;
         };
-        session.last_used_ms = now_ms();
         let project_id = session.project_id;
         let running = session.running;
-        self.active_session = Some(key.to_owned());
         self.workbench.apply(Action::SelectProject(project_id));
-        if !key.starts_with("draft://") {
+        if !is_draft(key) {
             self.workbench
                 .apply(Action::SelectSession(stable_session_id(key)));
         }
@@ -909,42 +878,34 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     /// Re-key a pooled session once Pi reveals its real session file (fresh
     /// sessions start under a `draft://` key; fork/clone move to a new file).
     fn rekey_session(&mut self, from: &str, to: &str) {
-        if from == to || !self.sessions.contains_key(from) {
-            return;
-        }
-        if let Some(mut session) = self.sessions.remove(from) {
-            session.last_used_ms = now_ms();
-            let was_active = self.active_session.as_deref() == Some(from);
-            self.sessions.insert(to.to_owned(), session);
-            if was_active {
-                self.active_session = Some(to.to_owned());
-                self.workbench
-                    .apply(Action::SelectSession(stable_session_id(to)));
-            }
+        if let Some(outcome) = self.sessions.rekey(from, to, now_ms())
+            && outcome.was_active
+        {
+            self.workbench
+                .apply(Action::SelectSession(stable_session_id(to)));
         }
     }
 
     fn stop_project_runtimes(&mut self, project_id: ProjectId) {
-        let keys: Vec<String> = self
+        // Note the visible session before removing anything: the pool drops its
+        // own selection as soon as that session leaves.
+        let was_visible = self
             .sessions
-            .iter()
-            .filter(|(_, session)| session.project_id == project_id)
-            .map(|(key, _)| key.clone())
-            .collect();
-        for key in keys {
-            if let Some(mut session) = self.sessions.remove(&key) {
-                let _ = session.runtime.stop();
-                self.workbench.apply(Action::SessionRunning {
-                    path: key.clone(),
-                    running: false,
-                });
-                if self.active_session.as_deref() == Some(key.as_str()) {
-                    self.active_session = None;
-                    self.workbench.apply(Action::ClearConversation);
-                    self.workbench
-                        .apply(Action::SetSessionStatus(SessionStatus::Offline));
-                }
-            }
+            .active_key()
+            .and_then(|key| self.sessions.get(key))
+            .is_some_and(|session| session.project_id == project_id);
+
+        for key in self.sessions.remove_project(project_id) {
+            self.workbench.apply(Action::SessionRunning {
+                path: key,
+                running: false,
+            });
+        }
+
+        if was_visible {
+            self.workbench.apply(Action::ClearConversation);
+            self.workbench
+                .apply(Action::SetSessionStatus(SessionStatus::Offline));
         }
     }
 
@@ -1082,7 +1043,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 return;
             }
         }
-        if self.active_session.as_deref() == Some(key) {
+        if self.sessions.active_key() == Some(key) {
             self.refresh_runtime_controls();
         }
     }
@@ -1156,7 +1117,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     /// session file (re-keying the pool when fork/clone moved to a new file)
     /// and reload the visible conversation.
     fn refresh_session_state(&mut self, project_id: ProjectId) {
-        let Some(key) = self.active_session.clone() else {
+        let Some(key) = self.sessions.active_key().map(str::to_owned) else {
             return;
         };
         match self.active_command(json!({"type":"get_state"})) {
@@ -1298,8 +1259,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     /// when already pooled); the session being left keeps running, so parallel
     /// L0 agents never abort each other.
     fn switch_session(&mut self, project_id: ProjectId, path: String) {
-        if !self.sessions.contains_key(&path)
-            && self.launch_session(project_id, Some(&path)).is_none()
+        if !self.sessions.contains(&path) && self.launch_session(project_id, Some(&path)).is_none()
         {
             return;
         }
@@ -1322,13 +1282,13 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         if let Some(project_id) = self.workbench.state.selected_project {
             self.index_session(project_id, &path, Some(&title));
         }
-        if self.active_session.as_deref() == Some(path.as_str()) {
+        if self.sessions.active_key() == Some(path.as_str()) {
             self.refresh_runtime_controls();
         }
     }
 
     fn set_current_session_name(&mut self, name: String) {
-        let Some(key) = self.active_session.clone() else {
+        let Some(key) = self.sessions.active_key().map(str::to_owned) else {
             self.error = Some("No active session to name.".into());
             return;
         };
@@ -1408,14 +1368,14 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     fn delete_session(&mut self, path: String) {
         // Stop the session's own process first so it cannot rewrite the file
         // after the delete; the conversation moves to another live session.
+        let was_visible = self.sessions.active_key() == Some(path.as_str());
         if let Some(mut session) = self.sessions.remove(&path) {
             let _ = session.runtime.stop();
             self.workbench.apply(Action::SessionRunning {
                 path: path.clone(),
                 running: false,
             });
-            if self.active_session.as_deref() == Some(path.as_str()) {
-                self.active_session = None;
+            if was_visible {
                 self.workbench.apply(Action::ClearConversation);
                 self.workbench
                     .apply(Action::SetSessionStatus(SessionStatus::Offline));
@@ -1602,7 +1562,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 .iter()
                 .any(|message| message.role != ConversationRole::User);
         if defer_for_compaction {
-            let Some(key) = self.active_session.clone() else {
+            let Some(key) = self.sessions.active_key().map(str::to_owned) else {
                 self.error = Some("No active session.".into());
                 return;
             };
@@ -1620,7 +1580,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             }
             return;
         }
-        let Some(key) = self.active_session.clone() else {
+        let Some(key) = self.sessions.active_key().map(str::to_owned) else {
             self.error = Some("No active session.".into());
             return;
         };
@@ -1659,7 +1619,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             self.error = Some(error.to_string());
             return;
         }
-        let is_active = self.active_session.as_deref() == Some(key);
+        let is_active = self.sessions.active_key() == Some(key);
         if let Some(session) = self.sessions.get_mut(key) {
             session.running = true;
         }
@@ -1710,8 +1670,13 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     /// dots, sidebar titles) so their progress survives until they are shown.
     fn consume_runtime_events(&mut self) {
         let mut drained: Vec<(String, RuntimeEvent)> = Vec::new();
-        for (key, session) in &self.sessions {
-            drained.extend(session.events.try_iter().map(|event| (key.clone(), event)));
+        for (key, session) in self.sessions.iter() {
+            drained.extend(
+                session
+                    .events
+                    .try_iter()
+                    .map(|event| (key.to_owned(), event)),
+            );
         }
         for (key, event) in drained {
             self.handle_runtime_event(&key, event);
@@ -1719,7 +1684,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     }
 
     fn handle_runtime_event(&mut self, key: &str, event: RuntimeEvent) {
-        let is_active = self.active_session.as_deref() == Some(key);
+        let is_active = self.sessions.active_key() == Some(key);
         match event {
             RuntimeEvent::Agent(value) => self.apply_agent_event(key, value),
             RuntimeEvent::ExtensionUi(value) => {
@@ -1747,7 +1712,6 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                     running: false,
                 });
                 if is_active {
-                    self.active_session = None;
                     self.workbench
                         .apply(Action::SetSessionStatus(SessionStatus::Failed(format!(
                             "Pi exited: {code:?}"
@@ -1764,7 +1728,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     }
 
     fn apply_agent_event(&mut self, key: &str, event: Value) {
-        let is_active = self.active_session.as_deref() == Some(key);
+        let is_active = self.sessions.active_key() == Some(key);
         match event.get("type").and_then(Value::as_str) {
             Some("message_start") | Some("message_update") => {
                 let message = event.get("message").cloned().unwrap_or(Value::Null);
@@ -2282,8 +2246,7 @@ mod tests {
             store: Some(SqliteStore::open(directory.path().join("test.sqlite")).unwrap()),
             secrets: MacosKeychainStore::default(),
             runtime_factory: Box::new(move || factory_runtime.clone()),
-            sessions: HashMap::new(),
-            active_session: None,
+            sessions: SessionPool::new(),
             pending_extension_request: None,
             pending_interactions: Vec::new(),
             capability_resolver: ModelCapabilityResolver::new(
@@ -2318,7 +2281,7 @@ mod tests {
         app.workbench
             .apply(Action::ProjectsLoaded(vec![project.clone()]));
         app.start_new_session(project.id);
-        assert!(app.active_session.is_some());
+        assert!(app.sessions.active_key().is_some());
     }
 
     #[test]
@@ -2371,7 +2334,7 @@ mod tests {
                 Some("new_session") | Some("switch_session")
             )
         }));
-        assert_eq!(app.sessions.len(), 3);
+        assert_eq!(app.sessions.iter().count(), 3);
     }
 
     #[test]
@@ -2382,7 +2345,7 @@ mod tests {
         let mut app = test_application(&directory, runtime);
         start_test_session(&mut app, &directory);
         let project_id = app.workbench.state.selected_project.unwrap();
-        let running_key = app.active_session.clone().unwrap();
+        let running_key = app.sessions.active_key().unwrap().to_owned();
 
         // Session A starts streaming.
         app.submit_prompt("long task".into(), Vec::new(), SubmitMode::Prompt);
@@ -2395,8 +2358,8 @@ mod tests {
         // Switching away must not abort A: no abort/new_session/switch_session
         // RPCs, and A's process stays pooled with its running flag set.
         app.switch_session(project_id, "/sessions/b.jsonl".into());
-        assert_eq!(app.active_session.as_deref(), Some("/sessions/b.jsonl"));
-        assert_eq!(app.sessions.len(), 2);
+        assert_eq!(app.sessions.active_key(), Some("/sessions/b.jsonl"));
+        assert_eq!(app.sessions.iter().count(), 2);
         assert!(
             app.sessions
                 .get(&running_key)
@@ -2411,8 +2374,8 @@ mod tests {
 
         // Switching back reuses A's own process instead of starting a third.
         app.switch_session(project_id, running_key.clone());
-        assert_eq!(app.active_session.as_deref(), Some(running_key.as_str()));
-        assert_eq!(app.sessions.len(), 2);
+        assert_eq!(app.sessions.active_key(), Some(running_key.as_str()));
+        assert_eq!(app.sessions.iter().count(), 2);
         assert_eq!(observer.starts().len(), 2);
     }
 
@@ -2440,7 +2403,7 @@ mod tests {
         start_test_session(&mut app, &directory);
         let baseline = observer.commands().len();
 
-        let key = app.active_session.clone().unwrap();
+        let key = app.sessions.active_key().unwrap().to_owned();
         app.set_model_on(
             &key,
             ModelOption {
