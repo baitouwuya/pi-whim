@@ -16,6 +16,8 @@ use std::collections::HashMap;
 use pi_whim_core::{Attachment, ProjectId, SubmitMode};
 use pi_whim_runtime::{AgentRuntime, RuntimeEvent};
 
+use crate::mailbox::{Delivery, Mailbox, SessionToken};
+
 /// Prefix for sessions Pi has not yet written a transcript for.
 pub const DRAFT_PREFIX: &str = "draft://";
 
@@ -27,7 +29,17 @@ pub fn is_draft(key: &str) -> bool {
 /// One Pi process and the state its current turn accumulates.
 pub struct SessionRuntime<R: AgentRuntime> {
     pub runtime: R,
-    pub events: crossbeam_channel::Receiver<RuntimeEvent>,
+    /// This process's events, until the pool takes them for its mailbox.
+    ///
+    /// Not public, and taken rather than cloned: a cloned crossbeam receiver
+    /// competes with the original for each event, so two readers would split the
+    /// stream between them rather than both seeing it.
+    events: Option<crossbeam_channel::Receiver<RuntimeEvent>>,
+    /// Identity that survives a rekey, for labelling this session's events.
+    ///
+    /// Minted here rather than passed in so no session can be pooled without
+    /// one, and so two sessions cannot be given the same token by mistake.
+    pub token: SessionToken,
     pub project_id: ProjectId,
     /// True while the agent is streaming or compacting.
     pub running: bool,
@@ -50,7 +62,8 @@ impl<R: AgentRuntime> SessionRuntime<R> {
     ) -> Self {
         Self {
             runtime,
-            events,
+            events: Some(events),
+            token: SessionToken::next(),
             project_id,
             running: false,
             assistant_message_id: None,
@@ -74,6 +87,8 @@ pub struct Rekeyed {
 pub struct SessionPool<R: AgentRuntime> {
     sessions: HashMap<String, SessionRuntime<R>>,
     active: Option<String>,
+    /// Every pooled session's events on one channel.
+    mailbox: Mailbox,
 }
 
 impl<R: AgentRuntime> Default for SessionPool<R> {
@@ -81,6 +96,7 @@ impl<R: AgentRuntime> Default for SessionPool<R> {
         Self {
             sessions: HashMap::new(),
             active: None,
+            mailbox: Mailbox::new(),
         }
     }
 }
@@ -90,8 +106,27 @@ impl<R: AgentRuntime> SessionPool<R> {
         Self::default()
     }
 
-    pub fn insert(&mut self, key: impl Into<String>, session: SessionRuntime<R>) {
+    /// Pool a session and start merging its events.
+    pub fn insert(&mut self, key: impl Into<String>, mut session: SessionRuntime<R>) {
+        // Merged on the way in rather than by a separate call, so a session
+        // cannot be pooled with its events going nowhere.
+        if let Some(events) = session.events.take() {
+            self.mailbox.forward(session.token, events);
+        }
         self.sessions.insert(key.into(), session);
+    }
+
+    /// The merged event stream, for a worker to block on.
+    ///
+    /// Deliveries are labelled with a [`SessionToken`]; resolve it with
+    /// [`Self::key_for`] when the event is handled, not before.
+    pub fn events(&self) -> crossbeam_channel::Receiver<Delivery> {
+        self.mailbox.events()
+    }
+
+    /// Every event that has arrived since the last call, without waiting.
+    pub fn drain_events(&self) -> Vec<Delivery> {
+        self.mailbox.try_drain()
     }
 
     pub fn get(&self, key: &str) -> Option<&SessionRuntime<R>> {
@@ -199,6 +234,24 @@ impl<R: AgentRuntime> SessionPool<R> {
     pub fn any_running(&self) -> bool {
         self.sessions.values().any(|session| session.running)
     }
+
+    /// The key `token` currently names.
+    ///
+    /// Events are labelled with a token because a key can change while they are
+    /// in flight, so the key is resolved when one is delivered rather than when
+    /// its session was pooled. Returns `None` once the session has been removed,
+    /// which is the ordinary way a late event from an exited process arrives.
+    pub fn key_for(&self, token: SessionToken) -> Option<&str> {
+        self.sessions
+            .iter()
+            .find(|(_, session)| session.token == token)
+            .map(|(key, _)| key.as_str())
+    }
+
+    /// The token of the session at `key`.
+    pub fn token_for(&self, key: &str) -> Option<SessionToken> {
+        self.sessions.get(key).map(|session| session.token)
+    }
 }
 
 #[cfg(test)]
@@ -208,9 +261,20 @@ mod tests {
     use uuid::Uuid;
 
     fn session(project_id: ProjectId, now_ms: i64) -> SessionRuntime<FakeRuntime> {
-        let runtime = FakeRuntime::default();
-        let (_sender, events) = crossbeam_channel::unbounded();
-        SessionRuntime::new(runtime, events, project_id, now_ms)
+        with_events(project_id, now_ms).1
+    }
+
+    /// A session and the sender that plays its process, for the merge tests.
+    fn with_events(
+        project_id: ProjectId,
+        now_ms: i64,
+    ) -> (
+        crossbeam_channel::Sender<RuntimeEvent>,
+        SessionRuntime<FakeRuntime>,
+    ) {
+        let (sender, events) = crossbeam_channel::unbounded();
+        let session = SessionRuntime::new(FakeRuntime::default(), events, project_id, now_ms);
+        (sender, session)
     }
 
     #[test]
@@ -360,5 +424,84 @@ mod tests {
         pool.insert("theirs", session(theirs, 100));
 
         assert_eq!(pool.most_recent_in(mine), Some("mine"));
+    }
+
+    #[test]
+    fn a_token_follows_its_session_through_a_rekey() {
+        // The whole reason events carry a token: a rekey happens while events
+        // are in flight, and one labelled with the old key would be dropped.
+        let mut pool = SessionPool::new();
+        pool.insert("draft://x", session(Uuid::new_v4(), 1));
+        let token = pool.token_for("draft://x").expect("the pooled session");
+
+        pool.rekey("draft://x", "/tmp/s.jsonl", 2);
+
+        assert_eq!(pool.key_for(token), Some("/tmp/s.jsonl"));
+    }
+
+    #[test]
+    fn each_pooled_session_gets_its_own_token() {
+        let mut pool = SessionPool::new();
+        let project = Uuid::new_v4();
+        pool.insert("a", session(project, 1));
+        pool.insert("b", session(project, 1));
+
+        assert_ne!(pool.token_for("a"), pool.token_for("b"));
+    }
+
+    #[test]
+    fn every_pooled_sessions_events_arrive_on_one_stream() {
+        let mut pool = SessionPool::new();
+        let project = Uuid::new_v4();
+        let (first_sender, first) = with_events(project, 1);
+        let (second_sender, second) = with_events(project, 1);
+        pool.insert("a", first);
+        pool.insert("b", second);
+
+        first_sender.send(RuntimeEvent::Stderr("a".into())).unwrap();
+        second_sender
+            .send(RuntimeEvent::Stderr("b".into()))
+            .unwrap();
+
+        // Both forwarders are threads, so wait for two rather than draining.
+        let events = pool.events();
+        let mut keys: Vec<String> = (0..2)
+            .map(|_| {
+                let (token, _) = events.recv().expect("a forwarded event");
+                pool.key_for(token).expect("its session").to_owned()
+            })
+            .collect();
+        keys.sort();
+        assert_eq!(keys, vec!["a".to_owned(), "b".to_owned()]);
+    }
+
+    #[test]
+    fn an_event_sent_before_a_rekey_resolves_to_the_new_key() {
+        // Pi reports its transcript path partway through the first turn, so the
+        // events already in the channel were sent under the draft key. Resolving
+        // at delivery is what keeps them attached to the session.
+        let mut pool = SessionPool::new();
+        let (sender, session) = with_events(Uuid::new_v4(), 1);
+        pool.insert("draft://x", session);
+
+        sender.send(RuntimeEvent::Stderr("early".into())).unwrap();
+        let (token, _) = pool.events().recv().expect("the forwarded event");
+        pool.rekey("draft://x", "/tmp/s.jsonl", 2);
+
+        assert_eq!(pool.key_for(token), Some("/tmp/s.jsonl"));
+    }
+
+    #[test]
+    fn a_removed_sessions_token_resolves_to_nothing() {
+        // A process that exits can still have events queued behind it. They
+        // resolve to no key, which is how the caller knows to discard them
+        // rather than attributing them to whichever session took the key.
+        let mut pool = SessionPool::new();
+        pool.insert("a", session(Uuid::new_v4(), 1));
+        let token = pool.token_for("a").expect("the pooled session");
+
+        pool.remove("a");
+
+        assert_eq!(pool.key_for(token), None);
     }
 }

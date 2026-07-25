@@ -824,17 +824,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         });
         self.sessions.insert(
             key.clone(),
-            SessionRuntime {
-                runtime,
-                events,
-                project_id,
-                running: false,
-                assistant_message_id: None,
-                conversation_compacted: false,
-                compaction_item_id: None,
-                pending_prompt: None,
-                last_used_ms: now_ms(),
-            },
+            SessionRuntime::new(runtime, events, project_id, now_ms()),
         );
         self.discover_sessions(project_id, &sessions_path);
         Some(key)
@@ -1600,16 +1590,14 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     /// conversation view; background sessions only update bookkeeping (busy
     /// dots, sidebar titles) so their progress survives until they are shown.
     fn consume_runtime_events(&mut self) {
-        let mut drained: Vec<(String, RuntimeEvent)> = Vec::new();
-        for (key, session) in self.sessions.iter() {
-            drained.extend(
-                session
-                    .events
-                    .try_iter()
-                    .map(|event| (key.to_owned(), event)),
-            );
-        }
-        for (key, event) in drained {
+        for (token, event) in self.sessions.drain_events() {
+            // The key is resolved now rather than when the event was sent: a
+            // session is re-keyed as soon as Pi reports its transcript path, and
+            // events sent before that would otherwise name a key that has gone.
+            let Some(key) = self.sessions.key_for(token).map(str::to_owned) else {
+                // Its session has been removed, so there is nothing to update.
+                continue;
+            };
             self.handle_runtime_event(&key, event);
         }
     }
