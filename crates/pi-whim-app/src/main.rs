@@ -17,7 +17,7 @@ use pi_whim_core::{
 use pi_whim_persistence::{
     AppPreferences, AttachmentStore, MacosKeychainStore, PreferencesRepository, ProjectRepository,
     ProviderRepository, SearchEngineRepository, SecretStore, SessionRepository, SqliteStore,
-    content_text, session_summary_from_jsonl,
+    session_summary_from_jsonl,
 };
 use pi_whim_runtime::{AgentRuntime, PiRpcRuntime, RuntimeEvent, RuntimeStart};
 use pi_whim_ui::{UiIntent, Workbench, install_fonts};
@@ -26,12 +26,8 @@ use uuid::Uuid;
 
 use macos_paste::{ClipboardAttachment, FinderPasteMonitor};
 use pi_whim_catalog::ModelCapabilityResolver;
-use pi_whim_engine::controls;
 use pi_whim_engine::pool::{SessionPool, SessionRuntime, is_draft};
-use pi_whim_engine::protocol::{
-    assistant_text, queue_mode_name, tool_call_report, tool_event_details, tool_result_report,
-    tool_result_summary,
-};
+use pi_whim_engine::protocol::{assistant_text, queue_mode_name};
 use pi_whim_engine::providers::{
     configured_provider_environment, discover_models, normalize_base_url, pi_models_json,
     provider_keychain_account, test_searxng_engine, valid_search_engine_url,
@@ -40,6 +36,7 @@ use pi_whim_engine::session::{
     attachment_from_path, bash_policy_name, canonical_path, ensure_agent_team_extension,
     is_large_paste, now_ms, pi_agent_directory, prompt_with_attachment_paths,
 };
+use pi_whim_engine::{controls, events};
 
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
@@ -1395,7 +1392,9 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             .into_iter()
             .flatten()
         {
-            self.apply_session_entry(entry);
+            if let Some(action) = events::session_entry_action(entry) {
+                self.workbench.apply(action);
+            }
         }
         Ok(())
     }
@@ -1777,7 +1776,9 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             }
             Some("tool_execution_start") | Some("tool_execution_end") => {
                 if is_active {
-                    self.apply_tool_event(&event)
+                    let action =
+                        events::tool_event_action(&event, &self.workbench.state().conversation);
+                    self.workbench.apply(action);
                 }
             }
             Some("queue_update") => {
@@ -1964,118 +1965,15 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 }
             }
             Some("entry_appended") => {
-                if is_active && let Some(entry) = event.get("entry") {
-                    self.apply_session_entry(entry);
+                if is_active
+                    && let Some(entry) = event.get("entry")
+                    && let Some(action) = events::session_entry_action(entry)
+                {
+                    self.workbench.apply(action);
                 }
             }
             _ => {}
         }
-    }
-
-    fn apply_tool_event(&mut self, event: &Value) {
-        let name = event
-            .get("toolName")
-            .and_then(Value::as_str)
-            .unwrap_or("tool");
-        let id = event
-            .get("toolCallId")
-            .and_then(Value::as_str)
-            .unwrap_or(name)
-            .to_owned();
-        let is_error = event
-            .get("isError")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let previous = self
-            .workbench
-            .state()
-            .conversation
-            .iter()
-            .find(|message| message.id == id.as_str())
-            .map(|message| (message.tool_report.clone(), message.tool_details.clone()));
-        let previous_report = previous.as_ref().and_then(|(report, _)| report.as_deref());
-        let previous_details = previous
-            .as_ref()
-            .and_then(|(_, details)| details.as_deref());
-        let (content, tool_report) = match event.get("type").and_then(Value::as_str) {
-            Some("tool_execution_end") => {
-                let result_content = event.get("result").and_then(|result| result.get("content"));
-                (
-                    tool_result_summary(Some(name), result_content, is_error),
-                    tool_result_report(Some(name), result_content, previous_report, is_error),
-                )
-            }
-            _ => ("Running…".into(), tool_call_report(name, event.get("args"))),
-        };
-        self.workbench
-            .apply(Action::UpsertConversation(ConversationItem {
-                id,
-                role: ConversationRole::Tool,
-                full_text: content,
-                streaming: false,
-                tool_name: Some(name.into()),
-                tool_report: Some(tool_report),
-                tool_details: Some(tool_event_details(event, previous_details)),
-                is_error,
-                model: None,
-                attachments: Vec::new(),
-            }));
-    }
-
-    fn apply_session_entry(&mut self, entry: &Value) {
-        let Some(message) = entry.get("message") else {
-            return;
-        };
-        let role = match message.get("role").and_then(Value::as_str) {
-            Some("user") => ConversationRole::User,
-            Some("assistant") => ConversationRole::Assistant,
-            Some("toolResult") | Some("bashExecution") => ConversationRole::Tool,
-            _ => return,
-        };
-        let id = entry
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or("entry")
-            .to_owned();
-        let is_tool = role == ConversationRole::Tool;
-        let tool_name = message
-            .get("toolName")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let is_error = message
-            .get("isError")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let text = match role {
-            ConversationRole::Assistant => assistant_text(message),
-            ConversationRole::Tool => {
-                tool_result_summary(tool_name.as_deref(), message.get("content"), is_error)
-            }
-            _ => content_text(message.get("content")).unwrap_or_else(|| message.to_string()),
-        };
-        self.workbench
-            .apply(Action::UpsertConversation(ConversationItem {
-                id,
-                role,
-                full_text: text,
-                streaming: false,
-                tool_name,
-                tool_report: is_tool.then(|| {
-                    tool_result_report(
-                        message.get("toolName").and_then(Value::as_str),
-                        message.get("content"),
-                        None,
-                        is_error,
-                    )
-                }),
-                tool_details: is_tool.then(|| message.to_string()),
-                is_error,
-                model: message
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                attachments: Vec::new(),
-            }));
     }
 
     /// Settings like the bash policy are process launch flags, so changing

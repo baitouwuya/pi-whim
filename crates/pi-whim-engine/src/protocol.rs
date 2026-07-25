@@ -77,7 +77,7 @@ pub fn session_metrics(value: &Value) -> SessionMetrics {
     }
 }
 
-pub fn tool_result_summary(
+pub(crate) fn tool_result_summary(
     tool_name: Option<&str>,
     content: Option<&Value>,
     is_error: bool,
@@ -97,7 +97,7 @@ pub fn tool_result_summary(
     }
 }
 
-pub fn tool_call_report(name: &str, arguments: Option<&Value>) -> String {
+pub(crate) fn tool_call_report(name: &str, arguments: Option<&Value>) -> String {
     let argument = |key| {
         arguments
             .and_then(|value| value.get(key))
@@ -171,7 +171,7 @@ pub fn tool_call_report(name: &str, arguments: Option<&Value>) -> String {
     }
 }
 
-pub fn tool_result_report(
+pub(crate) fn tool_result_report(
     tool_name: Option<&str>,
     content: Option<&Value>,
     initial_report: Option<&str>,
@@ -472,7 +472,7 @@ fn agent_message_report(messages: &[Value], empty_message: &str) -> String {
     }
 }
 
-pub fn tool_event_details(event: &Value, previous_details: Option<&str>) -> String {
+pub(crate) fn tool_event_details(event: &Value, previous_details: Option<&str>) -> String {
     let details = if event.get("type").and_then(Value::as_str) == Some("tool_execution_end") {
         let input = previous_details
             .and_then(|details| serde_json::from_str::<Value>(details).ok())
