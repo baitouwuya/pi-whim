@@ -4,15 +4,15 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use eframe::egui;
 use pi_whim_core::{
-    Action, Attachment, AttachmentKind, BashPolicy, ConversationItem, ConversationRole,
-    ModelOption, Project, ProjectId, ProviderId, ProviderProfile, ProviderProtocol, QueueMode,
-    SearchEngineProfile, SessionStatus, SessionSummary, SlashCommandInfo, ThinkingLevel,
-    normalize_provider_display_name, provider_name_key, stable_session_id,
+    Action, Attachment, ConversationItem, ConversationRole, ModelOption, Project, ProjectId,
+    ProviderId, ProviderProfile, ProviderProtocol, QueueMode, SearchEngineProfile, SessionStatus,
+    SessionSummary, SlashCommandInfo, ThinkingLevel, normalize_provider_display_name,
+    provider_name_key, stable_session_id,
 };
 use pi_whim_persistence::{
     AppPreferences, AttachmentStore, MacosKeychainStore, PreferencesRepository, ProjectRepository,
@@ -33,6 +33,10 @@ use pi_whim_engine::protocol::{
 use pi_whim_engine::providers::{
     configured_provider_environment, discover_models, normalize_base_url, pi_models_json,
     provider_config_key, provider_keychain_account, test_searxng_engine, valid_search_engine_url,
+};
+use pi_whim_engine::session::{
+    attachment_from_path, bash_policy_name, canonical_path, ensure_agent_team_extension,
+    is_large_paste, now_ms, pi_agent_directory, prompt_with_attachment_paths,
 };
 
 fn main() -> eframe::Result<()> {
@@ -2263,89 +2267,9 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     }
 }
 
-fn canonical_path(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_owned())
-}
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
-}
-
-fn pi_agent_directory() -> Result<PathBuf, String> {
-    let root = dirs::data_dir()
-        .ok_or_else(|| "Application Support directory is unavailable.".to_owned())?
-        .join("pi-whim")
-        .join("agent");
-    Ok(root)
-}
-
 /// Pi accepts an environment reference here, keeping API keys out of models.json.
-fn attachment_from_path(path: &Path, generated_by_app: bool) -> Result<Attachment, String> {
-    let path = path.canonicalize().map_err(|error| error.to_string())?;
-    let metadata = path.metadata().map_err(|error| error.to_string())?;
-    let kind = if metadata.is_dir() {
-        AttachmentKind::Directory
-    } else {
-        AttachmentKind::File
-    };
-    Ok(Attachment {
-        name: path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("attachment")
-            .into(),
-        path: path.to_string_lossy().into_owned(),
-        kind,
-        generated_by_app,
-    })
-}
-
-fn is_large_paste(text: &str) -> bool {
-    text.chars().count() > 1_000 || text.lines().count() > 10
-}
-
-fn prompt_with_attachment_paths(content: &str, attachments: &[Attachment]) -> String {
-    let paths = attachments
-        .iter()
-        .map(|attachment| attachment.path.as_str())
-        .collect::<Vec<_>>();
-    if paths.is_empty() {
-        return content.to_owned();
-    }
-    if content.is_empty() {
-        paths.join("\n")
-    } else {
-        format!("{content}\n{}", paths.join("\n"))
-    }
-}
-
 fn applescript_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-fn bash_policy_name(policy: &BashPolicy) -> &'static str {
-    match policy {
-        BashPolicy::Allow => "allow",
-        BashPolicy::Ask => "ask",
-        BashPolicy::Deny => "deny",
-    }
-}
-
-fn ensure_agent_team_extension(sessions_path: &Path) -> std::io::Result<PathBuf> {
-    let directory = sessions_path.join(".pi-whim-agent-team-extension");
-    fs::create_dir_all(&directory)?;
-    fs::write(
-        directory.join("client.ts"),
-        include_str!("../../../extensions/agent-team/client.ts"),
-    )?;
-    let entrypoint = directory.join("index.ts");
-    fs::write(
-        &entrypoint,
-        include_str!("../../../extensions/agent-team/index.ts"),
-    )?;
-    Ok(entrypoint)
 }
 
 #[cfg(test)]
