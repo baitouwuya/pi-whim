@@ -12,11 +12,13 @@ use gpui::{
 };
 use gpui_component::theme::{Theme as ComponentTheme, ThemeMode as ComponentMode};
 use pi_whim_core::{
-    Action, AppState, ConversationItem, ConversationRole, ModelOption, ProjectId, QueueMode,
-    SessionStatus, ThinkingLevel, stable_session_id,
+    Action, AgentTeamConfig, AppState, BashPolicy, ConversationItem, ConversationRole, Language,
+    ModelOption, ProjectId, ProviderId, ProviderProfile, ProviderProtocol, QueueMode,
+    SearchEngineProfile, SessionStatus, ThinkingLevel, stable_session_id,
 };
 use pi_whim_engine::dialogs::{Answer, Prompt};
 use pi_whim_engine::notice::Outbox;
+use pi_whim_engine::session::now_ms;
 use pi_whim_engine::slash_commands::SlashCommand;
 use pi_whim_engine::state::{EngineState, ViewEffect};
 use pi_whim_theme::{ThemeMode, ThemePreference, Tokens, text};
@@ -29,6 +31,7 @@ use crate::{
     chrome::{Banner, TopBar},
     dialogs::{PromptEvent, Prompts, Rename, RenameEvent},
     elements::GraphPaper,
+    settings::{Settings, SettingsEvent},
     theme::IntoHsla,
 };
 
@@ -73,6 +76,36 @@ pub enum Request {
     DeleteSession(String),
     /// Send a decision back to the agent that asked for it.
     AnswerPrompt(Answer),
+
+    // The settings page's requests. The reducer has already been run for the
+    // ones that have an `Action`, so these are the persistence and network half:
+    // writing preferences to the store, the key to the keychain, and asking a
+    // provider what it offers.
+    /// Write the preference the shell has already applied.
+    PersistLanguage(Language),
+    PersistBashPolicy(BashPolicy),
+    PersistBlockedPatterns(Vec<String>),
+    PersistAgentTeamConfig(AgentTeamConfig),
+    SetAutoCompaction(bool),
+    /// Store a provider, and its key if one was typed.
+    SaveProvider {
+        profile: ProviderProfile,
+        api_key: Option<String>,
+    },
+    DeleteProvider(ProviderId),
+    /// Store the whole search-engine list, which is how a reorder and a delete
+    /// are saved too.
+    SaveSearchEngines(Vec<SearchEngineProfile>),
+    /// Check that a URL really answers as a SearXNG instance.
+    TestSearchEngine(SearchEngineProfile),
+    /// Ask a provider which models it has.
+    DiscoverProviderModels {
+        profile_id: Option<ProviderId>,
+        provider_name: String,
+        base_url: String,
+        protocol: ProviderProtocol,
+        api_key: Option<String>,
+    },
 }
 
 /// The application shell.
@@ -87,6 +120,12 @@ pub struct Workspace {
     palette: Entity<Palette>,
     prompts: Entity<Prompts>,
     rename: Entity<Rename>,
+    settings: Entity<Settings>,
+    /// Whether settings is showing instead of the chat panes.
+    ///
+    /// A page rather than a modal, because the provider form is long enough that
+    /// a dialog would scroll inside a scroll.
+    showing_settings: bool,
     /// Messages waiting to be shown.
     ///
     /// Held rather than pushed straight to the window because the shell is
@@ -172,10 +211,17 @@ impl Workspace {
         })
         .detach();
 
+        let engine = EngineState::new();
+        let settings = cx.new(|cx| Settings::new(tokens, engine.get().clone(), window, cx));
+        cx.subscribe_in(&settings, window, |workspace, _, event, window, cx| {
+            workspace.handle_settings_event(event.clone(), window, cx);
+        })
+        .detach();
+
         Self {
             preference,
             tokens,
-            engine: EngineState::new(),
+            engine,
             sidebar,
             conversation,
             composer,
@@ -183,6 +229,8 @@ impl Workspace {
             palette,
             prompts,
             rename,
+            settings,
+            showing_settings: false,
             notices: Outbox::new(),
             expanded_projects: BTreeSet::new(),
             requests: Vec::new(),
@@ -393,6 +441,141 @@ impl Workspace {
         }
     }
 
+    /// Act on what the settings page reported.
+    ///
+    /// The preference toggles are applied through the reducer *and* queued as a
+    /// request: the reducer makes the control reflect the click immediately, and
+    /// the request writes it to the store. The provider and search-engine halves
+    /// only queue, because the draft is not domain state until it is stored and
+    /// read back.
+    fn handle_settings_event(
+        &mut self,
+        event: SettingsEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // The preference toggles all take the same route, so which action and
+        // which request each needs is decided by one function rather than by six
+        // near-identical arms — and that function is assertable without a window.
+        if let Some((action, request)) = preference_change(&event) {
+            if let Some(action) = action {
+                self.apply(action, window, cx);
+            }
+            self.requests.push(request);
+            cx.notify();
+            return;
+        }
+
+        match event {
+            SettingsEvent::Close => {
+                self.showing_settings = false;
+            }
+            SettingsEvent::Show(section) => {
+                self.settings
+                    .update(cx, |settings, cx| settings.show(section, cx));
+            }
+
+            SettingsEvent::SelectProvider(id) => {
+                self.settings.update(cx, |settings, cx| {
+                    settings.edit_provider(id, window, cx);
+                });
+            }
+            SettingsEvent::NewProvider => {
+                self.settings
+                    .update(cx, |settings, cx| settings.new_provider(window, cx));
+            }
+            SettingsEvent::SelectPreset(preset) => {
+                self.settings.update(cx, |settings, cx| {
+                    settings.apply_preset(preset, window, cx);
+                });
+            }
+            SettingsEvent::SetProtocol(protocol) => {
+                self.settings.update(cx, |settings, cx| {
+                    settings.set_protocol(protocol, window, cx);
+                });
+            }
+            SettingsEvent::AddManualModel => {
+                self.settings
+                    .update(cx, |settings, cx| settings.add_manual_model(window, cx));
+            }
+            SettingsEvent::RemoveModel(id) => {
+                self.settings
+                    .update(cx, |settings, cx| settings.remove_model(&id, cx));
+            }
+            SettingsEvent::DiscoverModels => {
+                let draft = self.settings.read(cx).provider_draft().clone();
+                self.requests.push(Request::DiscoverProviderModels {
+                    profile_id: draft.id,
+                    provider_name: draft.name.trim().to_owned(),
+                    base_url: draft.base_url.trim().to_owned(),
+                    protocol: draft.protocol,
+                    // Only what was typed: a stored key is looked up by the
+                    // backend, which is the only side that can read the keychain.
+                    api_key: draft.typed_api_key(),
+                });
+            }
+            SettingsEvent::SaveProvider => {
+                let draft = self.settings.read(cx).provider_draft().clone();
+                self.requests.push(Request::SaveProvider {
+                    profile: draft.to_profile(now_ms()),
+                    api_key: draft.typed_api_key(),
+                });
+            }
+            SettingsEvent::DeleteProvider(id) => {
+                self.requests.push(Request::DeleteProvider(id));
+                self.settings
+                    .update(cx, |settings, cx| settings.new_provider(window, cx));
+            }
+
+            SettingsEvent::SelectSearchEngine(profile) => {
+                self.settings.update(cx, |settings, cx| {
+                    settings.edit_search_engine(&profile, window, cx);
+                });
+            }
+            SettingsEvent::SetSearchEngineEnabled(enabled) => {
+                self.settings.update(cx, |settings, cx| {
+                    settings.set_search_engine_enabled(enabled, cx);
+                });
+            }
+            SettingsEvent::SaveSearchEngines(profiles) => {
+                self.requests.push(Request::SaveSearchEngines(profiles));
+            }
+            SettingsEvent::SaveSearchEngine => {
+                let profiles = self.settings.read(cx).search_engines_with_draft();
+                self.requests.push(Request::SaveSearchEngines(profiles));
+            }
+            SettingsEvent::TestSearchEngine => {
+                // Tested as it would be stored — trimmed URL, chosen protocol —
+                // so a pass means the saved instance works, not just the typing.
+                let draft = self.settings.read(cx).search_engine_draft().clone();
+                let position = self.engine.get().search_engine_profiles.len() as u32;
+                self.requests
+                    .push(Request::TestSearchEngine(draft.to_profile(position)));
+            }
+            SettingsEvent::RemoveSearchEngine(index) => {
+                let profiles = self.settings.read(cx).search_engines_without(index);
+                self.requests.push(Request::SaveSearchEngines(profiles));
+                self.settings.update(cx, |settings, cx| {
+                    settings.clear_search_engine_draft(window, cx);
+                });
+            }
+            SettingsEvent::MoveSearchEngine { index, delta } => {
+                let profiles = self.settings.read(cx).search_engines_moved(index, delta);
+                self.requests.push(Request::SaveSearchEngines(profiles));
+            }
+
+            // Handled above by `preference_change`, which returned `Some` for
+            // exactly these and returned early.
+            SettingsEvent::SetLanguage(_)
+            | SettingsEvent::SetAutoCompaction(_)
+            | SettingsEvent::SetBashPolicy(_)
+            | SettingsEvent::SetBlockedPatterns(_)
+            | SettingsEvent::SetAgentTeamConfig(_)
+            | SettingsEvent::SetQueueModes { .. } => unreachable!("taken by preference_change"),
+        }
+        cx.notify();
+    }
+
     /// Push the current rows into the sidebar.
     fn sync_sidebar(&mut self, cx: &mut Context<Self>) {
         let rows = chat::rows(self.engine.get(), &self.expanded_projects);
@@ -441,6 +624,47 @@ impl Workspace {
             .update(cx, |prompts, cx| prompts.set_tokens(tokens, cx));
         self.rename
             .update(cx, |rename, cx| rename.set_tokens(tokens, cx));
+        self.settings.update(cx, |settings, cx| {
+            settings.set_tokens(tokens, cx);
+            settings.sync(&state, window, cx);
+        });
+    }
+
+    /// Whether the settings page is showing instead of the chat panes.
+    pub fn showing_settings(&self) -> bool {
+        self.showing_settings
+    }
+
+    /// Show or hide the settings page.
+    pub fn show_settings(&mut self, showing: bool, cx: &mut Context<Self>) {
+        self.showing_settings = showing;
+        cx.notify();
+    }
+
+    /// Report what a provider said it offers.
+    pub fn set_discovered_models(
+        &mut self,
+        models: Vec<pi_whim_core::ProviderModel>,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings.update(cx, |settings, cx| {
+            settings.set_discovered_models(models, cx)
+        });
+    }
+
+    /// Note the id a freshly stored provider was given, and whether its key
+    /// actually landed in the keychain.
+    pub fn provider_saved(
+        &mut self,
+        id: ProviderId,
+        key_saved: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings.update(cx, |settings, cx| {
+            settings.provider_saved(id, cx);
+            settings.set_provider_key_status(id, key_saved, window, cx);
+        });
     }
 
     /// Read-only domain state, for rendering.
@@ -521,6 +745,56 @@ fn banner_for(status: &SessionStatus, tokens: Tokens) -> Option<Banner> {
     }
 }
 
+/// The reducer action and backend request a preference change needs, if `event`
+/// is one.
+///
+/// Returns `None` for the provider and search-engine events, which are drafts
+/// rather than preferences and need the settings view rather than a table.
+///
+/// Most of these come in pairs: the action makes the control show the click at
+/// once, and the request writes it where a restart will find it. Applying without
+/// persisting would silently forget the choice; persisting without applying would
+/// leave the control showing the old value until the store answered.
+fn preference_change(event: &SettingsEvent) -> Option<(Option<Action>, Request)> {
+    match event {
+        SettingsEvent::SetLanguage(language) => Some((
+            Some(Action::SetLanguage(*language)),
+            Request::PersistLanguage(*language),
+        )),
+        // The only one with no action: auto-compaction is the agent's setting, not
+        // the store's, and it comes back through `RuntimeControlsUpdated`. Guessing
+        // it locally would show the switch flipped even if the agent refused.
+        SettingsEvent::SetAutoCompaction(enabled) => {
+            Some((None, Request::SetAutoCompaction(*enabled)))
+        }
+        SettingsEvent::SetBashPolicy(policy) => Some((
+            Some(Action::SetBashPolicy(*policy)),
+            Request::PersistBashPolicy(*policy),
+        )),
+        SettingsEvent::SetBlockedPatterns(patterns) => Some((
+            Some(Action::SetBashBlockedPatterns(patterns.clone())),
+            Request::PersistBlockedPatterns(patterns.clone()),
+        )),
+        SettingsEvent::SetAgentTeamConfig(config) => Some((
+            Some(Action::SetAgentTeamConfig(config.clone())),
+            Request::PersistAgentTeamConfig(config.clone()),
+        )),
+        // Queue modes are the agent's too, and the controls bar sends the same
+        // request from beside the prompt.
+        SettingsEvent::SetQueueModes {
+            steering,
+            follow_up,
+        } => Some((
+            None,
+            Request::SetQueueModes {
+                steering: *steering,
+                follow_up: *follow_up,
+            },
+        )),
+        _ => None,
+    }
+}
+
 /// Toggle whether `id`'s sessions are listed, returning the new state.
 fn toggle_expanded(expanded: &mut BTreeSet<ProjectId>, id: ProjectId) -> bool {
     if expanded.remove(&id) {
@@ -578,47 +852,58 @@ impl Render for Workspace {
                             .on_toggle_theme(cx.listener(|workspace, _, window, cx| {
                                 workspace.toggle_theme(window, cx);
                             }))
-                            .on_open_settings(cx.listener(|_, _, _, _| {
-                                // The settings page lands in a later change.
+                            .on_open_settings(cx.listener(|workspace, _, _, cx| {
+                                workspace.showing_settings = true;
+                                cx.notify();
                             })),
                     )
-                    // Below the banner and above the panes: these configure the
-                    // agent, so they belong with the window chrome rather than
-                    // beside the prompt.
-                    .child(self.controls.clone())
-                    .when_some(banner_for(&status, tokens), |this, banner| {
-                        this.child(banner)
+                    // Settings replaces everything below the top bar, including
+                    // the controls: they configure the running agent, and there
+                    // is nothing to steer while the page is open.
+                    .when(self.showing_settings, |this| {
+                        this.child(div().flex_1().min_h(px(0.0)).child(self.settings.clone()))
                     })
-                    // The conversation and sidebar fill whatever the chrome
-                    // leaves.
-                    .child(
-                        div()
-                            .flex_1()
-                            .flex()
-                            .min_h(px(0.0))
-                            .child(self.sidebar.clone())
+                    .when(!self.showing_settings, |this| {
+                        this
+                            // Below the banner and above the panes: these
+                            // configure the agent, so they belong with the window
+                            // chrome rather than beside the prompt.
+                            .child(self.controls.clone())
+                            .when_some(banner_for(&status, tokens), |this, banner| {
+                                this.child(banner)
+                            })
+                            // The conversation and sidebar fill whatever the
+                            // chrome leaves.
                             .child(
                                 div()
                                     .flex_1()
                                     .flex()
-                                    .flex_col()
-                                    .min_w(px(0.0))
-                                    .child(self.conversation.clone())
+                                    .min_h(px(0.0))
+                                    .child(self.sidebar.clone())
                                     .child(
-                                        // The palette is absolutely positioned
-                                        // against this box so it floats over the
-                                        // conversation rather than pushing the
-                                        // input down as it grows.
                                         div()
-                                            .relative()
+                                            .flex_1()
                                             .flex()
                                             .flex_col()
-                                            .items_center()
-                                            .child(self.palette.clone())
-                                            .child(self.composer.clone()),
+                                            .min_w(px(0.0))
+                                            .child(self.conversation.clone())
+                                            .child(
+                                                // The palette is absolutely
+                                                // positioned against this box so it
+                                                // floats over the conversation
+                                                // rather than pushing the input
+                                                // down as it grows.
+                                                div()
+                                                    .relative()
+                                                    .flex()
+                                                    .flex_col()
+                                                    .items_center()
+                                                    .child(self.palette.clone())
+                                                    .child(self.composer.clone()),
+                                            ),
                                     ),
-                            ),
-                    ),
+                            )
+                    }),
             )
             // Modals last, so they paint over the panes. Each renders nothing
             // when it has nothing to ask.
@@ -666,6 +951,42 @@ mod tests {
 
         assert!(!toggle_expanded(&mut expanded, id));
         assert!(!expanded.contains(&id));
+    }
+
+    #[test]
+    fn a_stored_preference_is_both_applied_and_persisted() {
+        // Applying without persisting forgets the choice on restart; persisting
+        // without applying leaves the control showing the old value.
+        let (action, request) =
+            preference_change(&SettingsEvent::SetBashPolicy(BashPolicy::Deny)).expect("a change");
+        assert_eq!(action, Some(Action::SetBashPolicy(BashPolicy::Deny)));
+        assert_eq!(request, Request::PersistBashPolicy(BashPolicy::Deny));
+    }
+
+    #[test]
+    fn the_agents_own_settings_are_not_applied_locally() {
+        // Auto-compaction and the queue modes are the agent's to confirm. Guessing
+        // them here would show the switch flipped even if the agent refused.
+        let (action, _) =
+            preference_change(&SettingsEvent::SetAutoCompaction(true)).expect("a change");
+        assert_eq!(action, None);
+
+        let (action, _) = preference_change(&SettingsEvent::SetQueueModes {
+            steering: QueueMode::All,
+            follow_up: QueueMode::OneAtATime,
+        })
+        .expect("a change");
+        assert_eq!(action, None);
+    }
+
+    #[test]
+    fn drafts_are_not_preference_changes() {
+        // These need the settings view, not the table: a draft is not domain state
+        // until it is stored and read back.
+        assert!(preference_change(&SettingsEvent::NewProvider).is_none());
+        assert!(preference_change(&SettingsEvent::SaveProvider).is_none());
+        assert!(preference_change(&SettingsEvent::SaveSearchEngine).is_none());
+        assert!(preference_change(&SettingsEvent::Close).is_none());
     }
 
     #[test]

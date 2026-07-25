@@ -104,7 +104,43 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ("save-and-apply", "Save and apply", "保存并应用"),
     ("delete-provider", "Delete provider", "删除提供商"),
     ("language", "Language", "语言"),
+    ("api-key", "API key", "API Key"),
+    ("base-url", "Base URL", "基础 URL"),
+    (
+        "duplicate-provider-name",
+        "Another provider already uses this name.",
+        "已有另一个提供商在使用这个名称。",
+    ),
+    (
+        "provider-incomplete",
+        "A provider needs a name, a base URL, and at least one model.",
+        "提供商需要名称、基础 URL 和至少一个模型。",
+    ),
+    (
+        "search-engine-incomplete",
+        "A search engine needs a name and a base URL.",
+        "搜索引擎需要名称和基础 URL。",
+    ),
+    (
+        "no-providers",
+        "No providers configured.",
+        "尚未配置提供商。",
+    ),
+    (
+        "no-search-engines",
+        "No search engines configured.",
+        "尚未配置搜索引擎。",
+    ),
+    (
+        "preset-help",
+        "Fills in the base URL and protocol for a known provider.",
+        "为已知提供商填入基础 URL 和协议。",
+    ),
+    ("shell", "Shell", "Shell"),
     ("bash-policy", "Bash commands", "Bash 命令"),
+    ("bash-ask", "Ask", "询问"),
+    ("bash-allow", "Allow", "允许"),
+    ("bash-deny", "Deny", "拒绝"),
     (
         "bash-help",
         "Control how the Bash tool executes.",

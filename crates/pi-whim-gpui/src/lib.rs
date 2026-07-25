@@ -14,6 +14,7 @@ pub mod dialogs;
 pub mod elements;
 pub mod fonts;
 pub mod icons;
+pub mod settings;
 pub mod theme;
 
 mod workspace;
