@@ -2712,6 +2712,7 @@ dependencies = [
  "objc2-app-kit 0.3.2",
  "pi-whim-catalog",
  "pi-whim-core",
+ "pi-whim-engine",
  "pi-whim-persistence",
  "pi-whim-runtime",
  "pi-whim-ui",
@@ -2742,6 +2743,15 @@ dependencies = [
  "unicode-segmentation",
  "uuid",
  "walkdir",
+]
+
+[[package]]
+name = "pi-whim-engine"
+version = "0.1.0"
+dependencies = [
+ "pi-whim-core",
+ "pi-whim-persistence",
+ "serde_json",
 ]
 
 [[package]]

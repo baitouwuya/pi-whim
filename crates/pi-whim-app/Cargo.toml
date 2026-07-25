@@ -15,6 +15,7 @@ dirs.workspace = true
 eframe.workspace = true
 pi-whim-catalog = { path = "../pi-whim-catalog" }
 pi-whim-core = { path = "../pi-whim-core" }
+pi-whim-engine = { path = "../pi-whim-engine" }
 pi-whim-persistence = { path = "../pi-whim-persistence" }
 pi-whim-runtime = { path = "../pi-whim-runtime" }
 pi-whim-ui = { path = "../pi-whim-ui" }
