@@ -6,6 +6,9 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+# The event stream the engine hands out is a crossbeam receiver. Only the pump
+# touches it, and only to block on it off the main thread.
+crossbeam-channel.workspace = true
 gpui.workspace = true
 gpui-component.workspace = true
 pi-whim-core = { path = "../pi-whim-core" }
@@ -13,6 +16,9 @@ pi-whim-engine = { path = "../pi-whim-engine" }
 pi-whim-theme = { path = "../pi-whim-theme" }
 
 [dev-dependencies]
+# `test-support` is what gives a headless window to drive views without opening
+# one. It does not rasterize, so it proves behaviour and layout, never pixels.
+gpui = { workspace = true, features = ["test-support"] }
 pi-whim-core = { path = "../pi-whim-core" }
 # Only the example needs this: it fakes a wire request so the prompt dialog is on
 # screen. The crate itself never parses JSON — the engine does.

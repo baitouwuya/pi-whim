@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 
 use gpui::{
     AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render, Styled,
-    Window, div, prelude::FluentBuilder, px,
+    Task, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::theme::{Theme as ComponentTheme, ThemeMode as ComponentMode};
 use pi_whim_core::{
@@ -17,6 +17,7 @@ use pi_whim_core::{
     SearchEngineProfile, SessionStatus, ThinkingLevel, stable_session_id,
 };
 use pi_whim_engine::dialogs::{Answer, Prompt};
+use pi_whim_engine::mailbox::Delivery;
 use pi_whim_engine::notice::Outbox;
 use pi_whim_engine::session::now_ms;
 use pi_whim_engine::slash_commands::SlashCommand;
@@ -31,6 +32,7 @@ use crate::{
     chrome::{Banner, TopBar},
     dialogs::{PromptEvent, Prompts, Rename, RenameEvent},
     elements::GraphPaper,
+    pump,
     settings::{Settings, SettingsEvent},
     theme::IntoHsla,
 };
@@ -137,6 +139,17 @@ pub struct Workspace {
     expanded_projects: BTreeSet<ProjectId>,
     /// Requests waiting for the backend owner to drain.
     requests: Vec<Request>,
+    /// Session events waiting for the same owner.
+    ///
+    /// Held rather than handled, because turning one into state changes needs the
+    /// session pool — which key it belongs to now, whether its process is still
+    /// the current generation — and the pool is the owner's, not the shell's.
+    deliveries: Vec<Delivery>,
+    /// The loop delivering into `deliveries`.
+    ///
+    /// Stored and not detached on purpose: a [`Task`] cancels when dropped, so
+    /// holding it here is what stops the pump when the shell goes away.
+    pump: Option<Task<()>>,
 }
 
 impl Workspace {
@@ -234,7 +247,49 @@ impl Workspace {
             notices: Outbox::new(),
             expanded_projects: BTreeSet::new(),
             requests: Vec::new(),
+            deliveries: Vec::new(),
+            // Started by the owner once it has a pool to stream from, since a
+            // shell built before any session exists has nothing to listen to.
+            pump: None,
         }
+    }
+
+    /// Start waking the window when a session says something.
+    ///
+    /// `events` is the engine's merged stream. Replaces any pump already running,
+    /// so the old one is dropped — and therefore cancelled — rather than left
+    /// delivering alongside the new one.
+    pub fn listen(
+        &mut self,
+        events: crossbeam_channel::Receiver<Delivery>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pump = Some(pump::spawn(
+            events,
+            window,
+            cx,
+            |workspace, batch, _, cx| {
+                workspace.deliveries.extend(batch);
+                // The point of the whole pump: an event arriving is what marks the
+                // shell dirty, instead of a timer redrawing on the chance one did.
+                cx.notify();
+            },
+        ));
+    }
+
+    /// Take the session events that have arrived.
+    ///
+    /// Deliveries carry a `SessionToken` rather than a key; resolve it against
+    /// the pool when handling one, because a session is re-keyed as soon as Pi
+    /// reports its transcript path.
+    pub fn take_deliveries(&mut self) -> Vec<Delivery> {
+        std::mem::take(&mut self.deliveries)
+    }
+
+    /// Whether the pump is running.
+    pub fn is_listening(&self) -> bool {
+        self.pump.is_some()
     }
 
     /// Queue a question from the agent.
@@ -914,6 +969,8 @@ impl Render for Workspace {
 
 #[cfg(test)]
 mod tests {
+    use pi_whim_engine::mailbox::{RuntimeEvent, SessionToken};
+
     use super::*;
     use crate::chrome::Severity;
 
@@ -1001,5 +1058,98 @@ mod tests {
 
         assert!(!expanded.contains(&first));
         assert!(expanded.contains(&second));
+    }
+
+    /// A shell in a headless window, for the tests that need one.
+    ///
+    /// Goes through the crate's own `init` so the shell is built the way the app
+    /// builds it, rather than against a second setup path that could drift.
+    fn shell(cx: &mut gpui::TestAppContext) -> gpui::WindowHandle<Workspace> {
+        let preference = ThemePreference::default();
+        cx.update(|cx| {
+            crate::init(preference, cx).expect("the bundled fonts load");
+        });
+        cx.add_window(|window, cx| Workspace::new(preference, window, cx))
+    }
+
+    #[gpui::test]
+    async fn a_session_event_reaches_the_shell_without_a_frame_loop(cx: &mut gpui::TestAppContext) {
+        // The point of the pump: nothing polls, and the event still arrives.
+        let shell = shell(cx);
+        let (sender, events) = crossbeam_channel::unbounded();
+        let token = SessionToken::next();
+        shell
+            .update(cx, |workspace, window, cx| {
+                workspace.listen(events, window, cx)
+            })
+            .expect("the window is open");
+
+        sender
+            .send((token, RuntimeEvent::Stderr("boom".into())))
+            .expect("the pump is listening");
+        // Dropping the sender ends the blocking wait after this batch, so the
+        // test's scheduler has nothing left parked on it.
+        drop(sender);
+        cx.run_until_parked();
+
+        let delivered = shell
+            .update(cx, |workspace, _, _| workspace.take_deliveries())
+            .expect("the window is open");
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].0, token);
+    }
+
+    #[gpui::test]
+    async fn taking_deliveries_leaves_none_behind(cx: &mut gpui::TestAppContext) {
+        // Handling an event twice would replay it into the conversation.
+        let shell = shell(cx);
+        let (sender, events) = crossbeam_channel::unbounded();
+        shell
+            .update(cx, |workspace, window, cx| {
+                workspace.listen(events, window, cx)
+            })
+            .expect("the window is open");
+
+        sender
+            .send((SessionToken::next(), RuntimeEvent::Stderr("once".into())))
+            .expect("the pump is listening");
+        drop(sender);
+        cx.run_until_parked();
+
+        shell
+            .update(cx, |workspace, _, _| {
+                assert_eq!(workspace.take_deliveries().len(), 1);
+                assert!(workspace.take_deliveries().is_empty());
+            })
+            .expect("the window is open");
+    }
+
+    #[gpui::test]
+    async fn listening_again_replaces_the_running_pump(cx: &mut gpui::TestAppContext) {
+        // Two pumps on two streams would deliver a session's events twice over
+        // once the old stream was re-created. Replacing drops the old task, and a
+        // dropped task is a cancelled one.
+        let shell = shell(cx);
+        let (stale_sender, stale_events) = crossbeam_channel::unbounded();
+        let (live_sender, live_events) = crossbeam_channel::unbounded();
+        shell
+            .update(cx, |workspace, window, cx| {
+                workspace.listen(stale_events, window, cx);
+                workspace.listen(live_events, window, cx);
+                assert!(workspace.is_listening());
+            })
+            .expect("the window is open");
+
+        stale_sender
+            .send((SessionToken::next(), RuntimeEvent::Stderr("stale".into())))
+            .expect("the channel is open");
+        drop(stale_sender);
+        drop(live_sender);
+        cx.run_until_parked();
+
+        let delivered = shell
+            .update(cx, |workspace, _, _| workspace.take_deliveries())
+            .expect("the window is open");
+        assert!(delivered.is_empty());
     }
 }

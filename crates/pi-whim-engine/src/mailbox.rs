@@ -19,7 +19,10 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pi_whim_runtime::RuntimeEvent;
+// Re-exported because a [`Delivery`] carries one: a consumer of this stream
+// needs the event type, and making it reach past the engine for it would give
+// the UI a dependency on the runtime crate for a single name.
+pub use pi_whim_runtime::RuntimeEvent;
 
 /// A session's identity for the lifetime of its process.
 ///
