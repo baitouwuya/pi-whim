@@ -771,7 +771,6 @@ mod tests {
     // Progressive reveal moved to pi_whim_engine::typewriter::Typewriter, and
     // attachment de-duplication to pi_whim_engine::composer::Composer; both
     // cover those behaviors directly.
-    // which covers it directly.
 
     #[test]
     fn provider_protocol_maps_to_pi_models_json_api() {
