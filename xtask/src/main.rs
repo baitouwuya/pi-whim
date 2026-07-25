@@ -99,9 +99,15 @@ fn package_macos() -> Result<()> {
     fs::create_dir_all(&macos)?;
     fs::copy(root.join("target/release/pi-whim"), macos.join("Pi-Whim"))?;
     copy_directory(&pi_resources, &resources)?;
-    let plist = r#"<?xml version=\"1.0\" encoding=\"UTF-8\"?>
-<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
-<plist version=\"1.0\"><dict><key>CFBundleExecutable</key><string>Pi-Whim</string><key>CFBundleIdentifier</key><string>dev.pi-whim.desktop</string><key>CFBundleName</key><string>Pi-Whim</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleShortVersionString</key><string>0.1.0</string><key>LSMinimumSystemVersion</key><string>13.0</string></dict></plist>"#;
+    // A raw string, so the quotes stand for themselves. Escaping them wrote
+    // literal backslashes into the XML, which Launch Services rejects.
+    //
+    // NSHighResolutionCapable is what gets a Retina backing store. Without it
+    // macOS scales a 1x surface up and every glyph in the window is soft.
+    let plist = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>CFBundleExecutable</key><string>Pi-Whim</string><key>CFBundleIdentifier</key><string>dev.pi-whim.desktop</string><key>CFBundleName</key><string>Pi-Whim</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleShortVersionString</key><string>0.1.0</string><key>LSMinimumSystemVersion</key><string>13.0</string><key>NSHighResolutionCapable</key><true/></dict></plist>
+"#;
     fs::write(app.join("Contents/Info.plist"), plist)?;
     println!("Built {}", app.display());
     Ok(())
