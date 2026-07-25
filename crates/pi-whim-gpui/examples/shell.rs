@@ -7,8 +7,8 @@
 use gpui::{App, AppContext, Context, Window};
 use gpui_component::Root;
 use pi_whim_core::{
-    Action, ConversationItem, ConversationRole, ModelOption, Project, QueueMode, SessionStatus,
-    SessionSummary, ThinkingLevel, stable_session_id,
+    Action, AppState, ConversationItem, ConversationRole, ModelOption, Project, QueueMode,
+    SessionStatus, SessionSummary, ThinkingLevel, stable_session_id,
 };
 use pi_whim_engine::dialogs::Prompt;
 use pi_whim_gpui::Workspace;
@@ -17,7 +17,11 @@ use uuid::Uuid;
 
 /// Populate the shell with a short conversation, so the preview shows the
 /// layout rather than an empty window.
+///
+/// The state is built here and handed over whole, the same way the host does it:
+/// the shell has no reducer of its own to feed actions to.
 fn seed(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    let mut state = AppState::default();
     let project = Project {
         id: Uuid::new_v4(),
         name: "pi-whim".into(),
@@ -28,24 +32,20 @@ fn seed(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspa
     let project_id = project.id;
     let pi_path = "/Users/example/pi-whim/session.jsonl";
 
-    workspace.apply(Action::ProjectsLoaded(vec![project]), window, cx);
-    workspace.apply(
-        Action::SessionsLoaded {
+    state.dispatch(Action::ProjectsLoaded(vec![project]));
+    state.dispatch(Action::SessionsLoaded {
+        project_id,
+        sessions: vec![SessionSummary {
+            id: stable_session_id(pi_path),
             project_id,
-            sessions: vec![SessionSummary {
-                id: stable_session_id(pi_path),
-                project_id,
-                pi_path: pi_path.into(),
-                title: "Migrate the UI to gpui".into(),
-                preview: "How should the views be split?".into(),
-                updated_at_ms: 1,
-            }],
-        },
-        window,
-        cx,
-    );
-    workspace.apply(Action::SelectProject(project_id), window, cx);
-    workspace.apply(Action::SetSessionStatus(SessionStatus::Ready), window, cx);
+            pi_path: pi_path.into(),
+            title: "Migrate the UI to gpui".into(),
+            preview: "How should the views be split?".into(),
+            updated_at_ms: 1,
+        }],
+    });
+    state.dispatch(Action::SelectProject(project_id));
+    state.dispatch(Action::SetSessionStatus(SessionStatus::Ready));
 
     // One question waiting, so the chooser is on screen for the visual check.
     // Answering it or pressing Escape closes it; right-clicking a sidebar row
@@ -78,24 +78,20 @@ fn seed(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspa
         model("p2", "Ollama", "qwen3-coder", "qwen3-coder"),
     ];
     let current = models[0].clone();
-    workspace.apply(
-        Action::RuntimeControlsUpdated {
-            current_model: Some(current),
-            available_models: models,
-            thinking_level: ThinkingLevel::Medium,
-            available_thinking_levels: vec![
-                ThinkingLevel::Off,
-                ThinkingLevel::Low,
-                ThinkingLevel::Medium,
-                ThinkingLevel::High,
-            ],
-            auto_compaction_enabled: true,
-            steering_mode: QueueMode::OneAtATime,
-            follow_up_mode: QueueMode::All,
-        },
-        window,
-        cx,
-    );
+    state.dispatch(Action::RuntimeControlsUpdated {
+        current_model: Some(current),
+        available_models: models,
+        thinking_level: ThinkingLevel::Medium,
+        available_thinking_levels: vec![
+            ThinkingLevel::Off,
+            ThinkingLevel::Low,
+            ThinkingLevel::Medium,
+            ThinkingLevel::High,
+        ],
+        auto_compaction_enabled: true,
+        steering_mode: QueueMode::OneAtATime,
+        follow_up_mode: QueueMode::All,
+    });
 
     for (id, role, text) in [
         (
@@ -110,23 +106,21 @@ fn seed(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspa
         ),
         ("m3", ConversationRole::System, "session ready"),
     ] {
-        workspace.apply(
-            Action::UpsertConversation(ConversationItem {
-                id: id.into(),
-                role,
-                full_text: text.into(),
-                streaming: false,
-                tool_name: None,
-                tool_report: None,
-                tool_details: None,
-                is_error: false,
-                model: None,
-                attachments: Vec::new(),
-            }),
-            window,
-            cx,
-        );
+        state.dispatch(Action::UpsertConversation(ConversationItem {
+            id: id.into(),
+            role,
+            full_text: text.into(),
+            streaming: false,
+            tool_name: None,
+            tool_report: None,
+            tool_details: None,
+            is_error: false,
+            model: None,
+            attachments: Vec::new(),
+        }));
     }
+
+    workspace.set_state(state, window, cx);
 }
 
 fn main() {

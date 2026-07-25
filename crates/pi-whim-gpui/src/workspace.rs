@@ -12,16 +12,15 @@ use gpui::{
 };
 use gpui_component::theme::{Theme as ComponentTheme, ThemeMode as ComponentMode};
 use pi_whim_core::{
-    Action, AgentTeamConfig, AppState, Attachment, BashPolicy, ConversationItem, ConversationRole,
-    Language, ModelOption, ProjectId, ProviderId, ProviderProfile, ProviderProtocol, QueueMode,
-    SearchEngineProfile, SessionStatus, SubmitMode, ThinkingLevel,
+    AgentTeamConfig, AppState, Attachment, BashPolicy, Language, ModelOption, ProjectId,
+    ProviderId, ProviderProfile, ProviderProtocol, QueueMode, SearchEngineProfile, SessionStatus,
+    SubmitMode, ThinkingLevel,
 };
 use pi_whim_engine::dialogs::{Answer, Prompt};
 use pi_whim_engine::mailbox::Delivery;
 use pi_whim_engine::notice::Outbox;
 use pi_whim_engine::session::now_ms;
 use pi_whim_engine::slash_commands::SlashCommand;
-use pi_whim_engine::state::{EngineState, ViewEffect};
 use pi_whim_theme::{ThemeMode, ThemePreference, Tokens, text};
 
 use crate::{
@@ -142,7 +141,12 @@ pub enum Request {
 pub struct Workspace {
     preference: ThemePreference,
     tokens: Tokens,
-    engine: EngineState,
+    /// What is on screen.
+    ///
+    /// A projection, not the truth: the host owns the reducer and hands whole
+    /// snapshots to [`Workspace::set_state`]. A second reducer here could
+    /// disagree with the one the agent's events go through.
+    state: AppState,
     sidebar: Entity<Sidebar>,
     conversation: Entity<Conversation>,
     composer: Entity<Composer>,
@@ -212,14 +216,14 @@ impl Workspace {
         .detach();
 
         let composer = cx.new(|cx| Composer::new(tokens, window, cx));
-        cx.subscribe_in(&composer, window, |workspace, _, event, window, cx| {
-            workspace.handle_composer_event(event.clone(), window, cx);
+        cx.subscribe(&composer, |workspace, _, event, cx| {
+            workspace.handle_composer_event(event.clone(), cx);
         })
         .detach();
 
         let controls = cx.new(|cx| Controls::new(tokens, window, cx));
-        cx.subscribe_in(&controls, window, |workspace, _, event, window, cx| {
-            workspace.handle_controls_event(event.clone(), window, cx);
+        cx.subscribe(&controls, |workspace, _, event, cx| {
+            workspace.handle_controls_event(event.clone(), cx);
         })
         .detach();
 
@@ -252,8 +256,8 @@ impl Workspace {
         })
         .detach();
 
-        let engine = EngineState::new();
-        let settings = cx.new(|cx| Settings::new(tokens, engine.get().clone(), window, cx));
+        let state = AppState::default();
+        let settings = cx.new(|cx| Settings::new(tokens, state.clone(), window, cx));
         cx.subscribe_in(&settings, window, |workspace, _, event, window, cx| {
             workspace.handle_settings_event(event.clone(), window, cx);
         })
@@ -262,7 +266,7 @@ impl Workspace {
         Self {
             preference,
             tokens,
-            engine,
+            state,
             sidebar,
             conversation,
             composer,
@@ -429,38 +433,23 @@ impl Workspace {
     /// A submitted prompt goes into the conversation here and to the agent as a
     /// request: it should appear the moment it is sent, not when Pi acknowledges
     /// it, and the RPC needs the runtime this crate has no handle on.
-    fn handle_composer_event(
-        &mut self,
-        event: ComposerEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn handle_composer_event(&mut self, event: ComposerEvent, cx: &mut Context<Self>) {
         match event {
             ComposerEvent::Submit {
                 content,
                 attachments,
                 mode,
             } => {
+                // Composer::add_attachment already keeps paths unique, so the
+                // list arrives deduplicated. Showing it is the host's too: it
+                // puts the prompt in the conversation before sending, so the
+                // sent and the shown text cannot diverge.
                 self.requests.push(Request::SubmitPrompt {
-                    content: content.clone(),
-                    attachments: attachments.clone(),
+                    content,
+                    attachments,
                     mode,
                 });
-                // Composer::add_attachment already keeps paths unique, so the
-                // list arrives deduplicated.
-                let item = ConversationItem {
-                    id: format!("prompt-{}", self.engine.get().conversation.len()),
-                    role: ConversationRole::User,
-                    full_text: content,
-                    streaming: false,
-                    tool_name: None,
-                    tool_report: None,
-                    tool_details: None,
-                    is_error: false,
-                    model: None,
-                    attachments,
-                };
-                self.apply(Action::UpsertConversation(item), window, cx);
+                cx.notify();
             }
             ComposerEvent::Stop => {
                 // Requested, not applied: the status has to follow what the agent
@@ -477,7 +466,7 @@ impl Workspace {
             ComposerEvent::TextChanged(text) => {
                 // The palette is a function of what is typed: no open/close state
                 // to leave stale, so a `/` opens it and a backspace closes it.
-                let state = self.engine.get().clone();
+                let state = self.state.clone();
                 self.palette.update(cx, |palette, cx| {
                     palette.sync(&state, &text, cx);
                 });
@@ -508,7 +497,7 @@ impl Workspace {
                 });
                 // Setting the value does not emit a change, so re-derive the
                 // options here or the palette would keep showing the old list.
-                let state = self.engine.get().clone();
+                let state = self.state.clone();
                 self.palette.update(cx, |palette, cx| {
                     palette.sync(&state, &text, cx);
                 });
@@ -526,19 +515,14 @@ impl Workspace {
     /// Act on what the runtime controls reported.
     ///
     /// All three reach the agent over RPC, which lives behind `AgentRuntime`, so
-    /// they queue as requests the same way the sidebar's do. A model switch is
-    /// applied to state as well, since the picker has to keep showing the choice
-    /// while it waits for the next prompt to take effect.
-    fn handle_controls_event(
-        &mut self,
-        event: ControlsEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    /// they queue as requests the same way the sidebar's do.
+    fn handle_controls_event(&mut self, event: ControlsEvent, cx: &mut Context<Self>) {
         match event {
             ControlsEvent::SetModel(model) => {
-                self.requests.push(Request::SetModel(model.clone()));
-                self.apply(Action::SetPendingModel(Some(model)), window, cx);
+                // The host records the choice as pending — a switch waits for the
+                // next prompt so the prior model compacts the history first — and
+                // the picker shows it when that snapshot comes back.
+                self.requests.push(Request::SetModel(model));
             }
             ControlsEvent::SetThinkingLevel(level) => {
                 self.requests.push(Request::SetThinkingLevel(level));
@@ -553,28 +537,26 @@ impl Workspace {
                 });
             }
         }
+        cx.notify();
     }
 
     /// Act on what the settings page reported.
     ///
-    /// The preference toggles are applied through the reducer *and* queued as a
-    /// request: the reducer makes the control reflect the click immediately, and
-    /// the request writes it to the store. The provider and search-engine halves
-    /// only queue, because the draft is not domain state until it is stored and
-    /// read back.
+    /// Everything that changes domain state leaves as a request: the host applies
+    /// it and the snapshot comes back, so a preference cannot end up showing as
+    /// set while the write that stores it failed. The provider and search-engine
+    /// halves queue too, because a draft is not domain state until it is stored
+    /// and read back.
     fn handle_settings_event(
         &mut self,
         event: SettingsEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // The preference toggles all take the same route, so which action and
-        // which request each needs is decided by one function rather than by six
-        // near-identical arms — and that function is assertable without a window.
-        if let Some((action, request)) = preference_change(&event) {
-            if let Some(action) = action {
-                self.apply(action, window, cx);
-            }
+        // The preference toggles all take the same route, so which request each
+        // needs is decided by one function rather than by six near-identical
+        // arms — and that function is assertable without a window.
+        if let Some(request) = preference_change(&event) {
             self.requests.push(request);
             cx.notify();
             return;
@@ -667,7 +649,7 @@ impl Workspace {
                 // Tested as it would be stored — trimmed URL, chosen protocol —
                 // so a pass means the saved instance works, not just the typing.
                 let draft = self.settings.read(cx).search_engine_draft().clone();
-                let position = self.engine.get().search_engine_profiles.len() as u32;
+                let position = self.state.search_engine_profiles.len() as u32;
                 self.requests
                     .push(Request::TestSearchEngine(draft.to_profile(position)));
             }
@@ -697,7 +679,7 @@ impl Workspace {
 
     /// Push the current rows into the sidebar.
     fn sync_sidebar(&mut self, cx: &mut Context<Self>) {
-        let rows = chat::rows(self.engine.get(), &self.expanded_projects);
+        let rows = chat::rows(&self.state, &self.expanded_projects);
         let tokens = self.tokens;
         self.sidebar.update(cx, |sidebar, cx| {
             sidebar.set_tokens(tokens, cx);
@@ -707,7 +689,7 @@ impl Workspace {
 
     /// Push the current entries into the conversation.
     fn sync_conversation(&mut self, cx: &mut Context<Self>) {
-        let messages = chat::visible_messages(self.engine.get());
+        let messages = chat::visible_messages(&self.state);
         let tokens = self.tokens;
         self.conversation.update(cx, |conversation, cx| {
             conversation.set_tokens(tokens, cx);
@@ -722,7 +704,7 @@ impl Workspace {
 
         let tokens = self.tokens;
         let busy = matches!(
-            self.engine.get().session_status,
+            self.state.session_status,
             SessionStatus::Streaming | SessionStatus::Compacting
         );
         self.composer.update(cx, |composer, cx| {
@@ -733,7 +715,7 @@ impl Workspace {
         // The controls reseed from state wholesale: which models exist, which
         // thinking levels this one offers, and what is selected all change
         // together when the agent reports back.
-        let state = self.engine.get().clone();
+        let state = self.state.clone();
         self.controls.update(cx, |controls, cx| {
             controls.set_tokens(tokens, cx);
             controls.sync(&state, window, cx);
@@ -788,7 +770,7 @@ impl Workspace {
 
     /// Read-only domain state, for rendering.
     pub fn state(&self) -> &AppState {
-        self.engine.get()
+        &self.state
     }
 
     /// Show `state` instead of what is on screen now.
@@ -804,73 +786,16 @@ impl Workspace {
         // messages it describes do. A changed session counts as much as an
         // emptied conversation: switching clears and reloads in one step, so the
         // empty moment in between never arrives as its own snapshot.
-        let previous = self.engine.get();
+        let previous = &self.state;
         let switched = previous.selected_session != state.selected_session;
         let cleared = state.conversation.is_empty() && !previous.conversation.is_empty();
         if switched || cleared {
             self.conversation
                 .update(cx, |conversation, cx| conversation.clear(cx));
         }
-        self.engine = EngineState::from_state(state);
+        self.state = state;
         self.sync_views(window, cx);
         cx.notify();
-    }
-
-    /// Apply `action` through the reducer.
-    ///
-    /// View-local follow-ups arrive as a [`ViewEffect`]; the shell currently
-    /// caches nothing per message, so there is nothing to invalidate yet.
-    pub fn apply(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
-        self.reduce(action, cx);
-        self.sync_views(window, cx);
-        cx.notify();
-    }
-
-    /// Apply a run of actions, syncing the views once at the end.
-    ///
-    /// What a translated agent event produces is several actions at a time, and
-    /// `apply` would rebuild every view between each one — the sidebar rows and
-    /// the conversation both get rebuilt per call, so a streaming turn would pay
-    /// that several times per token.
-    pub fn apply_all(
-        &mut self,
-        actions: impl IntoIterator<Item = Action>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let mut any = false;
-        for action in actions {
-            self.reduce(action, cx);
-            any = true;
-        }
-        if !any {
-            // Nothing changed, so nothing to rebuild or redraw.
-            return;
-        }
-        self.sync_views(window, cx);
-        cx.notify();
-    }
-
-    /// Run one action through the reducer and handle its view-local follow-up.
-    ///
-    /// Split from `apply` so a batch can share one sync. Deliberately does not
-    /// sync or notify: the caller decides when the views are rebuilt.
-    fn reduce(&mut self, action: Action, cx: &mut Context<Self>) {
-        match self.engine.apply(action) {
-            Some(ViewEffect::ConversationCleared) => {
-                self.conversation
-                    .update(cx, |conversation, cx| conversation.clear(cx));
-            }
-            // The settings page owns the provider and search-engine drafts these
-            // describe, and sync_views rebuilds the project rows regardless, so
-            // there is nothing for the shell to do with these yet.
-            Some(
-                ViewEffect::ProvidersReloaded(_)
-                | ViewEffect::SearchEnginesReloaded(_)
-                | ViewEffect::ProjectsLoaded(_),
-            )
-            | None => {}
-        }
     }
 
     pub fn mode(&self) -> ThemeMode {
@@ -922,52 +847,35 @@ fn banner_for(status: &SessionStatus, tokens: Tokens) -> Option<Banner> {
     }
 }
 
-/// The reducer action and backend request a preference change needs, if `event`
-/// is one.
+/// The backend request a preference change needs, if `event` is one.
 ///
 /// Returns `None` for the provider and search-engine events, which are drafts
 /// rather than preferences and need the settings view rather than a table.
 ///
-/// Most of these come in pairs: the action makes the control show the click at
-/// once, and the request writes it where a restart will find it. Applying without
-/// persisting would silently forget the choice; persisting without applying would
-/// leave the control showing the old value until the store answered.
-fn preference_change(event: &SettingsEvent) -> Option<(Option<Action>, Request)> {
+/// The host applies each of these and the snapshot comes back, so the control
+/// shows what was actually stored rather than what was clicked. The two the agent
+/// owns — auto-compaction and the queue modes — could never have been guessed
+/// locally anyway: they arrive through `RuntimeControlsUpdated` and the agent is
+/// free to refuse.
+fn preference_change(event: &SettingsEvent) -> Option<Request> {
     match event {
-        SettingsEvent::SetLanguage(language) => Some((
-            Some(Action::SetLanguage(*language)),
-            Request::PersistLanguage(*language),
-        )),
-        // The only one with no action: auto-compaction is the agent's setting, not
-        // the store's, and it comes back through `RuntimeControlsUpdated`. Guessing
-        // it locally would show the switch flipped even if the agent refused.
-        SettingsEvent::SetAutoCompaction(enabled) => {
-            Some((None, Request::SetAutoCompaction(*enabled)))
+        SettingsEvent::SetLanguage(language) => Some(Request::PersistLanguage(*language)),
+        SettingsEvent::SetAutoCompaction(enabled) => Some(Request::SetAutoCompaction(*enabled)),
+        SettingsEvent::SetBashPolicy(policy) => Some(Request::PersistBashPolicy(*policy)),
+        SettingsEvent::SetBlockedPatterns(patterns) => {
+            Some(Request::PersistBlockedPatterns(patterns.clone()))
         }
-        SettingsEvent::SetBashPolicy(policy) => Some((
-            Some(Action::SetBashPolicy(*policy)),
-            Request::PersistBashPolicy(*policy),
-        )),
-        SettingsEvent::SetBlockedPatterns(patterns) => Some((
-            Some(Action::SetBashBlockedPatterns(patterns.clone())),
-            Request::PersistBlockedPatterns(patterns.clone()),
-        )),
-        SettingsEvent::SetAgentTeamConfig(config) => Some((
-            Some(Action::SetAgentTeamConfig(config.clone())),
-            Request::PersistAgentTeamConfig(config.clone()),
-        )),
-        // Queue modes are the agent's too, and the controls bar sends the same
-        // request from beside the prompt.
+        SettingsEvent::SetAgentTeamConfig(config) => {
+            Some(Request::PersistAgentTeamConfig(config.clone()))
+        }
+        // The controls bar sends the same request from beside the prompt.
         SettingsEvent::SetQueueModes {
             steering,
             follow_up,
-        } => Some((
-            None,
-            Request::SetQueueModes {
-                steering: *steering,
-                follow_up: *follow_up,
-            },
-        )),
+        } => Some(Request::SetQueueModes {
+            steering: *steering,
+            follow_up: *follow_up,
+        }),
         _ => None,
     }
 }
@@ -991,7 +899,7 @@ impl Render for Workspace {
         if !self.notices.is_empty() {
             crate::dialogs::show_notices(&mut self.notices, window, cx);
         }
-        let state = self.engine.get();
+        let state = &self.state;
         let status = state.session_status.clone();
 
         div()
@@ -1091,7 +999,7 @@ impl Render for Workspace {
 
 #[cfg(test)]
 mod tests {
-    use pi_whim_core::stable_session_id;
+    use pi_whim_core::{ConversationItem, ConversationRole, stable_session_id};
     use pi_whim_engine::mailbox::{RuntimeEvent, SessionToken};
 
     use super::*;
@@ -1134,29 +1042,32 @@ mod tests {
     }
 
     #[test]
-    fn a_stored_preference_is_both_applied_and_persisted() {
-        // Applying without persisting forgets the choice on restart; persisting
-        // without applying leaves the control showing the old value.
-        let (action, request) =
+    fn a_stored_preference_is_persisted_rather_than_assumed() {
+        // The host writes it and the snapshot comes back, so the control cannot
+        // show a policy as set while the write that stores it failed.
+        let request =
             preference_change(&SettingsEvent::SetBashPolicy(BashPolicy::Deny)).expect("a change");
-        assert_eq!(action, Some(Action::SetBashPolicy(BashPolicy::Deny)));
         assert_eq!(request, Request::PersistBashPolicy(BashPolicy::Deny));
     }
 
     #[test]
-    fn the_agents_own_settings_are_not_applied_locally() {
-        // Auto-compaction and the queue modes are the agent's to confirm. Guessing
-        // them here would show the switch flipped even if the agent refused.
-        let (action, _) =
-            preference_change(&SettingsEvent::SetAutoCompaction(true)).expect("a change");
-        assert_eq!(action, None);
-
-        let (action, _) = preference_change(&SettingsEvent::SetQueueModes {
-            steering: QueueMode::All,
-            follow_up: QueueMode::OneAtATime,
-        })
-        .expect("a change");
-        assert_eq!(action, None);
+    fn the_agents_own_settings_go_to_the_agent() {
+        // Auto-compaction and the queue modes are the agent's to confirm, so these
+        // are requests rather than writes to the store.
+        assert_eq!(
+            preference_change(&SettingsEvent::SetAutoCompaction(true)),
+            Some(Request::SetAutoCompaction(true))
+        );
+        assert_eq!(
+            preference_change(&SettingsEvent::SetQueueModes {
+                steering: QueueMode::All,
+                follow_up: QueueMode::OneAtATime,
+            }),
+            Some(Request::SetQueueModes {
+                steering: QueueMode::All,
+                follow_up: QueueMode::OneAtATime,
+            })
+        );
     }
 
     #[test]
@@ -1277,55 +1188,24 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn a_batch_of_actions_all_land(cx: &mut gpui::TestAppContext) {
-        // What a translated agent event produces is several actions at a time, so
-        // dropping any of them would leave the view describing a state the engine
-        // is not in.
+    async fn a_submitted_prompt_is_sent_and_not_shown_locally(cx: &mut gpui::TestAppContext) {
+        // The host puts the prompt in the conversation as it sends it. Showing it
+        // here as well would render it twice — once from the local copy and again
+        // from the snapshot that comes back.
         let shell = shell(cx);
 
         shell
-            .update(cx, |workspace, window, cx| {
-                workspace.apply_all(
-                    [
-                        Action::SetSessionStatus(SessionStatus::Streaming),
-                        Action::SetPendingModel(Some(ModelOption {
-                            provider: "anthropic".into(),
-                            provider_name: "Anthropic".into(),
-                            id: "sonnet".into(),
-                            name: "Sonnet".into(),
-                        })),
-                    ],
-                    window,
-                    cx,
-                );
-
-                assert_eq!(workspace.state().session_status, SessionStatus::Streaming);
-                assert!(workspace.state().pending_model.is_some());
-            })
-            .expect("the window is open");
-    }
-
-    #[gpui::test]
-    async fn a_submitted_prompt_is_shown_and_sent(cx: &mut gpui::TestAppContext) {
-        // Both halves matter: shown immediately so the prompt does not seem to
-        // vanish while Pi starts, and sent because otherwise it only looks sent.
-        let shell = shell(cx);
-
-        shell
-            .update(cx, |workspace, window, cx| {
+            .update(cx, |workspace, _, cx| {
                 workspace.handle_composer_event(
                     ComposerEvent::Submit {
                         content: "what changed?".to_owned(),
                         attachments: Vec::new(),
                         mode: SubmitMode::Prompt,
                     },
-                    window,
                     cx,
                 );
 
-                let shown = workspace.state().conversation.last().expect("the prompt");
-                assert_eq!(shown.full_text, "what changed?");
-                assert_eq!(shown.role, ConversationRole::User);
+                assert!(workspace.state().conversation.is_empty());
                 assert!(matches!(
                     workspace.take_requests().as_slice(),
                     [Request::SubmitPrompt { content, .. }] if content == "what changed?"
@@ -1344,16 +1224,42 @@ mod tests {
 
         shell
             .update(cx, |workspace, window, cx| {
-                workspace.apply(
-                    Action::SetSessionStatus(SessionStatus::Streaming),
+                workspace.set_state(
+                    AppState {
+                        session_status: SessionStatus::Streaming,
+                        ..AppState::default()
+                    },
                     window,
                     cx,
                 );
 
-                workspace.handle_composer_event(ComposerEvent::Stop, window, cx);
+                workspace.handle_composer_event(ComposerEvent::Stop, cx);
 
                 assert_eq!(workspace.state().session_status, SessionStatus::Streaming);
                 assert_eq!(workspace.take_requests(), vec![Request::Stop]);
+            })
+            .expect("the window is open");
+    }
+
+    #[gpui::test]
+    async fn choosing_a_model_asks_rather_than_showing_it_chosen(cx: &mut gpui::TestAppContext) {
+        // A switch waits for the next prompt so the prior model compacts the
+        // history first. Showing it as pending here would claim the deferral
+        // happened even if the request never reached the agent.
+        let shell = shell(cx);
+        let model = ModelOption {
+            provider: "anthropic".into(),
+            provider_name: "Anthropic".into(),
+            id: "sonnet".into(),
+            name: "Sonnet".into(),
+        };
+
+        shell
+            .update(cx, |workspace, _, cx| {
+                workspace.handle_controls_event(ControlsEvent::SetModel(model.clone()), cx);
+
+                assert!(workspace.state().pending_model.is_none());
+                assert_eq!(workspace.take_requests(), vec![Request::SetModel(model)]);
             })
             .expect("the window is open");
     }
