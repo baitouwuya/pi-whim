@@ -16,4 +16,5 @@ pub mod protocol;
 pub mod providers;
 pub mod session;
 pub mod state;
+pub mod thinking;
 pub mod typewriter;
