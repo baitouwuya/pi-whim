@@ -1,7 +1,7 @@
 mod macos_paste;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
     time::Duration,
@@ -29,14 +29,14 @@ use pi_whim_catalog::ModelCapabilityResolver;
 use pi_whim_engine::pool::{SessionPool, SessionRuntime, is_draft};
 use pi_whim_engine::protocol::{assistant_text, queue_mode_name};
 use pi_whim_engine::providers::{
-    configured_provider_environment, discover_models, normalize_base_url, pi_models_json,
-    provider_keychain_account, test_searxng_engine, valid_search_engine_url,
+    discover_models, normalize_base_url, provider_keychain_account, test_searxng_engine,
+    valid_search_engine_url,
 };
 use pi_whim_engine::session::{
     attachment_from_path, bash_policy_name, canonical_path, ensure_agent_team_extension,
-    is_large_paste, now_ms, pi_agent_directory, prompt_with_attachment_paths,
+    is_large_paste, now_ms, prompt_with_attachment_paths,
 };
-use pi_whim_engine::{controls, events};
+use pi_whim_engine::{controls, events, launch};
 
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
@@ -628,67 +628,6 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         }
     }
 
-    fn prepare_pi_configuration(&self) -> Result<HashMap<String, String>, String> {
-        const PI_COMPACTION_KEEP_RECENT_TOKENS: u64 = 100;
-        let agent_directory = self
-            .agent_directory_override
-            .clone()
-            .map(Ok)
-            .unwrap_or_else(pi_agent_directory)?;
-        fs::create_dir_all(&agent_directory).map_err(|error| error.to_string())?;
-        let mut profiles = self
-            .store
-            .as_ref()
-            .map(ProviderRepository::list_provider_profiles)
-            .transpose()
-            .map_err(|error| error.to_string())?
-            .unwrap_or_default();
-        for profile in &mut profiles {
-            self.capability_resolver.enrich_profile(profile);
-        }
-        let (configured_profiles, mut environment) =
-            configured_provider_environment(profiles, |profile_id| {
-                self.secrets
-                    .get(&provider_keychain_account(profile_id))
-                    .map_err(|error| error.to_string())
-            })?;
-        fs::write(
-            agent_directory.join("models.json"),
-            serde_json::to_vec_pretty(&pi_models_json(&configured_profiles))
-                .map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string())?;
-
-        // Lower pi-mono's keepRecentTokens (default 20000) so small sessions can be compacted.
-        let settings_path = agent_directory.join("settings.json");
-        let mut settings: Value = fs::read(&settings_path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_else(|| json!({}));
-        if let Some(obj) = settings.as_object_mut() {
-            let compaction = obj
-                .entry("compaction".to_string())
-                .or_insert_with(|| json!({}));
-            if let Some(compaction) = compaction.as_object_mut() {
-                compaction.insert(
-                    "keepRecentTokens".to_string(),
-                    Value::from(PI_COMPACTION_KEEP_RECENT_TOKENS),
-                );
-            }
-        }
-        fs::write(
-            &settings_path,
-            serde_json::to_vec_pretty(&settings).map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string())?;
-
-        environment.insert(
-            "PI_CODING_AGENT_DIR".into(),
-            agent_directory.to_string_lossy().into_owned(),
-        );
-        Ok(environment)
-    }
-
     fn discover_provider_models(
         &mut self,
         profile_id: Option<ProviderId>,
@@ -801,7 +740,23 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             self.error = Some(error.to_string());
             return None;
         }
-        let mut environment = match self.prepare_pi_configuration() {
+        // Capabilities come from the catalog, which the app owns, so profiles
+        // are enriched before they reach engine.
+        let mut profiles = self
+            .store
+            .as_ref()
+            .map(ProviderRepository::list_provider_profiles)
+            .transpose()
+            .unwrap_or_default()
+            .unwrap_or_default();
+        for profile in &mut profiles {
+            self.capability_resolver.enrich_profile(profile);
+        }
+        let mut environment = match launch::prepare_pi_configuration(
+            self.agent_directory_override.as_deref(),
+            profiles,
+            &self.secrets,
+        ) {
             Ok(environment) => environment,
             Err(error) => {
                 self.error = Some(error);

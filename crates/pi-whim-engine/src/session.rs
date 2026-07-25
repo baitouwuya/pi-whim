@@ -24,7 +24,7 @@ pub fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
-pub fn pi_agent_directory() -> Result<PathBuf, String> {
+pub(crate) fn pi_agent_directory() -> Result<PathBuf, String> {
     let root = dirs::data_dir()
         .ok_or_else(|| "Application Support directory is unavailable.".to_owned())?
         .join("pi-whim")

@@ -19,7 +19,7 @@ fn provider_environment_name(id: ProviderId) -> String {
     format!("PI_WHIM_PROVIDER_{}", id.simple())
 }
 
-pub fn configured_provider_environment(
+pub(crate) fn configured_provider_environment(
     profiles: Vec<ProviderProfile>,
     mut get_key: impl FnMut(ProviderId) -> Result<Option<String>, String>,
 ) -> Result<(Vec<ProviderProfile>, HashMap<String, String>), String> {
@@ -78,7 +78,7 @@ pub fn test_searxng_engine(profile: &SearchEngineProfile) -> Result<(), String> 
     Ok(())
 }
 
-pub fn pi_models_json(profiles: &[ProviderProfile]) -> Value {
+pub(crate) fn pi_models_json(profiles: &[ProviderProfile]) -> Value {
     let providers = profiles
         .iter()
         .map(|profile| {
