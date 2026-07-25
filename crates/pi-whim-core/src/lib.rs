@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use unicode_segmentation::UnicodeSegmentation;
 use uuid::Uuid;
 
+pub mod strings;
+
 pub use model_capabilities::{
     CapabilityMatch, CatalogModelCapability, ModelCapability, ModelCapabilitySource, ThinkingLevel,
     ThinkingLevelMap, normalize_provider_display_name, normalize_provider_name, provider_name_key,
