@@ -722,6 +722,9 @@ impl PreferencesRepository for SqliteStore {
     }
 }
 
+/// Cheap to clone: it holds only the service name, and the keychain
+/// itself is the shared resource.
+#[derive(Clone)]
 pub struct MacosKeychainStore {
     service: String,
 }

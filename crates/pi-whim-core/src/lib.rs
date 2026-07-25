@@ -547,6 +547,11 @@ pub enum Action {
     SetBashBlockedPatterns(Vec<String>),
     SetAgentTeamConfig(AgentTeamConfig),
     ProviderProfilesLoaded(Vec<ProviderProfile>),
+    /// Which providers have a key in the OS keychain.
+    ///
+    /// Separate from `ProviderProfilesLoaded` because probing the keychain can
+    /// block for a long time, so profiles render first and this fills in.
+    ProviderKeyStatusLoaded(Vec<(ProviderId, bool)>),
     SearchEngineProfilesLoaded(Vec<SearchEngineProfile>),
     RuntimeControlsUpdated {
         current_model: Option<ModelOption>,
@@ -614,6 +619,17 @@ impl AppState {
             }
             Action::SetAgentTeamConfig(config) => {
                 self.agent_team_config = config.normalized();
+            }
+            Action::ProviderKeyStatusLoaded(statuses) => {
+                for (id, has_api_key) in statuses {
+                    if let Some(profile) = self
+                        .provider_profiles
+                        .iter_mut()
+                        .find(|profile| profile.id == id)
+                    {
+                        profile.has_api_key = has_api_key;
+                    }
+                }
             }
             Action::ProviderProfilesLoaded(mut profiles) => {
                 profiles.sort_by(|left, right| {
@@ -734,6 +750,35 @@ mod tests {
     #[test]
     fn prefix_never_splits_a_grapheme() {
         assert_eq!(grapheme_prefix("A👨‍👩‍👧‍👦B", 2), "A👨‍👩‍👧‍👦");
+    }
+
+    #[test]
+    fn key_status_lands_on_already_loaded_profiles() {
+        // Profiles render before the keychain has been probed, so the status
+        // arrives separately and has to find its profile by id.
+        let mut state = AppState::default();
+        let profile = ProviderProfile {
+            id: Uuid::new_v4(),
+            name: "Example".into(),
+            base_url: "https://example.test".into(),
+            protocol: ProviderProtocol::default(),
+            models: Vec::new(),
+            updated_at_ms: 1,
+            has_api_key: false,
+        };
+        let id = profile.id;
+        state.dispatch(Action::ProviderProfilesLoaded(vec![profile]));
+        assert!(!state.provider_profiles[0].has_api_key);
+
+        state.dispatch(Action::ProviderKeyStatusLoaded(vec![(id, true)]));
+        assert!(state.provider_profiles[0].has_api_key);
+
+        // An id that is no longer loaded is simply ignored.
+        state.dispatch(Action::ProviderKeyStatusLoaded(vec![(
+            Uuid::new_v4(),
+            true,
+        )]));
+        assert!(state.provider_profiles[0].has_api_key);
     }
 
     // Progressive reveal moved to pi_whim_engine::typewriter::Typewriter, and

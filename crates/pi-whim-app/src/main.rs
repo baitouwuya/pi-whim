@@ -127,21 +127,18 @@ impl Default for PiWhimApplication<PiRpcRuntime> {
         {
             workbench.apply(Action::SearchEngineProfilesLoaded(profiles));
         }
+        let mut provider_ids = Vec::new();
         if let Some(store) = store.as_ref()
             && let Ok(mut profiles) = store.list_provider_profiles()
         {
             for profile in &mut profiles {
                 capability_resolver.enrich_profile(profile);
                 let _ = store.save_provider_profile(profile);
-                profile.has_api_key = MacosKeychainStore::default()
-                    .get(&provider_keychain_account(profile.id))
-                    .ok()
-                    .flatten()
-                    .is_some();
             }
+            provider_ids = profiles.iter().map(|profile| profile.id).collect();
             workbench.apply(Action::ProviderProfilesLoaded(profiles));
         }
-        Self {
+        let application = Self {
             workbench,
             store,
             secrets: MacosKeychainStore::default(),
@@ -158,7 +155,12 @@ impl Default for PiWhimApplication<PiRpcRuntime> {
             error: None,
             notice: None,
             control_updates: crossbeam_channel::unbounded(),
-        }
+        };
+        // Probing the keychain can block for a long time and this runs before
+        // the first frame, so profiles render with their stored status and a
+        // worker corrects them.
+        application.refresh_provider_key_status(provider_ids);
+        application
     }
 }
 
@@ -446,6 +448,34 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         }
     }
 
+    /// Probe the keychain for each provider's key on a worker thread.
+    ///
+    /// A keychain read can block for a long time — long enough to be worth
+    /// keeping off any path that has to draw — so profiles render with whatever
+    /// status they were stored with and this corrects them.
+    fn refresh_provider_key_status(&self, ids: Vec<ProviderId>) {
+        if ids.is_empty() {
+            return;
+        }
+        let sender = self.control_updates.0.clone();
+        let key = self.sessions.active_key().map(str::to_owned);
+        let secrets = self.secrets.clone();
+        std::thread::spawn(move || {
+            let statuses = ids
+                .into_iter()
+                .map(|id| {
+                    let saved = secrets
+                        .get(&provider_keychain_account(id))
+                        .ok()
+                        .flatten()
+                        .is_some();
+                    (id, saved)
+                })
+                .collect();
+            let _ = sender.send((key, vec![Action::ProviderKeyStatusLoaded(statuses)]));
+        });
+    }
+
     fn reload_provider_profiles(&mut self) {
         let Some(store) = self.store.as_ref() else {
             return;
@@ -454,15 +484,11 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             Ok(mut profiles) => {
                 for profile in &mut profiles {
                     self.capability_resolver.enrich_profile(profile);
-                    profile.has_api_key = self
-                        .secrets
-                        .get(&provider_keychain_account(profile.id))
-                        .ok()
-                        .flatten()
-                        .is_some();
                 }
+                let ids: Vec<ProviderId> = profiles.iter().map(|profile| profile.id).collect();
                 self.workbench
                     .apply(Action::ProviderProfilesLoaded(profiles));
+                self.refresh_provider_key_status(ids);
             }
             Err(error) => self.error = Some(error.to_string()),
         }
