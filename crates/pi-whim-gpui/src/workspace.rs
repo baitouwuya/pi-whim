@@ -12,11 +12,11 @@ use gpui::{
 };
 use gpui_component::theme::{Theme as ComponentTheme, ThemeMode as ComponentMode};
 use pi_whim_core::{Action, AppState, ProjectId, SessionStatus, stable_session_id};
-use pi_whim_engine::state::EngineState;
+use pi_whim_engine::state::{EngineState, ViewEffect};
 use pi_whim_theme::{ThemeMode, ThemePreference, Tokens, text};
 
 use crate::{
-    chat::{self, Sidebar, SidebarEvent},
+    chat::{self, Conversation, ConversationEvent, Sidebar, SidebarEvent},
     chrome::{Banner, StatusStrip, TopBar},
     theme::IntoHsla,
 };
@@ -27,6 +27,7 @@ pub struct Workspace {
     tokens: Tokens,
     engine: EngineState,
     sidebar: Entity<Sidebar>,
+    conversation: Entity<Conversation>,
     /// Projects whose sessions are listed. View-local: which projects a reader
     /// has open says nothing about the session.
     expanded_projects: BTreeSet<ProjectId>,
@@ -46,11 +47,26 @@ impl Workspace {
         })
         .detach();
 
+        let conversation = cx.new(|_| Conversation::new(tokens));
+        cx.subscribe(&conversation, |_, conversation, event, cx| {
+            match event {
+                ConversationEvent::ToggleToolDetails(id) => {
+                    let id = id.clone();
+                    conversation.update(cx, |conversation, cx| {
+                        conversation.toggle_details(&id, cx);
+                    });
+                }
+            }
+            cx.notify();
+        })
+        .detach();
+
         Self {
             preference,
             tokens,
             engine: EngineState::new(),
             sidebar,
+            conversation,
             expanded_projects: BTreeSet::new(),
         }
     }
@@ -73,7 +89,7 @@ impl Workspace {
                     .apply(Action::SelectSession(stable_session_id(&pi_path)));
             }
         }
-        self.sync_sidebar(cx);
+        self.sync_views(cx);
         cx.notify();
     }
 
@@ -87,6 +103,22 @@ impl Workspace {
         });
     }
 
+    /// Push the current entries into the conversation.
+    fn sync_conversation(&mut self, cx: &mut Context<Self>) {
+        let messages = chat::visible_messages(self.engine.get());
+        let tokens = self.tokens;
+        self.conversation.update(cx, |conversation, cx| {
+            conversation.set_tokens(tokens, cx);
+            conversation.set_messages(messages, cx);
+        });
+    }
+
+    /// Refresh both panes after state changed.
+    fn sync_views(&mut self, cx: &mut Context<Self>) {
+        self.sync_sidebar(cx);
+        self.sync_conversation(cx);
+    }
+
     /// Read-only domain state, for rendering.
     pub fn state(&self) -> &AppState {
         self.engine.get()
@@ -97,8 +129,22 @@ impl Workspace {
     /// View-local follow-ups arrive as a [`ViewEffect`]; the shell currently
     /// caches nothing per message, so there is nothing to invalidate yet.
     pub fn apply(&mut self, action: Action, cx: &mut Context<Self>) {
-        let _effect = self.engine.apply(action);
-        self.sync_sidebar(cx);
+        match self.engine.apply(action) {
+            Some(ViewEffect::ConversationCleared) => {
+                self.conversation
+                    .update(cx, |conversation, cx| conversation.clear(cx));
+            }
+            // The settings page owns the provider and search-engine drafts these
+            // describe, and sync_views rebuilds the project rows regardless, so
+            // there is nothing for the shell to do with these yet.
+            Some(
+                ViewEffect::ProvidersReloaded(_)
+                | ViewEffect::SearchEnginesReloaded(_)
+                | ViewEffect::ProjectsLoaded(_),
+            )
+            | None => {}
+        }
+        self.sync_views(cx);
         cx.notify();
     }
 
@@ -113,7 +159,7 @@ impl Workspace {
         self.preference = ThemePreference::Fixed(next);
         self.tokens = Tokens::new(next);
         crate::theme::reapply(next, Some(window), cx);
-        self.sync_sidebar(cx);
+        self.sync_views(cx);
         cx.notify();
     }
 
@@ -134,7 +180,7 @@ impl Workspace {
         }
         self.tokens = Tokens::new(system);
         crate::theme::reapply(system, Some(window), cx);
-        self.sync_sidebar(cx);
+        self.sync_views(cx);
         cx.notify();
     }
 }
@@ -193,7 +239,7 @@ impl Render for Workspace {
                     .flex()
                     .min_h(px(0.0))
                     .child(self.sidebar.clone())
-                    .child(div().flex_1().h_full()),
+                    .child(self.conversation.clone()),
             )
             .child(StatusStrip::from_state(self.engine.get(), tokens))
     }
