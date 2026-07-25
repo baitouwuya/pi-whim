@@ -11,12 +11,15 @@ use gpui::{
     prelude::FluentBuilder, px,
 };
 use gpui_component::theme::{Theme as ComponentTheme, ThemeMode as ComponentMode};
-use pi_whim_core::{Action, AppState, ProjectId, SessionStatus, stable_session_id};
+use pi_whim_core::{
+    Action, AppState, ConversationItem, ConversationRole, ProjectId, SessionStatus,
+    stable_session_id,
+};
 use pi_whim_engine::state::{EngineState, ViewEffect};
 use pi_whim_theme::{ThemeMode, ThemePreference, Tokens, text};
 
 use crate::{
-    chat::{self, Conversation, ConversationEvent, Sidebar, SidebarEvent},
+    chat::{self, Composer, ComposerEvent, Conversation, ConversationEvent, Sidebar, SidebarEvent},
     chrome::{Banner, StatusStrip, TopBar},
     theme::IntoHsla,
 };
@@ -28,13 +31,14 @@ pub struct Workspace {
     engine: EngineState,
     sidebar: Entity<Sidebar>,
     conversation: Entity<Conversation>,
+    composer: Entity<Composer>,
     /// Projects whose sessions are listed. View-local: which projects a reader
     /// has open says nothing about the session.
     expanded_projects: BTreeSet<ProjectId>,
 }
 
 impl Workspace {
-    pub fn new(preference: ThemePreference, cx: &mut Context<Self>) -> Self {
+    pub fn new(preference: ThemePreference, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mode = if ComponentTheme::global(cx).is_dark() {
             ThemeMode::Dark
         } else {
@@ -61,12 +65,19 @@ impl Workspace {
         })
         .detach();
 
+        let composer = cx.new(|cx| Composer::new(tokens, window, cx));
+        cx.subscribe(&composer, |workspace, _, event, cx| {
+            workspace.handle_composer_event(event.clone(), cx);
+        })
+        .detach();
+
         Self {
             preference,
             tokens,
             engine: EngineState::new(),
             sidebar,
             conversation,
+            composer,
             expanded_projects: BTreeSet::new(),
         }
     }
@@ -93,6 +104,45 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Act on what the composer reported.
+    ///
+    /// Submitting is the shell's to forward to the backend, which the egui app
+    /// still owns; for now the prompt lands in the conversation so the round trip
+    /// is visible.
+    fn handle_composer_event(&mut self, event: ComposerEvent, cx: &mut Context<Self>) {
+        match event {
+            ComposerEvent::Submit {
+                content,
+                attachments,
+                ..
+            } => {
+                // Composer::add_attachment already keeps paths unique, so the
+                // list arrives deduplicated.
+                let item = ConversationItem {
+                    id: format!("prompt-{}", self.engine.get().conversation.len()),
+                    role: ConversationRole::User,
+                    full_text: content,
+                    streaming: false,
+                    tool_name: None,
+                    tool_report: None,
+                    tool_details: None,
+                    is_error: false,
+                    model: None,
+                    attachments,
+                };
+                self.apply(Action::UpsertConversation(item), cx);
+            }
+            ComposerEvent::Stop => {
+                self.apply(Action::SetSessionStatus(SessionStatus::Ready), cx);
+            }
+            ComposerEvent::RemoveAttachment(path) => {
+                self.composer.update(cx, |composer, cx| {
+                    composer.remove_attachment(&path, cx);
+                });
+            }
+        }
+    }
+
     /// Push the current rows into the sidebar.
     fn sync_sidebar(&mut self, cx: &mut Context<Self>) {
         let rows = chat::rows(self.engine.get(), &self.expanded_projects);
@@ -113,10 +163,20 @@ impl Workspace {
         });
     }
 
-    /// Refresh both panes after state changed.
+    /// Refresh the panes after state changed.
     fn sync_views(&mut self, cx: &mut Context<Self>) {
         self.sync_sidebar(cx);
         self.sync_conversation(cx);
+
+        let tokens = self.tokens;
+        let busy = matches!(
+            self.engine.get().session_status,
+            SessionStatus::Streaming | SessionStatus::Compacting
+        );
+        self.composer.update(cx, |composer, cx| {
+            composer.set_tokens(tokens, cx);
+            composer.set_busy(busy, cx);
+        });
     }
 
     /// Read-only domain state, for rendering.
@@ -239,7 +299,15 @@ impl Render for Workspace {
                     .flex()
                     .min_h(px(0.0))
                     .child(self.sidebar.clone())
-                    .child(self.conversation.clone()),
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .min_w(px(0.0))
+                            .child(self.conversation.clone())
+                            .child(self.composer.clone()),
+                    ),
             )
             .child(StatusStrip::from_state(self.engine.get(), tokens))
     }

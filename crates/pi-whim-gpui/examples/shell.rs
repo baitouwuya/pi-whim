@@ -85,7 +85,7 @@ fn main() {
         let options = pi_whim_gpui::window_options(cx);
         cx.open_window(options, |window, cx| {
             let workspace = cx.new(|cx| {
-                let mut workspace = Workspace::new(ThemePreference::default(), cx);
+                let mut workspace = Workspace::new(ThemePreference::default(), window, cx);
                 seed(&mut workspace, cx);
                 workspace
             });
