@@ -77,6 +77,10 @@ pub enum Request {
     /// Copy the visible session's transcript into a new one.
     CloneSession,
     /// Put text on the clipboard.
+    ///
+    /// Kept as a request rather than written here: gpui can write the clipboard,
+    /// but what goes on it — a session id, the last reply — is decided beside the
+    /// data, and the host is where that is.
     CopyToClipboard(String),
     /// Move a session's transcript to the trash.
     DeleteSession(String),
@@ -85,6 +89,12 @@ pub enum Request {
     /// Turn a paste into an attachment. Copied files need canonicalizing and
     /// pasted bytes need writing, both of which need the attachment store.
     AttachPaste(Paste),
+    /// Delete an attachment the app wrote, now that the draft has dropped it.
+    ///
+    /// Only for the generated ones — a pasted image, a long paste saved to a file.
+    /// A file the reader attached from disk is theirs, and removing it from the
+    /// draft must not remove it from their computer.
+    DiscardAttachment(String),
     /// Send the drafted prompt to the agent.
     ///
     /// The shell has already put it in the conversation, because a prompt should
@@ -106,15 +116,13 @@ pub enum Request {
     /// Interrupt the turn in flight.
     Stop,
 
-    // The settings page's requests. The reducer has already been run for the
-    // ones that have an `Action`, so these are the persistence and network half:
-    // writing preferences to the store, the key to the keychain, and asking a
-    // provider what it offers.
-    /// Write the preference the shell has already applied.
-    PersistLanguage(Language),
-    PersistBashPolicy(BashPolicy),
-    PersistBlockedPatterns(Vec<String>),
-    PersistAgentTeamConfig(AgentTeamConfig),
+    // The settings page's requests. Preferences are stored as well as applied,
+    // and some of them are process launch flags, so each of these is a change the
+    // host makes rather than one the shell can make and report.
+    SetLanguage(Language),
+    SetBashPolicy(BashPolicy),
+    SetBlockedPatterns(Vec<String>),
+    SetAgentTeamConfig(AgentTeamConfig),
     SetAutoCompaction(bool),
     /// Store a provider, and its key if one was typed.
     SaveProvider {
@@ -459,9 +467,21 @@ impl Workspace {
                 cx.notify();
             }
             ComposerEvent::RemoveAttachment(path) => {
+                // The draft is view-local, so the row goes now. The file behind it
+                // is not: only the ones the app generated are its to delete, and
+                // only it knows which those are.
+                let generated = self
+                    .composer
+                    .read(cx)
+                    .attachments()
+                    .iter()
+                    .any(|attachment| attachment.path == path && attachment.generated_by_app);
                 self.composer.update(cx, |composer, cx| {
                     composer.remove_attachment(&path, cx);
                 });
+                if generated {
+                    self.requests.push(Request::DiscardAttachment(path));
+                }
             }
             ComposerEvent::TextChanged(text) => {
                 // The palette is a function of what is typed: no open/close state
@@ -742,6 +762,18 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Stage a file on the prompt draft.
+    ///
+    /// How the host answers [`Request::AttachPaste`] and the attach command: both
+    /// end in a file the store has written or canonicalized, and the draft that
+    /// carries it to the next prompt is the composer's.
+    pub fn attach(&mut self, attachment: Attachment, cx: &mut Context<Self>) {
+        self.composer.update(cx, |composer, cx| {
+            composer.add_attachment(attachment, cx);
+        });
+        cx.notify();
+    }
+
     /// Report what a provider said it offers.
     pub fn set_discovered_models(
         &mut self,
@@ -859,14 +891,14 @@ fn banner_for(status: &SessionStatus, tokens: Tokens) -> Option<Banner> {
 /// free to refuse.
 fn preference_change(event: &SettingsEvent) -> Option<Request> {
     match event {
-        SettingsEvent::SetLanguage(language) => Some(Request::PersistLanguage(*language)),
+        SettingsEvent::SetLanguage(language) => Some(Request::SetLanguage(*language)),
         SettingsEvent::SetAutoCompaction(enabled) => Some(Request::SetAutoCompaction(*enabled)),
-        SettingsEvent::SetBashPolicy(policy) => Some(Request::PersistBashPolicy(*policy)),
+        SettingsEvent::SetBashPolicy(policy) => Some(Request::SetBashPolicy(*policy)),
         SettingsEvent::SetBlockedPatterns(patterns) => {
-            Some(Request::PersistBlockedPatterns(patterns.clone()))
+            Some(Request::SetBlockedPatterns(patterns.clone()))
         }
         SettingsEvent::SetAgentTeamConfig(config) => {
-            Some(Request::PersistAgentTeamConfig(config.clone()))
+            Some(Request::SetAgentTeamConfig(config.clone()))
         }
         // The controls bar sends the same request from beside the prompt.
         SettingsEvent::SetQueueModes {
@@ -1047,7 +1079,7 @@ mod tests {
         // show a policy as set while the write that stores it failed.
         let request =
             preference_change(&SettingsEvent::SetBashPolicy(BashPolicy::Deny)).expect("a change");
-        assert_eq!(request, Request::PersistBashPolicy(BashPolicy::Deny));
+        assert_eq!(request, Request::SetBashPolicy(BashPolicy::Deny));
     }
 
     #[test]

@@ -190,21 +190,30 @@ impl Palette {
         self.query = None;
         self.dismissed = None;
 
-        // The three that take an argument prefill the composer instead of
-        // running: the reader still has to say which model, level, or message.
-        match &command {
-            SlashCommand::ChooseModel => {
-                cx.emit(PaletteEvent::SetComposerText("/model ".into()));
-            }
-            SlashCommand::ChooseThinkingLevel => {
-                cx.emit(PaletteEvent::SetComposerText("/thinking ".into()));
-            }
-            SlashCommand::ChooseFork => {
-                cx.emit(PaletteEvent::SetComposerText("/fork ".into()));
-            }
-            _ => cx.emit(PaletteEvent::Run(command)),
+        match prefill(&command) {
+            Some(text) => cx.emit(PaletteEvent::SetComposerText(text)),
+            None => cx.emit(PaletteEvent::Run(command)),
         }
         cx.notify();
+    }
+}
+
+/// What running `command` should leave in the field, if it needs an argument.
+///
+/// These do not reach the host at all: the reader still has to say which model,
+/// level, or entry, and sending an incomplete command to the backend so it could
+/// answer by changing what is typed would be a round trip to move a cursor.
+fn prefill(command: &SlashCommand) -> Option<String> {
+    match command {
+        SlashCommand::ChooseModel => Some("/model ".into()),
+        SlashCommand::ChooseThinkingLevel => Some("/thinking ".into()),
+        SlashCommand::ChooseFork => Some("/fork ".into()),
+        // A name is a command once it has one; without, it is a request for one.
+        SlashCommand::NameSession(None) => Some("/name ".into()),
+        // Pi's own commands, listed from what it reported. The trigger goes in the
+        // field so arguments can be added before it is sent.
+        SlashCommand::SubmitDynamic(name) => Some(format!("/{name} ")),
+        _ => None,
     }
 }
 
@@ -309,6 +318,35 @@ mod tests {
     fn stepping_a_single_option_is_a_no_op() {
         assert_eq!(step(0, 1, 1), 0);
         assert_eq!(step(0, 1, -1), 0);
+    }
+
+    #[test]
+    fn a_command_that_needs_an_argument_only_prefills_the_field() {
+        // Running these would ask the backend to change what is typed, which it
+        // would answer by asking the shell to change what is typed.
+        assert_eq!(
+            prefill(&SlashCommand::ChooseModel).as_deref(),
+            Some("/model ")
+        );
+        assert_eq!(
+            prefill(&SlashCommand::NameSession(None)).as_deref(),
+            Some("/name ")
+        );
+        assert_eq!(
+            prefill(&SlashCommand::SubmitDynamic("review".into())).as_deref(),
+            Some("/review ")
+        );
+    }
+
+    #[test]
+    fn a_complete_command_runs() {
+        // Including a name that already has its argument: the prefill is for the
+        // bare trigger, not for the command.
+        assert_eq!(prefill(&SlashCommand::Compact), None);
+        assert_eq!(
+            prefill(&SlashCommand::NameSession(Some("audit".into()))),
+            None
+        );
     }
 
     fn keystroke(key: &str) -> Keystroke {
