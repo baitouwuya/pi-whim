@@ -11,9 +11,9 @@ mod convert;
 
 pub use convert::{IntoHsla, to_gpui, to_hsla};
 
-use gpui::{App, Window};
+use gpui::{App, Window, px};
 use gpui_component::theme::{Theme as ComponentTheme, ThemeMode as ComponentMode};
-use pi_whim_theme::{ThemeMode, ThemePreference, Tokens, font};
+use pi_whim_theme::{ThemeMode, ThemePreference, Tokens, font, radius};
 
 /// Install the pi.dev palette and typography, resolving `preference` against
 /// the current system appearance.
@@ -62,6 +62,12 @@ fn apply_tokens(tokens: Tokens, cx: &mut App) {
 
     theme.font_family = font::MONO[0].into();
     theme.mono_font_family = font::MONO[0].into();
+
+    // gpui-component's widgets read these, so squaring them here is what makes
+    // stock buttons, inputs, and dialogs match pi.dev instead of each call site
+    // having to override a radius.
+    theme.radius = px(radius::NONE);
+    theme.radius_lg = px(radius::NONE);
 
     let colors = &mut theme.colors;
 

@@ -13,7 +13,7 @@ use pi_whim_engine::state::EngineState;
 use pi_whim_theme::{ThemeMode, ThemePreference, Tokens, layout, text};
 
 use crate::{
-    chrome::{Banner, Severity, StatusStrip, TopBar},
+    chrome::{Banner, StatusStrip, TopBar},
     theme::IntoHsla,
 };
 
@@ -148,6 +148,7 @@ impl Render for Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chrome::Severity;
 
     /// A workspace built without a window, for testing the parts that do not
     /// need one. `Workspace::new` reads the component theme from the app

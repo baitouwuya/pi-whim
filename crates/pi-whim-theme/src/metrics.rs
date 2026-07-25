@@ -66,6 +66,20 @@ pub mod control {
     pub const FOCUS_RING_OFFSET: f32 = -1.0;
 }
 
+/// Corner radii.
+///
+/// pi.dev is deliberately square: `border-radius: 0` appears sixteen times in
+/// its stylesheet, and the only two pill radii belong to actual round dots (a
+/// live indicator and a legend swatch), not to capsule-shaped containers. So
+/// panels, banners, inputs, and buttons all keep hard corners, and `DOT` exists
+/// only for things that are genuinely circular.
+pub mod radius {
+    /// Panels, cards, banners, inputs, buttons — everything with an edge.
+    pub const NONE: f32 = 0.0;
+    /// Circular indicators. The one place a radius is right.
+    pub const DOT: f32 = 999.0;
+}
+
 /// Layout widths carried over from the egui build, where they were tuned
 /// against pi.dev's reading measure.
 pub mod layout {
@@ -140,6 +154,10 @@ mod tests {
 
         // User bubbles stay narrower than the column so the two roles differ.
         assert!(layout::USER_MESSAGE_WIDTH < layout::CHAT_CONTENT_WIDTH);
+
+        // pi.dev's square edges are a deliberate part of its look, so this is
+        // pinned rather than left to each call site.
+        assert!(radius::NONE == 0.0);
     };
 
     #[test]

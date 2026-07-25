@@ -79,13 +79,7 @@ impl RenderOnce for Banner {
             .bg(accent.alpha(0.08).hsla())
             .border_b_1()
             .border_color(accent.alpha(0.25).hsla())
-            .child(
-                div()
-                    .w(px(3.0))
-                    .h(px(14.0))
-                    .rounded(px(2.0))
-                    .bg(accent.hsla()),
-            )
+            .child(div().w(px(3.0)).h(px(14.0)).bg(accent.hsla()))
             .child(
                 div()
                     .flex_1()

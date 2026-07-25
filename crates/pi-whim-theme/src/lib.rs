@@ -22,7 +22,7 @@ mod palette;
 mod tokens;
 
 pub use color::Rgba;
-pub use metrics::{ROOT_FONT_SIZE, control, font, layout, text};
+pub use metrics::{ROOT_FONT_SIZE, control, font, layout, radius, text};
 pub use tokens::Tokens;
 
 /// Which of the two pi.dev themes is active.

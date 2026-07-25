@@ -2,7 +2,7 @@
 
 use gpui::{IntoElement, ParentElement, RenderOnce, Styled, Window, div, px};
 use pi_whim_core::SessionStatus;
-use pi_whim_theme::{Tokens, text};
+use pi_whim_theme::{Tokens, radius, text};
 
 use crate::theme::IntoHsla;
 
@@ -55,15 +55,15 @@ impl RenderOnce for StatusPill {
             .gap(px(6.0))
             .px(px(8.0))
             .py(px(3.0))
-            .rounded(px(999.0))
             .bg(tokens.accent_surface_subtle().hsla())
             .border_1()
             .border_color(tokens.accent_border_muted().hsla())
             .child(
+                // The one round thing: pi.dev's own live indicator is a dot.
                 div()
                     .w(px(6.0))
                     .h(px(6.0))
-                    .rounded(px(999.0))
+                    .rounded(px(radius::DOT))
                     .bg(self.dot().hsla()),
             )
             .child(
