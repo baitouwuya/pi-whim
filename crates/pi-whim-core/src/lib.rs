@@ -436,8 +436,6 @@ pub struct ConversationItem {
     pub id: String,
     pub role: ConversationRole,
     pub full_text: String,
-    pub revealed_graphemes: usize,
-    pub reveal_credit: f32,
     pub streaming: bool,
     pub tool_name: Option<String>,
     /// Human-readable tool activity and result shown in the first expansion level.
@@ -449,40 +447,6 @@ pub struct ConversationItem {
     /// model switch actually took effect per message.
     pub model: Option<String>,
     pub attachments: Vec<Attachment>,
-}
-
-impl ConversationItem {
-    pub fn text_for_display(&self) -> &str {
-        if !self.streaming {
-            return &self.full_text;
-        }
-        grapheme_prefix(&self.full_text, self.revealed_graphemes)
-    }
-
-    pub fn reveal_all(&mut self) {
-        self.revealed_graphemes = self.full_text.graphemes(true).count();
-        self.reveal_credit = 0.0;
-    }
-
-    pub fn advance_typewriter(&mut self, elapsed_seconds: f32) -> bool {
-        if !self.streaming {
-            return false;
-        }
-        let total = self.full_text.graphemes(true).count();
-        let backlog = total.saturating_sub(self.revealed_graphemes);
-        let speed = if backlog > 180 {
-            240.0
-        } else {
-            45.0 + (backlog as f32 * 0.45).min(95.0)
-        };
-        self.reveal_credit += elapsed_seconds * speed;
-        let advance = self.reveal_credit.floor() as usize;
-        self.reveal_credit -= advance as f32;
-        let next = (self.revealed_graphemes + advance).min(total);
-        let changed = next != self.revealed_graphemes;
-        self.revealed_graphemes = next;
-        changed
-    }
 }
 
 pub fn grapheme_prefix(text: &str, count: usize) -> &str {
@@ -590,7 +554,6 @@ pub enum Action {
         text: String,
     },
     FinishMessage(String),
-    SkipTypewriter(String),
     QueueUpdated {
         steering: Vec<String>,
         follow_up: Vec<String>,
@@ -683,13 +646,7 @@ impl AppState {
                     .iter_mut()
                     .find(|message| message.id == item.id)
                 {
-                    let revealed_graphemes = existing
-                        .revealed_graphemes
-                        .min(item.full_text.graphemes(true).count());
-                    let reveal_credit = existing.reveal_credit;
                     *existing = item;
-                    existing.revealed_graphemes = revealed_graphemes;
-                    existing.reveal_credit = reveal_credit;
                 } else {
                     self.conversation.push(item);
                 }
@@ -720,16 +677,6 @@ impl AppState {
                     .find(|message| message.id == id)
                 {
                     message.streaming = false;
-                    message.reveal_all();
-                }
-            }
-            Action::SkipTypewriter(id) => {
-                if let Some(message) = self
-                    .conversation
-                    .iter_mut()
-                    .find(|message| message.id == id)
-                {
-                    message.reveal_all();
                 }
             }
             Action::QueueUpdated {
@@ -741,18 +688,6 @@ impl AppState {
             }
             Action::ClearConversation => self.conversation.clear(),
         }
-    }
-
-    pub fn tick_typewriter(&mut self, elapsed_seconds: f32) -> bool {
-        let mut changed = false;
-        for message in self
-            .conversation
-            .iter_mut()
-            .filter(|message| message.role == ConversationRole::Assistant)
-        {
-            changed |= message.advance_typewriter(elapsed_seconds);
-        }
-        changed
     }
 }
 
@@ -784,28 +719,9 @@ mod tests {
         assert_eq!(grapheme_prefix("A👨‍👩‍👧‍👦B", 2), "A👨‍👩‍👧‍👦");
     }
 
-    #[test]
-    fn typewriter_catches_up_and_can_skip() {
-        let mut item = ConversationItem {
-            id: "a".into(),
-            role: ConversationRole::Assistant,
-            full_text: "hello".into(),
-            revealed_graphemes: 0,
-            reveal_credit: 0.0,
-            streaming: true,
-            tool_name: None,
-            tool_report: None,
-            tool_details: None,
-            is_error: false,
-            model: None,
-            attachments: Vec::new(),
-        };
-        assert!(item.advance_typewriter(0.1));
-        item.reveal_all();
-        assert_eq!(item.text_for_display(), "hello");
-    }
-
-    // Attachment de-duplication moved to pi_whim_engine::composer::Composer,
+    // Progressive reveal moved to pi_whim_engine::typewriter::Typewriter, and
+    // attachment de-duplication to pi_whim_engine::composer::Composer; both
+    // cover those behaviors directly.
     // which covers it directly.
 
     #[test]

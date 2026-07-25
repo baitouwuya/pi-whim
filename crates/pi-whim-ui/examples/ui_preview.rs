@@ -234,8 +234,6 @@ fn item(id: &str, role: ConversationRole, text: &str) -> ConversationItem {
         id: id.into(),
         role,
         full_text: text.into(),
-        revealed_graphemes: usize::MAX,
-        reveal_credit: 0.0,
         streaming: false,
         tool_name: None,
         tool_report: None,

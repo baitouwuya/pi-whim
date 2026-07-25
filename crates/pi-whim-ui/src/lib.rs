@@ -24,6 +24,7 @@ use pi_whim_core::{
     ThinkingLevel, provider_name_key,
 };
 use pi_whim_engine::composer::Composer;
+use pi_whim_engine::typewriter::Typewriter;
 
 use markdown::MarkdownRenderer;
 
@@ -321,6 +322,8 @@ pub struct Workbench {
     pub state: AppState,
     /// The prompt being drafted. View-local, so it is not in `state`.
     composer: Composer,
+    /// How much of each streaming message has been revealed.
+    typewriter: Typewriter,
     intents: Vec<UiIntent>,
     page: WorkbenchPage,
     provider_draft: ProviderDraft,
@@ -346,7 +349,6 @@ struct CachedMessageLayout {
     width_bits: u32,
     text_len: usize,
     text_marker: u64,
-    revealed_graphemes: usize,
     attachments: usize,
     report_len: usize,
     details_len: usize,
@@ -360,7 +362,6 @@ impl CachedMessageLayout {
             width_bits: width.to_bits(),
             text_len: message.full_text.len(),
             text_marker: text_marker(&message.full_text),
-            revealed_graphemes: message.revealed_graphemes,
             attachments: message.attachments.len(),
             report_len: message.tool_report.as_deref().map_or(0, str::len),
             details_len: message.tool_details.as_deref().map_or(0, str::len),
@@ -373,7 +374,6 @@ impl CachedMessageLayout {
         self.width_bits == other.width_bits
             && self.text_len == other.text_len
             && self.text_marker == other.text_marker
-            && self.revealed_graphemes == other.revealed_graphemes
             && self.attachments == other.attachments
             && self.report_len == other.report_len
             && self.details_len == other.details_len
@@ -403,6 +403,7 @@ impl Default for Workbench {
         Self {
             state,
             composer: Composer::new(),
+            typewriter: Typewriter::new(),
             intents: Vec::new(),
             page: WorkbenchPage::Chat,
             provider_draft: ProviderDraft::default(),
@@ -474,7 +475,14 @@ impl Workbench {
             }
             Action::ClearConversation => {
                 self.message_layouts.clear();
+                self.typewriter.clear();
                 self.state.dispatch(Action::ClearConversation);
+            }
+            Action::RekeyConversation { from, to } => {
+                // Pi assigns a real message id once streaming starts; carry the
+                // reveal progress across so the text does not restart.
+                self.typewriter.rekey(&from, &to);
+                self.state.dispatch(Action::RekeyConversation { from, to });
             }
             action => self.state.dispatch(action),
         }
@@ -660,8 +668,6 @@ impl Workbench {
                 id: format!("slash-command-{}", now_ms()),
                 role: ConversationRole::System,
                 full_text: text,
-                revealed_graphemes: usize::MAX,
-                reveal_credit: 0.0,
                 streaming: false,
                 tool_name: None,
                 tool_report: None,
@@ -832,7 +838,7 @@ impl Workbench {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_frame).as_secs_f32();
         self.last_frame = now;
-        if self.state.tick_typewriter(elapsed) {
+        if self.typewriter.advance(&self.state.conversation, elapsed) {
             context.request_repaint_after(std::time::Duration::from_millis(33));
         }
         install_theme(context);
@@ -1597,7 +1603,7 @@ impl Workbench {
                 Vec2::new(message_width, 0.0),
                 Layout::top_down(Align::Min),
                 |ui| {
-                    let content = message.text_for_display();
+                    let content = self.typewriter.visible_text(&message);
                     match message.role {
                         ConversationRole::User => {
                             ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
@@ -1723,7 +1729,7 @@ impl Workbench {
                         }
                     }
                     if message.streaming && ui.small_button(tr(&self.state, "show-all")).clicked() {
-                        self.state.dispatch(Action::SkipTypewriter(message.id));
+                        self.typewriter.reveal_all(&message);
                     }
                 },
             );
@@ -1893,9 +1899,8 @@ impl Workbench {
                                                             input.key_pressed(egui::Key::Escape)
                                                         })
                                                     {
-                                                        for message in &mut self.state.conversation
-                                                        {
-                                                            message.reveal_all();
+                                                        for message in &self.state.conversation {
+                                                            self.typewriter.reveal_all(message);
                                                         }
                                                     }
                                                 },

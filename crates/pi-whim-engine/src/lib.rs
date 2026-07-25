@@ -10,3 +10,4 @@ pub mod protocol;
 pub mod providers;
 pub mod session;
 pub mod state;
+pub mod typewriter;

@@ -108,8 +108,6 @@ mod tests {
             id: id.into(),
             role: ConversationRole::Assistant,
             full_text: "hello".into(),
-            revealed_graphemes: 0,
-            reveal_credit: 0.0,
             streaming: false,
             tool_name: None,
             tool_report: None,

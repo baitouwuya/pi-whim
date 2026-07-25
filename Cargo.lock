@@ -2753,6 +2753,7 @@ dependencies = [
  "pi-whim-core",
  "pi-whim-persistence",
  "serde_json",
+ "unicode-segmentation",
  "ureq",
  "uuid",
 ]
