@@ -76,8 +76,11 @@ const CHAT_CONTENT_WIDTH: f32 = 820.0;
 const USER_MESSAGE_WIDTH: f32 = 620.0;
 const SIDEBAR_WIDTH: f32 = 260.0;
 
-const CJK_FONT_BYTES: &[u8] = include_bytes!("../assets/NotoSansCJKsc-Regular.otf");
-const EMOJI_FONT_BYTES: &[u8] = include_bytes!("../assets/NotoEmoji.ttf");
+// The files live with the gpui crate: that is the one that survives the UI swap,
+// and a shared asset in the crate being deleted would break the other one's build
+// the day it goes.
+const CJK_FONT_BYTES: &[u8] = include_bytes!("../../pi-whim-gpui/assets/NotoSansCJKsc-Regular.otf");
+const EMOJI_FONT_BYTES: &[u8] = include_bytes!("../../pi-whim-gpui/assets/NotoEmoji.ttf");
 
 #[derive(Clone, Debug)]
 pub enum UiIntent {

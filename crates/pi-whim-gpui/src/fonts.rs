@@ -11,8 +11,8 @@ use gpui::App;
 
 /// Simplified Chinese coverage. macOS has PingFang, but bundling keeps text
 /// identical across machines and matches what the egui build did.
-const CJK_FONT: &[u8] = include_bytes!("../../pi-whim-ui/assets/NotoSansCJKsc-Regular.otf");
-const EMOJI_FONT: &[u8] = include_bytes!("../../pi-whim-ui/assets/NotoEmoji.ttf");
+const CJK_FONT: &[u8] = include_bytes!("../assets/NotoSansCJKsc-Regular.otf");
+const EMOJI_FONT: &[u8] = include_bytes!("../assets/NotoEmoji.ttf");
 
 /// Load the bundled fonts into the text system.
 ///
