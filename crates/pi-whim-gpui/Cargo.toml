@@ -1,0 +1,16 @@
+[package]
+name = "pi-whim-gpui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+gpui.workspace = true
+gpui-component.workspace = true
+pi-whim-core = { path = "../pi-whim-core" }
+pi-whim-theme = { path = "../pi-whim-theme" }
+
+[dev-dependencies]
+gpui_platform.workspace = true
+gpui-component-assets.workspace = true

@@ -5,6 +5,7 @@ members = [
   "crates/pi-whim-catalog",
   "crates/pi-whim-core",
   "crates/pi-whim-engine",
+  "crates/pi-whim-gpui",
   "crates/pi-whim-persistence",
   "crates/pi-whim-pi-rpc",
   "crates/pi-whim-runtime",
@@ -34,6 +35,13 @@ eframe = { version = "0.31", default-features = true, features = ["wgpu"] }
 egui_commonmark = { version = "0.20", default-features = false }
 egui_extras = { version = "0.31", default-features = false }
 fluent-bundle = "0.16"
+# gpui-component declares `gpui = { git = ".../zed" }` with no rev, so pinning
+# one here would resolve a second, incompatible gpui. Both follow zed main and
+# Cargo.lock is what makes the build reproducible.
+gpui = { git = "https://github.com/zed-industries/zed" }
+gpui_platform = { git = "https://github.com/zed-industries/zed" }
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "bc174a7ec4534b2a4174fddde314b38d30d69093" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "bc174a7ec4534b2a4174fddde314b38d30d69093" }
 keyring = { version = "3.6", features = ["apple-native"] }
 libc = "0.2"
 parking_lot = "0.12"
@@ -55,6 +63,14 @@ walkdir = "2.5"
 [profile.dev]
 debug = "line-tables-only"
 split-debuginfo = "packed"
+
+# The UI framework is hot on every frame but is not what we debug, so build it
+# optimized even in dev. Without this, debug builds render sluggishly.
+[profile.dev.package]
+gpui = { opt-level = 3 }
+gpui_macos = { opt-level = 3 }
+gpui_platform = { opt-level = 3 }
+gpui-component = { opt-level = 3 }
 
 [profile.release]
 lto = "thin"
