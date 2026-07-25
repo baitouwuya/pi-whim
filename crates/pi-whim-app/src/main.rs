@@ -1,8 +1,6 @@
 mod attachment_store;
 mod macos_paste;
 mod model_capabilities;
-#[cfg(test)]
-mod session_report;
 
 use std::{
     collections::{HashMap, HashSet},
