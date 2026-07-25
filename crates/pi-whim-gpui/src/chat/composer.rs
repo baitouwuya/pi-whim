@@ -7,19 +7,28 @@
 //! is nothing to reimplement here.
 
 use gpui::{
-    App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement,
-    ParentElement, Render, Styled, Window, div, prelude::FluentBuilder, px,
+    App, AppContext, ClipboardEntry, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    InteractiveElement, IntoElement, ParentElement, Render, Styled, Window, div,
+    prelude::FluentBuilder, px,
 };
 use gpui_component::{
-    Icon, Sizable,
+    Icon,
+    Sizable,
     button::{Button, ButtonVariants},
-    input::{Input, InputEvent, InputState},
+    // Aliased because this module's own `Paste` is the classification, and the
+    // action is the keystroke that produces one.
+    input::{Input, InputEvent, InputState, Paste as PasteAction},
 };
 use pi_whim_core::{Attachment, SubmitMode};
 use pi_whim_engine::composer::Composer as Draft;
+use pi_whim_engine::session::is_large_paste;
 use pi_whim_theme::{Tokens, text};
 
-use crate::{icons, theme::IntoHsla};
+use crate::{
+    chat::paste::{self, Clipboard, Paste},
+    icons,
+    theme::IntoHsla,
+};
 
 /// Rows the input grows through before it starts scrolling.
 const MIN_ROWS: usize = 2;
@@ -41,6 +50,11 @@ pub enum ComposerEvent {
     /// The typed text changed. The palette re-derives its options from this, so
     /// it opens, filters, and closes purely as a function of what is typed.
     TextChanged(String),
+    /// A paste that belongs on disk rather than in the field.
+    ///
+    /// Reported rather than handled: writing it needs the attachment store, which
+    /// this crate does not own.
+    AttachPaste(Paste),
 }
 
 /// The prompt input, its attachments, and the send controls.
@@ -133,12 +147,30 @@ impl Composer {
         cx.notify();
     }
 
-    /// The focus handle, for the paste interception the app installs.
+    /// Where keyboard focus goes when the composer is asked to take it.
     ///
-    /// This replaces `composer_has_focus(&egui::Context)`, the one place the egui
-    /// view leaked its framework into the app's API.
+    /// The input's own handle rather than one of the composer's: focus has to land
+    /// on the thing that receives the typing, and a second handle in front of it
+    /// would swallow every keystroke.
     pub fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.input.focus_handle(cx)
+    }
+
+    /// Decide what a paste means, and report it if it belongs on disk.
+    ///
+    /// Returns true when the paste was taken, which is the caller's signal to stop
+    /// the input from also inserting it. The clipboard is read here rather than in
+    /// the shell because this runs during dispatch, where a read is the whole
+    /// decision — deferring it would let the input insert first.
+    fn intercept_paste(&mut self, cx: &mut Context<Self>) -> bool {
+        let clipboard = read_clipboard(cx);
+        match paste::classify(clipboard, is_large_paste) {
+            Paste::Insert => false,
+            attach => {
+                cx.emit(ComposerEvent::AttachPaste(attach));
+                true
+            }
+        }
     }
 
     /// Submit whatever is drafted, if there is anything worth sending.
@@ -172,6 +204,37 @@ impl Composer {
     }
 }
 
+/// The clipboard, in the shape [`paste::classify`] reads.
+///
+/// gpui hands over encoded image bytes and copied paths as their own entries, so
+/// there is nothing to sniff: each kind is already distinguished.
+fn read_clipboard(cx: &App) -> Clipboard {
+    let Some(item) = cx.read_from_clipboard() else {
+        return Clipboard::default();
+    };
+    let mut clipboard = Clipboard::default();
+    for entry in &item.entries {
+        match entry {
+            ClipboardEntry::ExternalPaths(paths) => {
+                clipboard.paths.extend(
+                    paths
+                        .paths()
+                        .iter()
+                        .map(|path| path.to_string_lossy().into_owned()),
+                );
+            }
+            ClipboardEntry::Image(image) => {
+                clipboard.image = Some((image.format.extension().to_owned(), image.bytes.clone()));
+            }
+            ClipboardEntry::String(_) => {}
+        }
+    }
+    // Read through the item rather than the string entries, so a paste of several
+    // strings arrives concatenated the way the input would insert it.
+    clipboard.text = item.text();
+    clipboard
+}
+
 impl Render for Composer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = self.tokens;
@@ -202,6 +265,20 @@ impl Render for Composer {
         };
 
         div()
+            // Captured, not bubbled: an action reaches the focused element first
+            // in the bubble phase, so by then the input would already have
+            // inserted the text. Capture runs from the root down, which is the
+            // only phase where declining to propagate still prevents the insert.
+            //
+            // This is the whole replacement for egui's application-wide
+            // `raw_input_hook`: the handler sits on the composer's own element, so
+            // it only fires when the composer has focus and nothing above has to
+            // ask whether it does.
+            .capture_action(cx.listener(|composer, _: &PasteAction, _, cx| {
+                if composer.intercept_paste(cx) {
+                    cx.stop_propagation();
+                }
+            }))
             .flex()
             .flex_col()
             .gap(px(6.0))

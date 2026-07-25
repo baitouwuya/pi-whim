@@ -27,7 +27,7 @@ use pi_whim_theme::{ThemeMode, ThemePreference, Tokens, text};
 use crate::{
     chat::{
         self, Composer, ComposerEvent, Controls, ControlsEvent, Conversation, ConversationEvent,
-        Palette, PaletteEvent, Sidebar, SidebarEvent,
+        Palette, PaletteEvent, Paste, Sidebar, SidebarEvent,
     },
     chrome::{Banner, TopBar},
     dialogs::{PromptEvent, Prompts, Rename, RenameEvent},
@@ -78,6 +78,9 @@ pub enum Request {
     DeleteSession(String),
     /// Send a decision back to the agent that asked for it.
     AnswerPrompt(Answer),
+    /// Turn a paste into an attachment. Copied files need canonicalizing and
+    /// pasted bytes need writing, both of which need the attachment store.
+    AttachPaste(Paste),
 
     // The settings page's requests. The reducer has already been run for the
     // ones that have an `Action`, so these are the persistence and network half:
@@ -292,6 +295,18 @@ impl Workspace {
         self.pump.is_some()
     }
 
+    /// Put the cursor in the prompt field.
+    ///
+    /// Where the window sends focus on open, and where it goes back to after a
+    /// dialog closes — typing should reach the prompt without a click.
+    pub fn focus_composer(&self, window: &mut Window, cx: &mut Context<Self>) {
+        // The handle is read out before focusing so the composer's borrow ends
+        // first: `focus` needs the app mutably, and holding the read across it
+        // would borrow `cx` twice.
+        let handle = self.composer.read(cx).focus_handle(cx);
+        handle.focus(window, cx);
+    }
+
     /// Queue a question from the agent.
     ///
     /// Takes a parsed [`Prompt`]: reading the wire request is `engine::dialogs`'
@@ -428,6 +443,12 @@ impl Workspace {
                 self.palette.update(cx, |palette, cx| {
                     palette.sync(&state, &text, cx);
                 });
+            }
+            ComposerEvent::AttachPaste(paste) => {
+                // Straight through: the copied files have to be canonicalized and
+                // the pasted bytes written somewhere Pi can read them, and both
+                // need the store.
+                self.requests.push(Request::AttachPaste(paste));
             }
         }
     }
