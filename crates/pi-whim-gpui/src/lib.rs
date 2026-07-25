@@ -11,6 +11,7 @@
 pub mod chat;
 pub mod chrome;
 pub mod fonts;
+pub mod icons;
 pub mod theme;
 
 mod workspace;

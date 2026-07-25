@@ -12,12 +12,12 @@ use gpui::{
     AnyElement, App, IntoElement, ParentElement, RenderOnce, SharedString, Styled, Window, div,
     prelude::FluentBuilder, px,
 };
-use gpui_component::text::TextView;
+use gpui_component::{Icon, text::TextView};
 use pi_whim_core::{ConversationItem, ConversationRole};
 use pi_whim_engine::thinking::{Segment, split_thinking_segments};
 use pi_whim_theme::{Tokens, layout, text};
 
-use crate::theme::IntoHsla;
+use crate::{icons, theme::IntoHsla};
 
 /// A single conversation entry.
 #[derive(IntoElement)]
@@ -137,9 +137,18 @@ impl RenderOnce for MessageCard {
                     .border_color(accent.alpha(0.25).hsla())
                     .child(
                         div()
-                            .text_size(px(text::LABEL_SIZE))
-                            .text_color(accent.hsla())
-                            .child(name),
+                            .flex()
+                            .items_center()
+                            .gap(px(5.0))
+                            .when_some(icons::role(&ConversationRole::Tool), |this, icon| {
+                                this.child(Icon::new(icon).size(px(12.0)).text_color(accent.hsla()))
+                            })
+                            .child(
+                                div()
+                                    .text_size(px(text::LABEL_SIZE))
+                                    .text_color(accent.hsla())
+                                    .child(name),
+                            ),
                     )
                     .when_some(self.message.tool_report.clone(), |this, report| {
                         this.child(
@@ -168,9 +177,22 @@ impl RenderOnce for MessageCard {
             }
 
             ConversationRole::System => div()
-                .text_size(px(text::MONO_DETAIL_SIZE))
-                .text_color(tokens.muted.hsla())
-                .child(self.visible_text.clone())
+                .flex()
+                .items_center()
+                .gap(px(5.0))
+                .when_some(icons::role(&ConversationRole::System), |this, icon| {
+                    this.child(
+                        Icon::new(icon)
+                            .size(px(12.0))
+                            .text_color(tokens.muted.hsla()),
+                    )
+                })
+                .child(
+                    div()
+                        .text_size(px(text::MONO_DETAIL_SIZE))
+                        .text_color(tokens.muted.hsla())
+                        .child(self.visible_text.clone()),
+                )
                 .into_any_element(),
         });
 

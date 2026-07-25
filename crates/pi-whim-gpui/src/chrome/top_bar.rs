@@ -7,7 +7,7 @@ use gpui_component::button::{Button, ButtonVariants};
 use pi_whim_core::SessionStatus;
 use pi_whim_theme::{ThemeMode, Tokens, text};
 
-use crate::{chrome::StatusPill, theme::IntoHsla};
+use crate::{chrome::StatusPill, icons, theme::IntoHsla};
 
 /// A click handler a caller can hand to a chrome control.
 type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
@@ -49,11 +49,11 @@ impl TopBar {
         self
     }
 
-    /// Label for the theme toggle, naming where it goes rather than where it is.
-    fn theme_toggle_label(&self) -> &'static str {
+    /// Tooltip for the theme toggle, naming where it goes rather than where it is.
+    fn theme_toggle_tooltip(&self) -> &'static str {
         match self.mode {
-            ThemeMode::Light => "Dark",
-            ThemeMode::Dark => "Light",
+            ThemeMode::Light => "Switch to dark",
+            ThemeMode::Dark => "Switch to light",
         }
     }
 }
@@ -61,13 +61,19 @@ impl TopBar {
 impl RenderOnce for TopBar {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
         let tokens = self.tokens;
-        let theme_label = self.theme_toggle_label();
-
-        let mut theme_button = Button::new("toggle-theme").ghost().label(theme_label);
+        // Icons rather than words: these controls are always present, and their
+        // glyphs are recognizable enough that labels would only add width.
+        let mut theme_button = Button::new("toggle-theme")
+            .ghost()
+            .icon(icons::theme_toggle(self.mode.is_dark()))
+            .tooltip(self.theme_toggle_tooltip());
         if let Some(handler) = self.on_toggle_theme {
             theme_button = theme_button.on_click(handler);
         }
-        let mut settings_button = Button::new("open-settings").ghost().label("Settings");
+        let mut settings_button = Button::new("open-settings")
+            .ghost()
+            .icon(icons::settings())
+            .tooltip("Settings");
         if let Some(handler) = self.on_open_settings {
             settings_button = settings_button.on_click(handler);
         }
@@ -102,14 +108,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_theme_toggle_names_its_destination() {
-        // A button reading "Dark" while in light mode says what you get, which
-        // is what a reader expects from a toggle.
+    fn the_theme_toggle_tooltip_names_its_destination() {
+        // The tooltip says what you get, not what you have.
         let light = TopBar::new(SessionStatus::Ready, ThemeMode::Light, Tokens::light());
-        assert_eq!(light.theme_toggle_label(), "Dark");
+        assert_eq!(light.theme_toggle_tooltip(), "Switch to dark");
 
         let dark = TopBar::new(SessionStatus::Ready, ThemeMode::Dark, Tokens::dark());
-        assert_eq!(dark.theme_toggle_label(), "Light");
+        assert_eq!(dark.theme_toggle_tooltip(), "Switch to light");
     }
 
     #[test]

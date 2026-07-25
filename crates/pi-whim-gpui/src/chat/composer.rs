@@ -11,6 +11,7 @@ use gpui::{
     ParentElement, Render, Styled, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::{
+    Icon,
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
 };
@@ -18,7 +19,7 @@ use pi_whim_core::{Attachment, SubmitMode};
 use pi_whim_engine::composer::Composer as Draft;
 use pi_whim_theme::{Tokens, text};
 
-use crate::theme::IntoHsla;
+use crate::{icons, theme::IntoHsla};
 
 /// Rows the input grows through before it starts scrolling.
 const MIN_ROWS: usize = 2;
@@ -155,14 +156,18 @@ impl Render for Composer {
             .map(|attachment| attachment.name.clone())
             .collect();
 
+        // Icon plus label: this is the primary action, and the pair reads faster
+        // than either alone.
         let action = if self.busy {
             Button::new("stop")
                 .danger()
+                .icon(icons::stop())
                 .label("Stop")
                 .on_click(cx.listener(|_, _, _, cx| cx.emit(ComposerEvent::Stop)))
         } else {
             Button::new("send")
                 .primary()
+                .icon(icons::send())
                 .label("Send")
                 .on_click(cx.listener(|composer, _, window, cx| composer.submit(window, cx)))
         };
@@ -180,6 +185,9 @@ impl Render for Composer {
                 this.child(div().flex().flex_wrap().gap(px(4.0)).children(
                     attachments.into_iter().map(|name| {
                         div()
+                            .flex()
+                            .items_center()
+                            .gap(px(4.0))
                             .px(px(6.0))
                             .py(px(2.0))
                             .bg(tokens.accent_surface_soft().hsla())
@@ -187,6 +195,7 @@ impl Render for Composer {
                             .border_color(tokens.accent_border_muted().hsla())
                             .text_size(px(text::LABEL_SIZE))
                             .text_color(tokens.muted.hsla())
+                            .child(Icon::new(icons::attachment()).size(px(11.0)))
                             .child(name)
                     }),
                 ))

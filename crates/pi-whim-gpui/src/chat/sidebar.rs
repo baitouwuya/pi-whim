@@ -9,15 +9,19 @@ use gpui::{
     SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
     uniform_list,
 };
+use gpui_component::Icon;
 use pi_whim_core::ProjectId;
 use pi_whim_theme::{Tokens, layout, radius, text};
 
-use crate::{chat::Row, theme::IntoHsla};
+use crate::{chat::Row, icons, theme::IntoHsla};
 
 /// Row height. Fixed, because `uniform_list` requires it.
 const ROW_HEIGHT: f32 = 30.0;
 /// How far sessions sit inside their project header.
 const SESSION_INDENT: f32 = 14.0;
+/// Leading glyph size, kept below the row's text so icons read as marks rather
+/// than as content.
+const ICON_SIZE: f32 = 13.0;
 
 /// What the sidebar asks the shell to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,6 +94,17 @@ impl Sidebar {
             } => (title.clone(), SESSION_INDENT, *running, *selected),
         };
 
+        // A project carries a disclosure arrow and a folder; a session carries a
+        // transcript glyph. Together they make the nesting readable even where a
+        // title is truncated.
+        let (leading, folder) = match row {
+            Row::Project { expanded, .. } => (
+                Some(icons::disclosure(*expanded)),
+                Some(icons::project(*expanded)),
+            ),
+            Row::Session { .. } => (None, Some(icons::session())),
+        };
+
         let event = match row {
             // A click on a header both selects the project and toggles its
             // sessions; two separate hit targets in a 30px row would be fussy.
@@ -119,6 +134,20 @@ impl Sidebar {
                     .border_color(tokens.accent.hsla())
             })
             .hover(|this| this.bg(tokens.control_background_hover().hsla()))
+            .when_some(leading, |this, icon| {
+                this.child(
+                    Icon::new(icon)
+                        .size(px(ICON_SIZE))
+                        .text_color(tokens.muted.hsla()),
+                )
+            })
+            .when_some(folder, |this, icon| {
+                this.child(Icon::new(icon).size(px(ICON_SIZE)).text_color(if selected {
+                    tokens.accent.hsla()
+                } else {
+                    tokens.muted.hsla()
+                }))
+            })
             .child(
                 div()
                     .flex_1()

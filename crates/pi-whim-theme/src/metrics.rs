@@ -96,27 +96,30 @@ pub mod layout {
     pub const GRID_MAJOR_EVERY: u32 = 4;
 }
 
-/// Font stacks. pi.dev's first choices — Plantin MT Pro, Commit Mono,
-/// Departure Mono — are commercial and not bundled, so each stack starts at
-/// the first freely available fallback pi.dev itself names.
+/// Font families.
+///
+/// pi.dev's first choices — Plantin MT Pro for serif, Commit Mono and Departure
+/// Mono for monospace — are commercial and not bundled. These are its named
+/// fallbacks, each verified to resolve on this platform.
+///
+/// That verification matters: gpui resolves a family through its own registry
+/// and silently substitutes Helvetica for anything it cannot find, so a
+/// misspelled or unavailable name is not a compile error and not obviously wrong
+/// on screen either. `.ZedMono` and `.ZedSans` look like safe choices from the
+/// family list but only exist inside Zed's own build; they fall back here.
 pub mod font {
-    /// `--serif`, minus the unavailable Plantin faces.
-    pub const SERIF: &[&str] = &["Georgia", "serif"];
+    /// Body text and UI labels. The system UI face, as pi.dev's own sans stack
+    /// resolves to on macOS.
+    pub const UI: &str = ".SystemUIFont";
+    /// Code, tool output, and the mono details in the status strip. pi.dev names
+    /// Menlo in its `--mono` stack, after the commercial faces.
+    pub const MONO: &str = "Menlo";
 
-    /// `--mono`, minus Commit Mono. `ui-monospace` resolves to SF Mono on
-    /// macOS, which is pi.dev's own next choice.
-    pub const MONO: &[&str] = &[
-        "SF Mono",
-        "ui-monospace",
-        "Menlo",
-        "Monaco",
-        "Consolas",
-        "monospace",
-    ];
-
-    /// `--accent-mono`, used for form labels. Departure Mono is unavailable,
-    /// so this collapses onto the same stack as [`MONO`].
-    pub const ACCENT_MONO: &[&str] = MONO;
+    /// Bundled coverage for scripts and emoji the above lack, registered at
+    /// startup via `add_fonts`. These do not appear in gpui's family list —
+    /// which reports only what it enumerated — but do resolve.
+    pub const CJK: &str = "Noto Sans CJK SC";
+    pub const EMOJI: &str = "Noto Emoji";
 }
 
 #[cfg(test)]
@@ -161,17 +164,26 @@ mod tests {
     };
 
     #[test]
-    fn font_stacks_end_in_a_generic_family() {
-        assert_eq!(font::SERIF.last(), Some(&"serif"));
-        assert_eq!(font::MONO.last(), Some(&"monospace"));
-        // No commercial faces we cannot ship.
-        for stack in [font::SERIF, font::MONO, font::ACCENT_MONO] {
-            for family in stack {
-                assert!(
-                    !matches!(*family, "Plantin MT Pro" | "Commit Mono" | "Departure Mono"),
-                    "{family} is not bundled"
-                );
-            }
+    fn families_are_ones_gpui_can_resolve() {
+        // gpui does not enumerate system fonts, and an unresolvable family makes
+        // text render as nothing rather than falling back. Only its own faces
+        // and what we register ourselves are safe to name.
+        // gpui substitutes Helvetica for a family it cannot find, so an
+        // unavailable name is silent. These are the ones measured to resolve;
+        // the rest are recorded here so they are not reached for again.
+        for family in [font::UI, font::MONO, font::CJK, font::EMOJI] {
+            assert!(
+                !matches!(
+                    family,
+                    // Commercial, not bundled.
+                    "Plantin MT Pro" | "Commit Mono" | "Departure Mono"
+                    // Not in gpui's registry despite being installed.
+                    | "SF Mono" | "SFMono-Regular" | "Georgia" | "Noto Sans Mono"
+                    // Only exist inside Zed's own build.
+                    | ".ZedMono" | ".ZedSans"
+                ),
+                "{family} does not resolve; gpui would substitute Helvetica"
+            );
         }
     }
 }

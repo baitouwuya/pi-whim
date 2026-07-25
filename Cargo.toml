@@ -39,7 +39,12 @@ fluent-bundle = "0.16"
 # one here would resolve a second, incompatible gpui. Both follow zed main and
 # Cargo.lock is what makes the build reproducible.
 gpui = { git = "https://github.com/zed-industries/zed" }
-gpui_platform = { git = "https://github.com/zed-industries/zed" }
+# font-kit is what enables real font loading on macOS; without it every family
+# resolves to the same empty FontId and text renders as nothing at all.
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = [
+  "font-kit",
+  "runtime_shaders",
+] }
 gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "bc174a7ec4534b2a4174fddde314b38d30d69093" }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "bc174a7ec4534b2a4174fddde314b38d30d69093" }
 keyring = { version = "3.6", features = ["apple-native"] }

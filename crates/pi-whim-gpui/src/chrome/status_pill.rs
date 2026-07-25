@@ -1,10 +1,13 @@
 //! Session status indicator.
 
-use gpui::{IntoElement, ParentElement, RenderOnce, Styled, Window, div, px};
+use gpui::{
+    IntoElement, ParentElement, RenderOnce, Styled, Window, div, prelude::FluentBuilder, px,
+};
+use gpui_component::Icon;
 use pi_whim_core::SessionStatus;
 use pi_whim_theme::{Tokens, radius, text};
 
-use crate::theme::IntoHsla;
+use crate::{icons, theme::IntoHsla};
 
 /// A coloured dot and a label naming what the session is doing.
 #[derive(IntoElement)]
@@ -66,6 +69,11 @@ impl RenderOnce for StatusPill {
                     .rounded(px(radius::DOT))
                     .bg(self.dot().hsla()),
             )
+            // States worth noticing carry a glyph as well as the dot; idle ones
+            // do not, so the pill stays quiet when nothing needs attention.
+            .when_some(icons::status(&self.status), |this, icon| {
+                this.child(Icon::new(icon).size(px(11.0)).text_color(self.dot().hsla()))
+            })
             .child(
                 div()
                     .text_size(px(text::LABEL_SIZE))

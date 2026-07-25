@@ -69,13 +69,22 @@ impl ThemeMode {
 }
 
 /// How the app decides which theme to show.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThemePreference {
     /// Follow the OS appearance.
-    #[default]
     System,
     /// Pin to one mode regardless of the OS.
+    ///
+    /// The default, at light: pi.dev serves dark as its `:root`, but Pi-Whim
+    /// prefers paper, and following the OS would mean a dark window for anyone
+    /// whose system is dark — which is not the look we chose.
     Fixed(ThemeMode),
+}
+
+impl Default for ThemePreference {
+    fn default() -> Self {
+        Self::Fixed(ThemeMode::Light)
+    }
 }
 
 impl ThemePreference {
@@ -163,6 +172,20 @@ mod tests {
         let preference = ThemePreference::System;
         assert_eq!(preference.resolve(Some(ThemeMode::Dark)), ThemeMode::Dark);
         assert_eq!(preference.resolve(Some(ThemeMode::Light)), ThemeMode::Light);
+    }
+
+    #[test]
+    fn the_default_preference_pins_light_rather_than_following_the_os() {
+        // Following the OS would hand a dark window to anyone whose system is
+        // dark, which is not the look chosen for this app.
+        assert_eq!(
+            ThemePreference::default(),
+            ThemePreference::Fixed(ThemeMode::Light)
+        );
+        assert_eq!(
+            ThemePreference::default().resolve(Some(ThemeMode::Dark)),
+            ThemeMode::Light
+        );
     }
 
     #[test]

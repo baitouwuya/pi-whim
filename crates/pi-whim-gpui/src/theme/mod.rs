@@ -60,8 +60,11 @@ fn component_mode(mode: ThemeMode) -> ComponentMode {
 fn apply_tokens(tokens: Tokens, cx: &mut App) {
     let theme = ComponentTheme::global_mut(cx);
 
-    theme.font_family = font::MONO[0].into();
-    theme.mono_font_family = font::MONO[0].into();
+    // Body text is the UI face; monospace is for code and the small details.
+    // The egui build had both set to a monospace family, which is not what
+    // pi.dev does and made prose read as terminal output.
+    theme.font_family = font::UI.into();
+    theme.mono_font_family = font::MONO.into();
 
     // gpui-component's widgets read these, so squaring them here is what makes
     // stock buttons, inputs, and dialogs match pi.dev instead of each call site
