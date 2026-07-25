@@ -11,7 +11,7 @@ use eframe::egui;
 use pi_whim_core::{
     Action, Attachment, ConversationItem, ConversationRole, ModelOption, Project, ProjectId,
     ProviderId, ProviderProfile, ProviderProtocol, QueueMode, SearchEngineProfile, SessionStatus,
-    SessionSummary, SlashCommandInfo, ThinkingLevel, normalize_provider_display_name,
+    SessionSummary, SlashCommandInfo, SubmitMode, ThinkingLevel, normalize_provider_display_name,
     provider_name_key, stable_session_id,
 };
 use pi_whim_persistence::{
@@ -20,7 +20,7 @@ use pi_whim_persistence::{
     content_text, session_summary_from_jsonl,
 };
 use pi_whim_runtime::{AgentRuntime, PiRpcRuntime, RuntimeEvent, RuntimeStart};
-use pi_whim_ui::{SubmitMode, UiIntent, Workbench, install_fonts};
+use pi_whim_ui::{UiIntent, Workbench, install_fonts};
 use serde_json::{Value, json};
 use uuid::Uuid;
 

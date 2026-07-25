@@ -398,6 +398,23 @@ pub enum QueueMode {
     OneAtATime,
 }
 
+/// How a submitted prompt reaches a running agent.
+///
+/// This picks the Pi RPC to use, so it is protocol vocabulary rather than a
+/// view concern: the session pool reads it to decide between starting a turn,
+/// steering one in flight, and queueing for after it finishes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubmitMode {
+    /// Start a new turn.
+    #[default]
+    Prompt,
+    /// Redirect the turn already in flight.
+    Steer,
+    /// Queue for once the current turn finishes.
+    FollowUp,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionMetrics {
     pub total_messages: u64,

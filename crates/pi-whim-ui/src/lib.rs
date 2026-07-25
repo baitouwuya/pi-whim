@@ -20,7 +20,7 @@ use eframe::egui::{
 use pi_whim_core::{
     Action, AgentTeamConfig, AppState, BashPolicy, ConversationItem, ConversationRole, Language,
     MAX_AGENT_DEPTH, MAX_AGENTS_PER_LEVEL, ModelOption, ProjectId, ProviderId, ProviderModel,
-    ProviderProfile, ProviderProtocol, QueueMode, SearchEngineProfile, SessionStatus,
+    ProviderProfile, ProviderProtocol, QueueMode, SearchEngineProfile, SessionStatus, SubmitMode,
     ThinkingLevel, provider_name_key,
 };
 use pi_whim_engine::composer::Composer;
@@ -132,13 +132,6 @@ pub enum UiIntent {
         request_id: String,
         confirmed: bool,
     },
-}
-
-#[derive(Clone, Copy, Debug)]
-pub enum SubmitMode {
-    Prompt,
-    Steer,
-    FollowUp,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
