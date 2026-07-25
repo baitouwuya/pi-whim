@@ -758,6 +758,41 @@ impl Workspace {
     /// View-local follow-ups arrive as a [`ViewEffect`]; the shell currently
     /// caches nothing per message, so there is nothing to invalidate yet.
     pub fn apply(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
+        self.reduce(action, cx);
+        self.sync_views(window, cx);
+        cx.notify();
+    }
+
+    /// Apply a run of actions, syncing the views once at the end.
+    ///
+    /// What a translated agent event produces is several actions at a time, and
+    /// `apply` would rebuild every view between each one — the sidebar rows and
+    /// the conversation both get rebuilt per call, so a streaming turn would pay
+    /// that several times per token.
+    pub fn apply_all(
+        &mut self,
+        actions: impl IntoIterator<Item = Action>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut any = false;
+        for action in actions {
+            self.reduce(action, cx);
+            any = true;
+        }
+        if !any {
+            // Nothing changed, so nothing to rebuild or redraw.
+            return;
+        }
+        self.sync_views(window, cx);
+        cx.notify();
+    }
+
+    /// Run one action through the reducer and handle its view-local follow-up.
+    ///
+    /// Split from `apply` so a batch can share one sync. Deliberately does not
+    /// sync or notify: the caller decides when the views are rebuilt.
+    fn reduce(&mut self, action: Action, cx: &mut Context<Self>) {
         match self.engine.apply(action) {
             Some(ViewEffect::ConversationCleared) => {
                 self.conversation
@@ -773,8 +808,6 @@ impl Workspace {
             )
             | None => {}
         }
-        self.sync_views(window, cx);
-        cx.notify();
     }
 
     pub fn mode(&self) -> ThemeMode {
@@ -1177,5 +1210,34 @@ mod tests {
             .update(cx, |workspace, _, _| workspace.take_deliveries())
             .expect("the window is open");
         assert!(delivered.is_empty());
+    }
+
+    #[gpui::test]
+    async fn a_batch_of_actions_all_land(cx: &mut gpui::TestAppContext) {
+        // What a translated agent event produces is several actions at a time, so
+        // dropping any of them would leave the view describing a state the engine
+        // is not in.
+        let shell = shell(cx);
+
+        shell
+            .update(cx, |workspace, window, cx| {
+                workspace.apply_all(
+                    [
+                        Action::SetSessionStatus(SessionStatus::Streaming),
+                        Action::SetPendingModel(Some(ModelOption {
+                            provider: "anthropic".into(),
+                            provider_name: "Anthropic".into(),
+                            id: "sonnet".into(),
+                            name: "Sonnet".into(),
+                        })),
+                    ],
+                    window,
+                    cx,
+                );
+
+                assert_eq!(workspace.state().session_status, SessionStatus::Streaming);
+                assert!(workspace.state().pending_model.is_some());
+            })
+            .expect("the window is open");
     }
 }
