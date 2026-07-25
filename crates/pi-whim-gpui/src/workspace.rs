@@ -12,9 +12,9 @@ use gpui::{
 };
 use gpui_component::theme::{Theme as ComponentTheme, ThemeMode as ComponentMode};
 use pi_whim_core::{
-    Action, AgentTeamConfig, AppState, BashPolicy, ConversationItem, ConversationRole, Language,
-    ModelOption, ProjectId, ProviderId, ProviderProfile, ProviderProtocol, QueueMode,
-    SearchEngineProfile, SessionStatus, ThinkingLevel, stable_session_id,
+    Action, AgentTeamConfig, AppState, Attachment, BashPolicy, ConversationItem, ConversationRole,
+    Language, ModelOption, ProjectId, ProviderId, ProviderProfile, ProviderProtocol, QueueMode,
+    SearchEngineProfile, SessionStatus, SubmitMode, ThinkingLevel, stable_session_id,
 };
 use pi_whim_engine::dialogs::{Answer, Prompt};
 use pi_whim_engine::mailbox::Delivery;
@@ -81,6 +81,26 @@ pub enum Request {
     /// Turn a paste into an attachment. Copied files need canonicalizing and
     /// pasted bytes need writing, both of which need the attachment store.
     AttachPaste(Paste),
+    /// Send the drafted prompt to the agent.
+    ///
+    /// The shell has already put it in the conversation, because a prompt should
+    /// appear the moment it is sent rather than when Pi acknowledges it. What is
+    /// left is the RPC.
+    SubmitPrompt {
+        content: String,
+        attachments: Vec<Attachment>,
+        mode: SubmitMode,
+    },
+    /// Bind the conversation to an already-pooled session.
+    ///
+    /// Selecting one is the shell's, but the process behind it is the host's: the
+    /// pool decides which is visible and the transcript has to be re-read.
+    ActivateSession {
+        project_id: ProjectId,
+        path: String,
+    },
+    /// Interrupt the turn in flight.
+    Stop,
 
     // The settings page's requests. The reducer has already been run for the
     // ones that have an `Action`, so these are the persistence and network half:
@@ -374,6 +394,14 @@ impl Workspace {
                 self.engine.apply(Action::SelectProject(project_id));
                 self.engine
                     .apply(Action::SelectSession(stable_session_id(&pi_path)));
+                // Selecting is the shell's; binding to the process is not. The
+                // pool decides which session is visible and the transcript has to
+                // be re-read, so without this the sidebar would move while the
+                // conversation kept showing the previous session.
+                self.requests.push(Request::ActivateSession {
+                    project_id,
+                    path: pi_path,
+                });
             }
             // The rest of the row menu is the backend's: Finder, the store, the
             // clipboard, and the trash all sit behind the boundary this crate
@@ -397,9 +425,9 @@ impl Workspace {
 
     /// Act on what the composer reported.
     ///
-    /// Submitting is the shell's to forward to the backend, which the egui app
-    /// still owns; for now the prompt lands in the conversation so the round trip
-    /// is visible.
+    /// A submitted prompt goes into the conversation here and to the agent as a
+    /// request: it should appear the moment it is sent, not when Pi acknowledges
+    /// it, and the RPC needs the runtime this crate has no handle on.
     fn handle_composer_event(
         &mut self,
         event: ComposerEvent,
@@ -410,8 +438,13 @@ impl Workspace {
             ComposerEvent::Submit {
                 content,
                 attachments,
-                ..
+                mode,
             } => {
+                self.requests.push(Request::SubmitPrompt {
+                    content: content.clone(),
+                    attachments: attachments.clone(),
+                    mode,
+                });
                 // Composer::add_attachment already keeps paths unique, so the
                 // list arrives deduplicated.
                 let item = ConversationItem {
@@ -429,7 +462,11 @@ impl Workspace {
                 self.apply(Action::UpsertConversation(item), window, cx);
             }
             ComposerEvent::Stop => {
-                self.apply(Action::SetSessionStatus(SessionStatus::Ready), window, cx);
+                // Requested, not applied: the status has to follow what the agent
+                // actually did. Setting it Ready here would show a stopped session
+                // while the process kept streaming.
+                self.requests.push(Request::Stop);
+                cx.notify();
             }
             ComposerEvent::RemoveAttachment(path) => {
                 self.composer.update(cx, |composer, cx| {
@@ -1237,6 +1274,91 @@ mod tests {
 
                 assert_eq!(workspace.state().session_status, SessionStatus::Streaming);
                 assert!(workspace.state().pending_model.is_some());
+            })
+            .expect("the window is open");
+    }
+
+    #[gpui::test]
+    async fn a_submitted_prompt_is_shown_and_sent(cx: &mut gpui::TestAppContext) {
+        // Both halves matter: shown immediately so the prompt does not seem to
+        // vanish while Pi starts, and sent because otherwise it only looks sent.
+        let shell = shell(cx);
+
+        shell
+            .update(cx, |workspace, window, cx| {
+                workspace.handle_composer_event(
+                    ComposerEvent::Submit {
+                        content: "what changed?".to_owned(),
+                        attachments: Vec::new(),
+                        mode: SubmitMode::Prompt,
+                    },
+                    window,
+                    cx,
+                );
+
+                let shown = workspace.state().conversation.last().expect("the prompt");
+                assert_eq!(shown.full_text, "what changed?");
+                assert_eq!(shown.role, ConversationRole::User);
+                assert!(matches!(
+                    workspace.take_requests().as_slice(),
+                    [Request::SubmitPrompt { content, .. }] if content == "what changed?"
+                ));
+            })
+            .expect("the window is open");
+    }
+
+    #[gpui::test]
+    async fn stopping_asks_the_agent_rather_than_reporting_it_stopped(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // The status has to follow what the process did. Flipping it here would
+        // show a stopped session while the agent kept streaming.
+        let shell = shell(cx);
+
+        shell
+            .update(cx, |workspace, window, cx| {
+                workspace.apply(
+                    Action::SetSessionStatus(SessionStatus::Streaming),
+                    window,
+                    cx,
+                );
+
+                workspace.handle_composer_event(ComposerEvent::Stop, window, cx);
+
+                assert_eq!(workspace.state().session_status, SessionStatus::Streaming);
+                assert_eq!(workspace.take_requests(), vec![Request::Stop]);
+            })
+            .expect("the window is open");
+    }
+
+    #[gpui::test]
+    async fn opening_a_session_selects_it_and_asks_to_bind_the_process(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Without the request the sidebar selection would move while the
+        // conversation kept showing the session that was open before.
+        let shell = shell(cx);
+        let project_id = uuid::Uuid::new_v4();
+
+        shell
+            .update(cx, |workspace, window, cx| {
+                workspace.handle_sidebar_event(
+                    SidebarEvent::OpenSession {
+                        project_id,
+                        pi_path: "/tmp/s.jsonl".to_owned(),
+                    },
+                    window,
+                    cx,
+                );
+
+                assert_eq!(workspace.state().selected_project, Some(project_id));
+                assert_eq!(
+                    workspace.take_requests(),
+                    vec![Request::ActivateSession {
+                        project_id,
+                        path: "/tmp/s.jsonl".to_owned(),
+                    }]
+                );
             })
             .expect("the window is open");
     }
