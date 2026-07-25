@@ -2708,7 +2708,6 @@ dependencies = [
  "crossbeam-channel",
  "dirs",
  "eframe",
- "image",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
  "pi-whim-core",
@@ -2739,9 +2738,11 @@ name = "pi-whim-persistence"
 version = "0.1.0"
 dependencies = [
  "dirs",
+ "image",
  "keyring",
  "pi-whim-core",
  "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.19",

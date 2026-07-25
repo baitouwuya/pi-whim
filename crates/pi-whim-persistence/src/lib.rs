@@ -1,5 +1,11 @@
 //! Local metadata repositories. Pi JSONL files remain the conversation source of truth.
 
+mod attachments;
+mod sessions;
+
+pub use attachments::AttachmentStore;
+pub use sessions::{content_text, session_summary_from_jsonl};
+
 use std::{
     io,
     path::{Path, PathBuf},

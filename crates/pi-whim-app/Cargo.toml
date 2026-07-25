@@ -13,7 +13,6 @@ crossbeam-channel.workspace = true
 arboard.workspace = true
 dirs.workspace = true
 eframe.workspace = true
-image = { version = "0.25", default-features = false, features = ["png"] }
 pi-whim-core = { path = "../pi-whim-core" }
 pi-whim-persistence = { path = "../pi-whim-persistence" }
 pi-whim-runtime = { path = "../pi-whim-runtime" }
