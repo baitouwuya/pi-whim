@@ -20,9 +20,15 @@ use pi_whim_core::{
     Action, AgentTeamConfig, AppState, BashPolicy, ConversationItem, ConversationRole, Language,
     MAX_AGENT_DEPTH, MAX_AGENTS_PER_LEVEL, ModelOption, ProjectId, ProviderId, ProviderModel,
     ProviderProfile, ProviderProtocol, QueueMode, SearchEngineProfile, SessionStatus, SubmitMode,
-    ThinkingLevel, provider_name_key,
+    ThinkingLevel,
 };
 use pi_whim_engine::composer::Composer;
+// The form state and its validation live in the engine, so the gpui page shares
+// them rather than reimplementing the same rules.
+use pi_whim_engine::settings::{
+    Preset as ProviderPreset, ProviderDraft, SearchEngineDraft, Section as SettingsSection,
+    move_search_engine, remove_search_engine, upsert_search_engine,
+};
 use pi_whim_engine::state::{EngineState, ViewEffect};
 use pi_whim_engine::typewriter::Typewriter;
 
@@ -135,176 +141,6 @@ enum WorkbenchPage {
     #[default]
     Chat,
     Settings(SettingsSection),
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum SettingsSection {
-    #[default]
-    General,
-    Providers,
-    WebSearch,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum ProviderPreset {
-    #[default]
-    Custom,
-    OpenAi,
-    Anthropic,
-    Google,
-    OpenRouter,
-}
-
-impl ProviderPreset {
-    const ALL: [Self; 5] = [
-        Self::Custom,
-        Self::OpenAi,
-        Self::Anthropic,
-        Self::Google,
-        Self::OpenRouter,
-    ];
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Custom => "Custom",
-            Self::OpenAi => "OpenAI",
-            Self::Anthropic => "Anthropic",
-            Self::Google => "Google / Gemini",
-            Self::OpenRouter => "OpenRouter",
-        }
-    }
-
-    fn apply(self, draft: &mut ProviderDraft) {
-        let (name, base_url, protocol) = match self {
-            Self::Custom => return,
-            Self::OpenAi => (
-                "OpenAI",
-                "https://api.openai.com/v1",
-                ProviderProtocol::OpenAiResponses,
-            ),
-            Self::Anthropic => (
-                "Anthropic",
-                "https://api.anthropic.com",
-                ProviderProtocol::AnthropicMessages,
-            ),
-            Self::Google => (
-                "Google / Gemini",
-                "https://generativelanguage.googleapis.com/v1beta",
-                ProviderProtocol::GoogleGenerativeAi,
-            ),
-            Self::OpenRouter => (
-                "OpenRouter",
-                "https://openrouter.ai/api/v1",
-                ProviderProtocol::OpenAiCompletions,
-            ),
-        };
-        draft.name = name.into();
-        draft.base_url = base_url.into();
-        draft.protocol = protocol;
-    }
-}
-
-#[derive(Clone, Debug)]
-struct ProviderDraft {
-    id: Option<ProviderId>,
-    name: String,
-    base_url: String,
-    protocol: ProviderProtocol,
-    preset: ProviderPreset,
-    api_key: String,
-    has_api_key: bool,
-    models: Vec<ProviderModel>,
-    selected_model: Option<usize>,
-    manual_model_id: String,
-}
-
-#[derive(Clone, Debug)]
-struct SearchEngineDraft {
-    id: Option<pi_whim_core::SearchEngineId>,
-    name: String,
-    base_url: String,
-    enabled: bool,
-}
-
-impl Default for SearchEngineDraft {
-    fn default() -> Self {
-        Self {
-            id: None,
-            name: "SearXNG".into(),
-            base_url: String::new(),
-            enabled: true,
-        }
-    }
-}
-
-impl SearchEngineDraft {
-    fn from_profile(profile: &SearchEngineProfile) -> Self {
-        Self {
-            id: Some(profile.id),
-            name: profile.name.clone(),
-            base_url: profile.base_url.clone(),
-            enabled: profile.enabled,
-        }
-    }
-
-    fn to_profile(&self, position: u32) -> SearchEngineProfile {
-        SearchEngineProfile {
-            id: self.id.unwrap_or_else(uuid::Uuid::new_v4),
-            name: self.name.trim().to_owned(),
-            kind: pi_whim_core::SearchEngineKind::Searxng,
-            base_url: self.base_url.trim().trim_end_matches('/').to_owned(),
-            enabled: self.enabled,
-            position,
-        }
-    }
-}
-
-impl Default for ProviderDraft {
-    fn default() -> Self {
-        Self {
-            id: None,
-            name: "OpenAI-compatible".into(),
-            base_url: ProviderProtocol::OpenAiCompletions
-                .default_base_url()
-                .into(),
-            protocol: ProviderProtocol::OpenAiCompletions,
-            preset: ProviderPreset::Custom,
-            api_key: String::new(),
-            has_api_key: false,
-            models: Vec::new(),
-            selected_model: None,
-            manual_model_id: String::new(),
-        }
-    }
-}
-
-impl ProviderDraft {
-    fn from_profile(profile: &ProviderProfile) -> Self {
-        Self {
-            id: Some(profile.id),
-            name: profile.name.clone(),
-            base_url: profile.base_url.clone(),
-            protocol: profile.protocol,
-            preset: ProviderPreset::Custom,
-            api_key: String::new(),
-            has_api_key: profile.has_api_key,
-            models: profile.models.clone(),
-            selected_model: None,
-            manual_model_id: String::new(),
-        }
-    }
-
-    fn to_profile(&self) -> ProviderProfile {
-        ProviderProfile {
-            id: self.id.unwrap_or_else(uuid::Uuid::new_v4),
-            name: self.name.trim().to_owned(),
-            base_url: self.base_url.trim().trim_end_matches('/').to_owned(),
-            protocol: self.protocol,
-            models: self.models.clone(),
-            updated_at_ms: now_ms(),
-            has_api_key: self.has_api_key || !self.api_key.trim().is_empty(),
-        }
-    }
 }
 
 pub struct Workbench {
@@ -514,7 +350,6 @@ impl Workbench {
     /// The app only supplies discovered identifiers; credentials never flow back to the UI.
     pub fn set_discovered_models(&mut self, models: Vec<ProviderModel>) {
         self.provider_draft.models = models;
-        self.provider_draft.selected_model = None;
     }
 
     /// Reflect a verified Keychain result rather than a value merely typed in
@@ -529,9 +364,9 @@ impl Workbench {
     }
 
     fn save_provider_intent(&mut self) {
-        let profile = self.provider_draft.to_profile();
-        let api_key = (!self.provider_draft.api_key.trim().is_empty())
-            .then(|| std::mem::take(&mut self.provider_draft.api_key));
+        let profile = self.provider_draft.to_profile(now_ms());
+        let api_key = self.provider_draft.typed_api_key();
+        self.provider_draft.api_key.clear();
         self.provider_draft.id = Some(profile.id);
         self.intents
             .push(UiIntent::SaveProvider { profile, api_key });
@@ -2263,12 +2098,8 @@ impl Workbench {
                 preset.apply(&mut self.provider_draft);
             }
         });
-        let draft_name_key = provider_name_key(&self.provider_draft.name);
-        let duplicate_provider_name = !draft_name_key.is_empty()
-            && self.state().provider_profiles.iter().any(|profile| {
-                Some(profile.id) != self.provider_draft.id
-                    && provider_name_key(&profile.name) == draft_name_key
-            });
+        let existing_providers = self.state().provider_profiles.clone();
+        let duplicate_provider_name = self.provider_draft.name_collides(&existing_providers);
         settings::form_row(ui, tr(self.state(), "provider-name"), None, |ui| {
             settings::sized_control(
                 ui,
@@ -2291,24 +2122,17 @@ impl Workbench {
             );
         });
         settings::form_row(ui, tr(self.state(), "protocol"), None, |ui| {
-            let old_protocol = self.provider_draft.protocol;
+            let mut protocol = self.provider_draft.protocol;
             egui::ComboBox::from_id_salt("provider-protocol")
                 .width(settings::control_width(ui))
-                .selected_text(self.provider_draft.protocol.label())
+                .selected_text(protocol.label())
                 .show_ui(ui, |ui| {
-                    for protocol in ProviderProtocol::ALL {
-                        ui.selectable_value(
-                            &mut self.provider_draft.protocol,
-                            protocol,
-                            protocol.label(),
-                        );
+                    for option in ProviderProtocol::ALL {
+                        ui.selectable_value(&mut protocol, option, option.label());
                     }
                 });
-            if old_protocol != self.provider_draft.protocol
-                && self.provider_draft.base_url.trim() == old_protocol.default_base_url()
-            {
-                self.provider_draft.base_url =
-                    self.provider_draft.protocol.default_base_url().into();
+            if protocol != self.provider_draft.protocol {
+                self.provider_draft.set_protocol(protocol);
             }
         });
         settings::form_row(
@@ -2331,10 +2155,7 @@ impl Workbench {
             },
         );
 
-        let can_save = !self.provider_draft.name.trim().is_empty()
-            && !self.provider_draft.base_url.trim().is_empty()
-            && !self.provider_draft.models.is_empty()
-            && !duplicate_provider_name;
+        let can_save = self.provider_draft.can_save(&existing_providers);
 
         settings::section_header(
             ui,
@@ -2342,7 +2163,7 @@ impl Workbench {
             Some(tr(self.state(), "models-help")),
         );
         settings::control_row(ui, |ui| {
-            let can_discover = !self.provider_draft.base_url.trim().is_empty();
+            let can_discover = self.provider_draft.can_discover();
             if ui
                 .add_enabled_ui(can_discover, |ui| {
                     settings::action_button(ui, tr(self.state(), "discover-models"))
@@ -2381,19 +2202,7 @@ impl Workbench {
             let add_model = add_model_clicked
                 || (model_id_input.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter)));
             if add_model {
-                let model_id = self.provider_draft.manual_model_id.trim().to_owned();
-                if !model_id.is_empty()
-                    && !self
-                        .provider_draft
-                        .models
-                        .iter()
-                        .any(|model| model.id == model_id)
-                {
-                    self.provider_draft
-                        .models
-                        .push(ProviderModel::new(model_id));
-                }
-                self.provider_draft.manual_model_id.clear();
+                self.provider_draft.add_manual_model();
             }
         });
         if self.provider_draft.models.is_empty() {
@@ -2540,13 +2349,11 @@ impl Workbench {
                         if ui.small_button("x").clicked() {
                             remove = Some(index);
                         }
-                        if ui.small_button("v").clicked()
-                            && index + 1 < self.state().search_engine_profiles.len()
-                        {
-                            move_engine = Some((index, index + 1));
+                        if ui.small_button("v").clicked() {
+                            move_engine = Some((index, 1));
                         }
-                        if ui.small_button("^").clicked() && index > 0 {
-                            move_engine = Some((index, index - 1));
+                        if ui.small_button("^").clicked() {
+                            move_engine = Some((index, -1));
                         }
                     });
                 });
@@ -2556,14 +2363,12 @@ impl Workbench {
             self.search_engine_draft = SearchEngineDraft::from_profile(&profile);
         }
         if let Some(index) = remove {
-            let mut profiles = self.state().search_engine_profiles.clone();
-            profiles.remove(index);
+            let profiles = remove_search_engine(&self.state().search_engine_profiles, index);
             self.search_engine_draft = SearchEngineDraft::default();
             self.intents.push(UiIntent::SaveSearchEngines(profiles));
         }
-        if let Some((from, to)) = move_engine {
-            let mut profiles = self.state().search_engine_profiles.clone();
-            profiles.swap(from, to);
+        if let Some((index, delta)) = move_engine {
+            let profiles = move_search_engine(&self.state().search_engine_profiles, index, delta);
             self.intents.push(UiIntent::SaveSearchEngines(profiles));
         }
         settings::control_row(ui, |ui| {
@@ -2599,17 +2404,14 @@ impl Workbench {
         });
 
         settings::control_row(ui, |ui| {
-            let mut profiles = self.state().search_engine_profiles.clone();
-            let profile = self.search_engine_draft.to_profile(profiles.len() as u32);
+            let profile = self
+                .search_engine_draft
+                .to_profile(self.state().search_engine_profiles.len() as u32);
             if settings::action_button(ui, tr(self.state(), "save-search-engine")).clicked() {
-                if let Some(index) = profiles
-                    .iter()
-                    .position(|existing| existing.id == profile.id)
-                {
-                    profiles[index] = profile.clone();
-                } else {
-                    profiles.push(profile.clone());
-                }
+                let profiles = upsert_search_engine(
+                    &self.state().search_engine_profiles,
+                    &self.search_engine_draft,
+                );
                 self.intents.push(UiIntent::SaveSearchEngines(profiles));
             }
             ui.add_space(settings::inline_gap());
