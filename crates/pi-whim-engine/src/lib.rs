@@ -9,6 +9,7 @@ pub mod composer;
 pub mod controls;
 pub mod events;
 pub mod launch;
+pub mod notice;
 pub mod pool;
 pub mod protocol;
 pub mod providers;
