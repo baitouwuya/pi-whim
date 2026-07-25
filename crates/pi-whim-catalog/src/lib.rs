@@ -89,8 +89,14 @@ impl ModelCapabilityResolver {
         Self { state, completed }
     }
 
-    pub fn online_refresh_completed(&self) -> bool {
-        self.completed.try_recv().is_ok()
+    /// A channel that yields once, when the online fetch has finished.
+    ///
+    /// Handed out rather than polled: the caller has no frame to poll from, and a
+    /// receiver is something it can block on off the main thread. Disconnected
+    /// straight away when this resolver did not start a fetch, which reads as
+    /// "there will be no refresh" — the same answer polling gave.
+    pub fn refreshed(&self) -> Receiver<()> {
+        self.completed.clone()
     }
 
     pub fn enrich_profile(&self, profile: &mut ProviderProfile) {

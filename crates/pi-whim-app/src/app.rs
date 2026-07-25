@@ -9,10 +9,8 @@ use std::{
     collections::HashSet,
     fs,
     path::{Path, PathBuf},
-    time::Duration,
 };
 
-use eframe::egui;
 use pi_whim_core::{
     Action, AppState, Attachment, ConversationItem, ConversationRole, ModelOption, Project,
     ProjectId, ProviderId, ProviderProfile, ProviderProtocol, QueueMode, SearchEngineProfile,
@@ -25,12 +23,11 @@ use pi_whim_persistence::{
     session_summary_from_jsonl,
 };
 use pi_whim_runtime::{AgentRuntime, PiRpcRuntime, RuntimeEvent, RuntimeStart};
-use pi_whim_ui::{UiIntent, Workbench};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::macos_paste::{ClipboardAttachment, FinderPasteMonitor};
 use pi_whim_catalog::ModelCapabilityResolver;
+use pi_whim_engine::mailbox::Delivery;
 use pi_whim_engine::pool::{SessionPool, SessionRuntime, is_draft};
 use pi_whim_engine::protocol::queue_mode_name;
 use pi_whim_engine::providers::{
@@ -38,13 +35,16 @@ use pi_whim_engine::providers::{
     valid_search_engine_url,
 };
 use pi_whim_engine::session::{
-    attachment_from_path, bash_policy_name, canonical_path, ensure_agent_team_extension,
-    is_large_paste, now_ms, prompt_with_attachment_paths,
+    attachment_from_path, bash_policy_name, canonical_path, ensure_agent_team_extension, now_ms,
+    prompt_with_attachment_paths,
 };
+use pi_whim_engine::slash_commands::SlashCommand;
+use pi_whim_engine::state::EngineState;
 use pi_whim_engine::{controls, dialogs, events, launch, notice};
+use pi_whim_gpui::Request;
 
 pub struct PiWhimApplication<R: AgentRuntime = PiRpcRuntime> {
-    workbench: Workbench,
+    engine: EngineState,
     store: Option<SqliteStore>,
     secrets: MacosKeychainStore,
     runtime_factory: Box<dyn Fn() -> R + Send>,
@@ -52,21 +52,34 @@ pub struct PiWhimApplication<R: AgentRuntime = PiRpcRuntime> {
     /// Extension confirmations and supervisor interactions, in the order they
     /// arrived. Each carries the session that asked, so a background agent can
     /// prompt the user and still get its answer back.
-    prompts: dialogs::Queue,
+    ///
+    /// Only a staging area: the shell holds the queue that decides which one is
+    /// on screen, so these are handed over and none are kept.
+    prompts: Vec<dialogs::Prompt>,
+    /// Sessions that have stopped since the shell was last told.
+    ///
+    /// The questions belong to the shell's queue now, so forgetting them is
+    /// something it has to be asked to do rather than something done here.
+    closed: Vec<String>,
+    /// Attachments chosen in a file dialog, waiting for the composer.
+    ///
+    /// Staged rather than answered, because the dialog is opened from a slash
+    /// command whose request carries nothing back.
+    attached: Vec<Attachment>,
+    /// Text waiting to go on the clipboard.
+    ///
+    /// Written by the host, which is the only part of this that has a window.
+    clipboard: Option<String>,
     capability_resolver: ModelCapabilityResolver,
     sessions_root_override: Option<PathBuf>,
     agent_directory_override: Option<PathBuf>,
     attachment_store: AttachmentStore,
-    finder_paste_monitor: Option<FinderPasteMonitor>,
-    finder_paste_monitor_install_pending: bool,
     /// Messages bound for the user, oldest first.
     ///
     /// A queue rather than two `Option<String>` fields: orchestration fails in
     /// bursts — a project that has moved, then a provider with no key — and the
     /// second was overwriting the first before anyone had read it.
     notices: notice::Outbox,
-    /// The message currently on screen, taken off the queue.
-    showing: Option<notice::Notice>,
     /// Control-state refreshes in flight, tagged with the session they were
     /// asked about.
     #[allow(clippy::type_complexity)]
@@ -78,7 +91,7 @@ pub struct PiWhimApplication<R: AgentRuntime = PiRpcRuntime> {
 
 impl Default for PiWhimApplication<PiRpcRuntime> {
     fn default() -> Self {
-        let mut workbench = Workbench::default();
+        let mut engine = EngineState::new();
         let capability_resolver = ModelCapabilityResolver::default();
         let store = SqliteStore::open_default()
             .map_err(|error| error.to_string())
@@ -90,10 +103,10 @@ impl Default for PiWhimApplication<PiRpcRuntime> {
                 .iter()
                 .map(|project| project.id)
                 .collect::<Vec<_>>();
-            workbench.apply(Action::ProjectsLoaded(projects));
+            let _ = engine.apply(Action::ProjectsLoaded(projects));
             for project_id in project_ids {
                 if let Ok(sessions) = store.list_sessions(project_id) {
-                    workbench.apply(Action::SessionsLoaded {
+                    let _ = engine.apply(Action::SessionsLoaded {
                         project_id,
                         sessions,
                     });
@@ -103,17 +116,17 @@ impl Default for PiWhimApplication<PiRpcRuntime> {
         if let Some(store) = store.as_ref()
             && let Ok(preferences) = store.load_preferences()
         {
-            workbench.apply(Action::SetLanguage(preferences.language));
-            workbench.apply(Action::SetBashPolicy(preferences.bash_policy));
-            workbench.apply(Action::SetBashBlockedPatterns(
+            let _ = engine.apply(Action::SetLanguage(preferences.language));
+            let _ = engine.apply(Action::SetBashPolicy(preferences.bash_policy));
+            let _ = engine.apply(Action::SetBashBlockedPatterns(
                 preferences.bash_blocked_patterns,
             ));
-            workbench.apply(Action::SetAgentTeamConfig(preferences.agent_team_config));
+            let _ = engine.apply(Action::SetAgentTeamConfig(preferences.agent_team_config));
         }
         if let Some(store) = store.as_ref()
             && let Ok(profiles) = store.list_search_engine_profiles()
         {
-            workbench.apply(Action::SearchEngineProfilesLoaded(profiles));
+            let _ = engine.apply(Action::SearchEngineProfilesLoaded(profiles));
         }
         let mut provider_ids = Vec::new();
         if let Some(store) = store.as_ref()
@@ -124,106 +137,93 @@ impl Default for PiWhimApplication<PiRpcRuntime> {
                 let _ = store.save_provider_profile(profile);
             }
             provider_ids = profiles.iter().map(|profile| profile.id).collect();
-            workbench.apply(Action::ProviderProfilesLoaded(profiles));
+            let _ = engine.apply(Action::ProviderProfilesLoaded(profiles));
         }
         let application = Self {
-            workbench,
+            engine,
             store,
             secrets: MacosKeychainStore::default(),
             runtime_factory: Box::new(PiRpcRuntime::default),
             sessions: SessionPool::new(),
-            prompts: dialogs::Queue::new(),
+            prompts: Vec::new(),
+            closed: Vec::new(),
+            attached: Vec::new(),
+            clipboard: None,
             capability_resolver,
             sessions_root_override: None,
             agent_directory_override: None,
             attachment_store: AttachmentStore::open_default(),
-            finder_paste_monitor: None,
-            finder_paste_monitor_install_pending: true,
             notices: notice::Outbox::new(),
-            showing: None,
             control_updates: crossbeam_channel::unbounded(),
         };
         // Probing the keychain can block for a long time and this runs before
-        // the first frame, so profiles render with their stored status and a
+        // the window opens, so profiles start with their stored status and a
         // worker corrects them.
         application.refresh_provider_key_status(provider_ids);
         application
     }
 }
 
-impl<R: AgentRuntime> eframe::App for PiWhimApplication<R> {
-    fn raw_input_hook(&mut self, context: &egui::Context, raw_input: &mut egui::RawInput) {
-        let composer_focused = self.workbench.composer_has_focus(context);
-        if !composer_focused {
-            return;
-        }
-        raw_input.events.retain(|event| match event {
-            egui::Event::Paste(text) => !self.capture_attachment_paste(text),
-            _ => true,
-        });
-    }
-
-    fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
-        if self.finder_paste_monitor_install_pending {
-            self.finder_paste_monitor = FinderPasteMonitor::install();
-            self.finder_paste_monitor_install_pending = false;
-        }
-        self.consume_finder_paste(context);
-        self.consume_runtime_events();
-        self.consume_control_updates();
-        self.consume_capability_catalog();
-        self.workbench.show(context);
-        for intent in self.workbench.take_intents() {
-            self.handle_intent(intent);
-        }
-        self.prompt_dialog(context);
-        self.notice_window(context);
-        let session_running = self.sessions.any_running();
-        let agent_busy = matches!(
-            self.state().session_status,
-            SessionStatus::Starting | SessionStatus::Streaming | SessionStatus::Compacting
-        );
-        if session_running || agent_busy {
-            // Runtime events arrive on channels and need a periodic poll while
-            // a session is active.  Fifty milliseconds keeps streaming smooth
-            // without laying out the whole conversation at display refresh rate.
-            context.request_repaint_after(Duration::from_millis(50));
-        }
-    }
-}
-
 impl<R: AgentRuntime> PiWhimApplication<R> {
     /// Read the domain state.
     ///
-    /// Named here rather than reaching through the view, so orchestration does
-    /// not care which one is mounted: the state is about to move out of the view
-    /// and these callers should not have to move with it.
-    fn state(&self) -> &AppState {
-        self.workbench.state()
+    /// The reducer is here rather than on the view, so orchestration does not
+    /// care which UI is mounted; the shell is handed a snapshot of this.
+    pub(crate) fn state(&self) -> &AppState {
+        self.engine.get()
     }
 
     /// Change the domain state through the reducer.
     fn apply(&mut self, action: Action) {
-        self.workbench.apply(action);
+        // The view effect is dropped: it exists for a caller that renders, and
+        // the shell derives what it needs from the snapshot it is handed next.
+        let _ = self.engine.apply(action);
     }
 
-    fn consume_finder_paste(&mut self, context: &egui::Context) {
-        let attachments = self
-            .finder_paste_monitor
-            .as_ref()
-            .map(FinderPasteMonitor::drain_attachments)
-            .unwrap_or_default();
-        for attachment in attachments {
-            if self.workbench.composer_has_focus(context) {
-                self.add_clipboard_attachment(attachment);
-            }
-        }
+    /// The merged stream of every pooled session's events.
+    pub(crate) fn session_events(&self) -> crossbeam_channel::Receiver<Delivery> {
+        self.sessions.events()
     }
 
-    fn consume_capability_catalog(&mut self) {
-        if !self.capability_resolver.online_refresh_completed() {
-            return;
-        }
+    /// The answers to the control-state RPCs issued on worker threads.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn control_answers(
+        &self,
+    ) -> crossbeam_channel::Receiver<(Option<String>, Vec<Action>)> {
+        self.control_updates.1.clone()
+    }
+
+    /// Messages bound for the user, taken off the queue.
+    pub(crate) fn take_notices(&mut self) -> Vec<notice::Notice> {
+        self.notices.drain()
+    }
+
+    /// Questions an agent is blocked on, handed to whoever will ask them.
+    pub(crate) fn take_prompts(&mut self) -> Vec<dialogs::Prompt> {
+        std::mem::take(&mut self.prompts)
+    }
+
+    /// Sessions that have stopped, so their questions can be dropped.
+    pub(crate) fn take_closed_sessions(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.closed)
+    }
+
+    /// Text a command produced for the clipboard.
+    pub(crate) fn take_clipboard(&mut self) -> Option<String> {
+        self.clipboard.take()
+    }
+
+    /// A signal that the online capability catalog has arrived.
+    pub(crate) fn catalog_refreshed(&self) -> crossbeam_channel::Receiver<()> {
+        self.capability_resolver.refreshed()
+    }
+
+    /// Re-enrich every stored provider now that the online catalog is known.
+    ///
+    /// Only worth doing once, when the fetch lands: the models a profile lists do
+    /// not change on their own, and what the catalog says about them was already
+    /// applied from the bundled table at startup.
+    pub(crate) fn absorb_capability_catalog(&mut self) {
         let Some(store) = self.store.as_ref() else {
             return;
         };
@@ -240,10 +240,14 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         self.reload_provider_profiles();
     }
 
-    fn handle_intent(&mut self, intent: UiIntent) {
-        match intent {
-            UiIntent::AddProject => self.add_project(),
-            UiIntent::RemoveProject(project_id) => {
+    /// Carry out one request from the shell.
+    ///
+    /// The shell has already done its half — the prompt is in the conversation,
+    /// the draft is cleared — so what is left is the store, the pool, and Pi.
+    pub(crate) fn handle(&mut self, request: Request) {
+        match request {
+            Request::AddProject => self.add_project(),
+            Request::RemoveProject(project_id) => {
                 self.stop_project_runtimes(project_id);
                 if let Some(store) = self.store.as_ref()
                     && let Err(error) = store.delete_project(project_id)
@@ -252,93 +256,171 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 }
                 self.reload_projects();
             }
-            UiIntent::RevealProject(project_id) => {
+            Request::RevealProject(project_id) => {
                 if let Some(project) = self.find_project(project_id) {
                     let _ = std::process::Command::new("open").arg(project.path).spawn();
                 }
             }
-            UiIntent::StartProject(project_id) => self.start_project(project_id),
-            UiIntent::StartNewSession(project_id) => self.start_new_session(project_id),
-            UiIntent::SwitchSession { project_id, path } => self.switch_session(project_id, path),
-            UiIntent::RenameSession { path, title } => self.rename_session(path, title),
-            UiIntent::CloneSession => self.clone_session(),
-            UiIntent::ForkSession(entry_id) => self.fork_session(entry_id),
-            UiIntent::DeleteSession(path) => self.delete_session(path),
-            UiIntent::SetSessionName(name) => self.set_current_session_name(name),
-            UiIntent::ExportSession(path) => self.export_session(path),
-            UiIntent::ShareSession => self.share_session(),
-            UiIntent::AddFileAttachments => {
-                if self.state().selected_project.is_some() {
-                    self.add_file_attachments();
-                } else {
-                    self.notices
-                        .error("Select a project before adding attachments.");
-                }
-            }
-            UiIntent::AddFolderAttachment => {
-                if self.state().selected_project.is_some() {
-                    self.add_folder_attachment();
-                } else {
-                    self.notices
-                        .error("Select a project before adding attachments.");
-                }
-            }
-            UiIntent::RemoveComposerAttachment(path) => self.remove_composer_attachment(&path),
-            UiIntent::SubmitPrompt {
+            Request::OpenProject(project_id) => self.start_project(project_id),
+            Request::NewSession(project_id) => self.start_new_session(project_id),
+            Request::ActivateSession { project_id, path } => self.switch_session(project_id, path),
+            Request::RenameSession { path, title } => self.rename_session(path, title),
+            Request::CloneSession => self.clone_session(),
+            Request::DeleteSession(path) => self.delete_session(path),
+            Request::SubmitPrompt {
                 content,
                 attachments,
                 mode,
             } => self.submit_prompt(content, attachments, mode),
-            UiIntent::Compact => self.compact_session(),
-            UiIntent::SetAutoCompaction(enabled) => self.set_auto_compaction(enabled),
-            UiIntent::Stop => {
+            Request::AnswerPrompt(answer) => self.send_answer(answer),
+            Request::DiscardAttachment(path) => {
+                // Only the generated ones reach here — the composer decides that
+                // — so this deletes the file it wrote without asking again.
+                if let Err(error) = self.attachment_store.remove_generated(&path) {
+                    self.notices.error(error);
+                }
+            }
+            Request::PickAttachments { directories } => self.pick_attachments(directories),
+            Request::SetAutoCompaction(enabled) => self.set_auto_compaction(enabled),
+            Request::Stop => {
                 if let Err(error) = self.active_command(json!({"type":"abort"})) {
                     self.notices.error(error);
                 }
             }
-            UiIntent::SetLanguage(language) => {
+            Request::SetLanguage(language) => {
                 self.apply(Action::SetLanguage(language));
                 self.save_preferences();
             }
-            UiIntent::SetBashPolicy(policy) => {
+            Request::SetBashPolicy(policy) => {
                 self.apply(Action::SetBashPolicy(policy));
                 self.save_preferences();
                 self.restart_selected_project();
             }
-            UiIntent::SetBashBlockedPatterns(patterns) => {
+            Request::SetBlockedPatterns(patterns) => {
                 self.apply(Action::SetBashBlockedPatterns(patterns));
                 self.save_preferences();
                 self.restart_selected_project();
             }
-            UiIntent::SetAgentTeamConfig(config) => {
+            Request::SetAgentTeamConfig(config) => {
                 self.apply(Action::SetAgentTeamConfig(config));
                 self.save_preferences();
                 self.restart_selected_project();
             }
-            UiIntent::SetModel(model) => self.queue_model_switch(model),
-            UiIntent::SetThinkingLevel(level) => self.set_thinking_level(level),
-            UiIntent::SetQueueModes {
+            Request::SetModel(model) => self.queue_model_switch(model),
+            Request::SetThinkingLevel(level) => self.set_thinking_level(level),
+            Request::SetQueueModes {
                 steering,
                 follow_up,
             } => self.set_queue_modes(steering, follow_up),
-            UiIntent::SaveProvider { profile, api_key } => self.save_provider(profile, api_key),
-            UiIntent::DeleteProvider(profile_id) => self.delete_provider(profile_id),
-            UiIntent::SaveSearchEngines(profiles) => self.save_search_engines(profiles),
-            UiIntent::TestSearchEngine(profile) => self.test_search_engine(profile),
-            UiIntent::DiscoverProviderModels {
-                profile_id,
-                provider_name,
-                base_url,
-                protocol,
-                api_key,
-            } => self.discover_provider_models(
-                profile_id,
-                provider_name,
-                base_url,
-                protocol,
-                api_key,
-            ),
+            Request::RunCommand(command) => self.run_command(command),
+            Request::DeleteProvider(profile_id) => self.delete_provider(profile_id),
+            Request::SaveSearchEngines(profiles) => self.save_search_engines(profiles),
+            Request::TestSearchEngine(profile) => self.test_search_engine(profile),
+            // Each of these either needs the window and the clipboard, or answers
+            // with something a view has to be told, so the host keeps them.
+            Request::CopyToClipboard(_)
+            | Request::AttachPaste(_)
+            | Request::SaveProvider { .. }
+            | Request::DiscoverProviderModels { .. } => {
+                unreachable!("handled by the host")
+            }
         }
+    }
+
+    /// Carry out one slash command.
+    ///
+    /// Only the ones that need something outside the shell: the palette fills the
+    /// composer in for the rest itself.
+    fn run_command(&mut self, command: SlashCommand) {
+        match command {
+            SlashCommand::NewSession => {
+                if let Some(project_id) = self.state().selected_project {
+                    self.start_new_session(project_id);
+                }
+            }
+            SlashCommand::AddAttachment => {
+                if self.state().selected_project.is_some() {
+                    self.pick_attachments(false);
+                } else {
+                    self.notices
+                        .error("Select a project before adding attachments.");
+                }
+            }
+            SlashCommand::SetModel(model) => self.queue_model_switch(model),
+            SlashCommand::SetThinkingLevel(level) => self.set_thinking_level(level),
+            SlashCommand::Compact => self.compact_session(),
+            SlashCommand::Stop => {
+                if let Err(error) = self.active_command(json!({"type":"abort"})) {
+                    self.notices.error(error);
+                }
+            }
+            SlashCommand::Clone => self.clone_session(),
+            SlashCommand::Fork(entry_id) => self.fork_session(entry_id),
+            SlashCommand::Share => self.share_session(),
+            SlashCommand::Export(path) => self.export_session(path),
+            SlashCommand::NameSession(Some(name)) => self.set_current_session_name(name),
+            SlashCommand::CopyLastMessage => {
+                // The streaming entry is skipped because a reply still arriving
+                // would be copied half-written.
+                if let Some(message) = self.state().conversation.iter().rev().find(|message| {
+                    message.role == ConversationRole::Assistant
+                        && !message.streaming
+                        && !message.full_text.trim().is_empty()
+                }) {
+                    self.clipboard = Some(message.full_text.clone());
+                }
+            }
+            SlashCommand::ShowSessionInfo => {
+                let metrics = self.state().session_metrics.clone().unwrap_or_default();
+                self.push_command_output(format!(
+                    "Session info\n\nMessages: {} ({} user, {} assistant)\nTool calls: {}\nTokens: {}\nCost: ${:.4}",
+                    metrics.total_messages,
+                    metrics.user_messages,
+                    metrics.assistant_messages,
+                    metrics.tool_calls,
+                    metrics.total_tokens,
+                    metrics.cost_microusd as f64 / 1_000_000.0
+                ));
+            }
+            SlashCommand::ShowHotkeys => {
+                self.push_command_output(
+                    "Keyboard shortcuts\n\nEnter: send\nShift+Enter: new line\n/: quick actions\nUp/Down: select action\nTab or Enter: confirm action\nEsc: close action menu or reveal streamed text".into(),
+                );
+            }
+            SlashCommand::ShowChangelog => {
+                self.push_command_output(
+                    "Pi changelog: https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/CHANGELOG.md".into(),
+                );
+            }
+            // These only prefill the composer, which the palette does without
+            // asking anyone, so they never travel as a request.
+            SlashCommand::ChooseModel
+            | SlashCommand::ChooseThinkingLevel
+            | SlashCommand::ChooseFork
+            | SlashCommand::NameSession(None)
+            | SlashCommand::SubmitDynamic(_) => {
+                unreachable!("the palette prefills these itself")
+            }
+        }
+    }
+
+    /// Answer a command in the conversation itself.
+    ///
+    /// The reducer's upsert rather than a notice: the text is long enough to want
+    /// scrolling, and it belongs to the session it was asked in.
+    fn push_command_output(&mut self, text: String) {
+        self.apply(Action::UpsertConversation(ConversationItem {
+            id: format!("slash-command-{}", now_ms()),
+            role: ConversationRole::System,
+            full_text: text,
+            streaming: false,
+            tool_name: None,
+            tool_report: None,
+            tool_details: None,
+            is_error: false,
+            model: None,
+            attachments: Vec::new(),
+        }));
     }
 
     fn add_project(&mut self) {
@@ -461,7 +543,17 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         }
     }
 
-    fn save_provider(&mut self, mut profile: ProviderProfile, api_key: Option<String>) {
+    /// Store a provider, and its key if one was typed.
+    ///
+    /// Answers with the id the profile ended up under and whether a key really
+    /// is in the keychain, because the badge beside the form is the one place
+    /// that must not claim a key it has not seen. Nothing to report — the form
+    /// did not validate — is `None`.
+    pub(crate) fn save_provider(
+        &mut self,
+        mut profile: ProviderProfile,
+        api_key: Option<String>,
+    ) -> Option<(ProviderId, bool)> {
         profile.name = normalize_provider_display_name(&profile.name);
         if profile.name.trim().is_empty()
             || profile.base_url.trim().is_empty()
@@ -469,23 +561,17 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         {
             self.notices
                 .error("A provider needs a name, base URL, and at least one model.");
-            return;
+            return None;
         }
-        if self
-            .workbench
-            .state()
-            .provider_profiles
-            .iter()
-            .any(|existing| {
-                existing.id != profile.id
-                    && provider_name_key(&existing.name) == provider_name_key(&profile.name)
-            })
-        {
+        if self.state().provider_profiles.iter().any(|existing| {
+            existing.id != profile.id
+                && provider_name_key(&existing.name) == provider_name_key(&profile.name)
+        }) {
             self.notices.error(format!(
                 "A provider named '{}' already exists.",
                 profile.name
             ));
-            return;
+            return None;
         }
         profile.base_url = normalize_base_url(&profile.base_url);
         self.capability_resolver.enrich_profile(&mut profile);
@@ -496,7 +582,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 .set(&provider_keychain_account(profile.id), &api_key)
             {
                 self.notices.error(error.to_string());
-                return;
+                return None;
             }
             profile.has_api_key = self
                 .secrets
@@ -506,11 +592,12 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 .flatten()
                 .is_some();
             if !profile.has_api_key {
-                self.workbench.set_provider_key_status(profile.id, false);
                 self.notices.error(
                     "The API key could not be read back from Keychain. Pi was not restarted; try Save and apply again.",
                 );
-                return;
+                // Reported as stored-nothing rather than as no answer: the write
+                // was attempted, and the badge must not be left claiming a key.
+                return Some((profile.id, false));
             }
         } else if self
             .secrets
@@ -522,18 +609,19 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             self.notices.error(
                 "This provider has no API key in Keychain. Enter and save its API key before starting Pi.",
             );
-            return;
+            return None;
         }
-        self.workbench.set_provider_key_status(profile.id, true);
+        let id = profile.id;
         if let Some(store) = self.store.as_ref()
             && let Err(error) = store.save_provider_profile(&profile)
         {
             self.notices.error(error.to_string());
-            return;
+            return None;
         }
         self.reload_provider_profiles();
         // Pi reads models.json at startup. Restart the active project to apply new providers.
         self.restart_selected_project();
+        Some((id, true))
     }
 
     fn delete_provider(&mut self, profile_id: ProviderId) {
@@ -596,14 +684,19 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         }
     }
 
-    fn discover_provider_models(
+    /// Ask a provider which models it has.
+    ///
+    /// Answers with the list rather than filling the form in, because the form is
+    /// the shell's. Nothing to offer — no models, or the request failed — is
+    /// reported as a notice and answered `None`.
+    pub(crate) fn discover_provider_models(
         &mut self,
         profile_id: Option<ProviderId>,
         provider_name: String,
         base_url: String,
         protocol: ProviderProtocol,
         supplied_key: Option<String>,
-    ) {
+    ) -> Option<Vec<pi_whim_core::ProviderModel>> {
         let key = supplied_key.or_else(|| {
             profile_id.and_then(|id| {
                 self.secrets
@@ -616,12 +709,17 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             Ok(mut models) if !models.is_empty() => {
                 self.capability_resolver
                     .enrich_models(&provider_name, &base_url, &mut models);
-                self.workbench.set_discovered_models(models);
+                Some(models)
             }
-            Ok(_) => self
-                .notices
-                .error("The provider returned no models; add a model ID manually."),
-            Err(error) => self.notices.error(error),
+            Ok(_) => {
+                self.notices
+                    .error("The provider returned no models; add a model ID manually.");
+                None
+            }
+            Err(error) => {
+                self.notices.error(error);
+                None
+            }
         }
     }
 
@@ -668,7 +766,6 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             return;
         }
         let stored = self
-            .workbench
             .state()
             .sessions
             .get(&project_id)
@@ -835,7 +932,9 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             .is_some_and(|session| session.project_id == project_id);
 
         for key in self.sessions.remove_project(project_id) {
-            self.prompts.forget_session(&key);
+            // Nothing is left to answer, and a dialog still up would ask the
+            // reader to unblock a process that has gone.
+            self.closed.push(key.clone());
             self.apply(Action::SessionRunning {
                 path: key,
                 running: false,
@@ -852,7 +951,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     ///
     /// Five RPCs at up to 20 seconds each; issuing them inline froze the window
     /// whenever Pi was slow to answer. Results arrive as actions and are applied
-    /// by `consume_control_updates`.
+    /// by [`Self::settle_controls`].
     fn refresh_runtime_controls(&mut self) {
         let Some(commander) = self
             .active()
@@ -871,11 +970,15 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
 
     /// Block until an in-flight control refresh lands, for tests.
     ///
-    /// Production code applies these from the frame loop; a test has no frame
-    /// loop, so it waits for the worker instead of racing it.
+    /// Production code applies these as the pump delivers them; a test has no
+    /// pump, so it waits for the worker instead of racing it.
     #[cfg(test)]
     fn settle_control_updates(&mut self) {
-        while let Ok((key, actions)) = self.control_updates.1.recv_timeout(Duration::from_secs(5)) {
+        while let Ok((key, actions)) = self
+            .control_updates
+            .1
+            .recv_timeout(std::time::Duration::from_secs(5))
+        {
             if key.as_deref() == self.sessions.active_key() {
                 for action in actions {
                     self.apply(action);
@@ -887,20 +990,17 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         }
     }
 
-    /// Apply whatever the control refresh reported.
+    /// Apply whatever one control refresh reported.
     ///
-    /// Updates for a session that is no longer visible are dropped: the user
-    /// has moved on, and applying them would overwrite the current session's
+    /// An update for a session that is no longer visible is dropped: the user
+    /// has moved on, and applying it would overwrite the current session's
     /// controls with another's.
-    fn consume_control_updates(&mut self) {
-        let updates: Vec<_> = self.control_updates.1.try_iter().collect();
-        for (key, actions) in updates {
-            if key.as_deref() != self.sessions.active_key() {
-                continue;
-            }
-            for action in actions {
-                self.apply(action);
-            }
+    pub(crate) fn settle_controls(&mut self, key: Option<String>, actions: Vec<Action>) {
+        if key.as_deref() != self.sessions.active_key() {
+            return;
+        }
+        for action in actions {
+            self.apply(action);
         }
     }
 
@@ -1095,7 +1195,6 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         if self.active().is_some_and(|session| {
             session.project_id == project_id
                 && !self
-                    .workbench
                     .state()
                     .conversation
                     .iter()
@@ -1306,102 +1405,72 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         Ok(())
     }
 
-    fn add_file_attachments(&mut self) {
-        if let Some(paths) = rfd::FileDialog::new()
-            .set_title("Choose attachments")
-            .pick_files()
-        {
-            self.add_attachments(paths);
-        }
-    }
-
-    fn add_folder_attachment(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
-            .set_title("Choose attachment folder")
-            .pick_folder()
-        {
-            self.add_attachments(vec![path]);
-        }
-    }
-
-    fn add_attachments(&mut self, paths: Vec<PathBuf>) {
-        for path in paths {
+    /// Ask for something on disk, and stage whatever was chosen.
+    ///
+    /// Files and folders are separate pickers rather than one that accepts both: a
+    /// folder is attached whole, and a picker that took either would make "this
+    /// file" and "the folder it is in" the same gesture.
+    pub(crate) fn pick_attachments(&mut self, directories: bool) {
+        let dialog = rfd::FileDialog::new();
+        let chosen = if directories {
+            dialog
+                .set_title("Choose attachment folder")
+                .pick_folder()
+                .map(|path| vec![path])
+        } else {
+            dialog.set_title("Choose attachments").pick_files()
+        };
+        for path in chosen.into_iter().flatten() {
             match attachment_from_path(&path, false) {
-                Ok(attachment) => self
-                    .workbench
-                    .composer_draft_mut()
-                    .add_attachment(attachment),
+                Ok(attachment) => self.attached.push(attachment),
                 Err(error) => self.notices.error(error),
             }
         }
     }
 
-    fn add_clipboard_attachment(&mut self, attachment: ClipboardAttachment) {
-        match attachment {
-            ClipboardAttachment::Paths(paths) => self.add_attachments(paths),
-            ClipboardAttachment::Image {
-                width,
-                height,
-                rgba,
-            } => match self
-                .attachment_store
-                .create_pasted_image(width, height, &rgba)
-            {
-                Ok(attachment) => self
-                    .workbench
-                    .composer_draft_mut()
-                    .add_attachment(attachment),
-                Err(error) => self.notices.error(error),
-            },
-        }
-    }
-
-    fn remove_composer_attachment(&mut self, path: &str) {
-        let attachment = self
-            .workbench
-            .composer_draft()
-            .attachments()
-            .iter()
-            .find(|attachment| attachment.path == path)
-            .cloned();
-        self.workbench.composer_draft_mut().remove_attachment(path);
-        if attachment.is_some_and(|attachment| attachment.generated_by_app)
-            && let Err(error) = self.attachment_store.remove_generated(path)
-        {
-            self.notices.error(error);
-        }
-    }
-
-    fn capture_attachment_paste(&mut self, text: &str) -> bool {
-        if let Ok(mut clipboard) = arboard::Clipboard::new()
-            && let Ok(paths) = clipboard.get().file_list()
-            && !paths.is_empty()
-        {
-            self.add_attachments(paths);
-            return true;
-        }
-        if let Ok(mut clipboard) = arboard::Clipboard::new()
-            && let Ok(image) = clipboard.get_image()
-        {
-            self.add_clipboard_attachment(ClipboardAttachment::Image {
-                width: image.width,
-                height: image.height,
-                rgba: image.bytes.into_owned(),
-            });
-            return true;
-        }
-        if is_large_paste(text) {
-            match self.attachment_store.create_pasted_text(text) {
-                Ok(attachment) => {
-                    self.workbench
-                        .composer_draft_mut()
-                        .add_attachment(attachment);
-                    return true;
+    /// Turn a paste into attachments the composer can hold.
+    ///
+    /// Answered rather than staged, because a paste is the reader waiting on one
+    /// action and the composer is where it lands. Files come as a list, so this
+    /// answers with however many the clipboard held.
+    pub(crate) fn attachments_for(&mut self, paste: pi_whim_gpui::chat::Paste) -> Vec<Attachment> {
+        let created = match paste {
+            pi_whim_gpui::chat::Paste::Files(paths) => {
+                let mut attachments = Vec::new();
+                for path in paths {
+                    match attachment_from_path(Path::new(&path), false) {
+                        Ok(attachment) => attachments.push(attachment),
+                        // One unreadable path does not spoil the rest of a
+                        // multi-file paste.
+                        Err(error) => self.notices.error(error),
+                    }
                 }
-                Err(error) => self.notices.error(error),
+                return attachments;
+            }
+            pi_whim_gpui::chat::Paste::Image { extension, bytes } => self
+                .attachment_store
+                .create_pasted_encoded_image(&extension, &bytes),
+            pi_whim_gpui::chat::Paste::LongText(text) => {
+                self.attachment_store.create_pasted_text(&text)
+            }
+            // The composer resolves this one itself by inserting the text, so it
+            // is never reported as a request.
+            pi_whim_gpui::chat::Paste::Insert => {
+                unreachable!("the composer inserts rather than attaching")
+            }
+        };
+        match created {
+            Ok(attachment) => vec![attachment],
+            Err(error) => {
+                self.notices.error(error);
+                Vec::new()
             }
         }
-        false
+    }
+
+    /// Attachments a file dialog produced, bound for the composer.
+    pub(crate) fn take_attachments(&mut self) -> Vec<Attachment> {
+        std::mem::take(&mut self.attached)
     }
 
     fn submit_prompt(&mut self, content: String, attachments: Vec<Attachment>, mode: SubmitMode) {
@@ -1441,7 +1510,6 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 .map(|session| session.turn.conversation_compacted)
                 .unwrap_or(true)
             && self
-                .workbench
                 .state()
                 .conversation
                 .iter()
@@ -1528,7 +1596,6 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             return;
         }
         let Some(user_message) = self
-            .workbench
             .state()
             .conversation
             .iter()
@@ -1548,11 +1615,11 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         }
     }
 
-    /// Drain every session process. Events from the visible session update the
+    /// Take one batch off the pump. Events from the visible session update the
     /// conversation view; background sessions only update bookkeeping (busy
     /// dots, sidebar titles) so their progress survives until they are shown.
-    fn consume_runtime_events(&mut self) {
-        for (token, event) in self.sessions.drain_events() {
+    pub(crate) fn handle_deliveries(&mut self, batch: Vec<Delivery>) {
+        for (token, event) in batch {
             // The key is resolved now rather than when the event was sent: a
             // session is re-keyed as soon as Pi reports its transcript path, and
             // events sent before that would otherwise name a key that has gone.
@@ -1569,10 +1636,12 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         match event {
             RuntimeEvent::Agent(value) => self.apply_agent_event(key, value),
             RuntimeEvent::ExtensionUi(value) => {
-                self.prompts.push_extension(key, &value);
+                self.prompts
+                    .extend(dialogs::Prompt::from_extension(key, &value));
             }
             RuntimeEvent::Interaction(value) => {
-                self.prompts.push_interaction(key, &value);
+                self.prompts
+                    .extend(dialogs::Prompt::from_interaction(key, &value));
             }
             RuntimeEvent::Stderr(message) => {
                 if is_active && !message.trim().is_empty() {
@@ -1590,7 +1659,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 self.sessions.remove(key);
                 // Nothing is left to answer, and a dialog still up would ask the
                 // reader to unblock a process that has gone.
-                self.prompts.forget_session(key);
+                self.closed.push(key.to_owned());
                 self.apply(Action::SessionRunning {
                     path: key.to_owned(),
                     running: false,
@@ -1706,43 +1775,6 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         }
     }
 
-    /// The one chooser both asking protocols share.
-    ///
-    /// What a request means is read in `engine::dialogs`; what stays here is the
-    /// window and routing the answer back to the session that asked, which may
-    /// be running in the background.
-    fn prompt_dialog(&mut self, context: &egui::Context) {
-        let Some(prompt) = self.prompts.current().cloned() else {
-            return;
-        };
-        let mut answer = None;
-        let mut open = true;
-        egui::Window::new(prompt.title.as_str())
-            .open(&mut open)
-            .collapsible(false)
-            .show(context, |ui| {
-                if !prompt.message.is_empty() {
-                    ui.label(prompt.message.as_str());
-                    ui.add_space(8.0);
-                }
-                ui.horizontal_wrapped(|ui| {
-                    for choice in &prompt.choices {
-                        if ui.button(choice.label.as_str()).clicked() {
-                            answer = Some(self.prompts.answer(&choice.value));
-                        }
-                    }
-                });
-            });
-        // Closing the window is an answer too: the agent is blocked waiting, and
-        // the prompt names the cautious one to send.
-        if !open && answer.is_none() {
-            answer = Some(self.prompts.dismiss());
-        }
-        if let Some(Some(answer)) = answer {
-            self.send_answer(answer);
-        }
-    }
-
     /// Carry a decision back over whichever channel asked.
     fn send_answer(&mut self, answer: dialogs::Answer) {
         let Some(session) = self.sessions.get(answer.session_key()) else {
@@ -1772,31 +1804,6 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             self.notices.error(error.to_string());
         }
     }
-
-    /// Show the oldest unread message, one at a time.
-    fn notice_window(&mut self, context: &egui::Context) {
-        if self.showing.is_none() {
-            self.showing = self.notices.take();
-        }
-        let Some(showing) = self.showing.clone() else {
-            return;
-        };
-        let title = if showing.is_error() {
-            "Pi-Whim error"
-        } else {
-            "Pi-Whim"
-        };
-        let mut open = true;
-        egui::Window::new(title)
-            .open(&mut open)
-            .collapsible(false)
-            .show(context, |ui| {
-                ui.label(showing.message.as_str());
-            });
-        if !open {
-            self.showing = None;
-        }
-    }
 }
 
 /// Pi accepts an environment reference here, keeping API keys out of models.json.
@@ -1808,6 +1815,7 @@ fn applescript_escape(value: &str) -> String {
 mod tests {
     use super::*;
     use pi_whim_core::ConversationItem;
+    use pi_whim_engine::session::is_large_paste;
     use pi_whim_runtime::FakeRuntime;
     use serde_json::json;
     use tempfile::TempDir;
@@ -1820,12 +1828,15 @@ mod tests {
         // every start and command across all session processes.
         let factory_runtime = runtime;
         PiWhimApplication {
-            workbench: Workbench::default(),
+            engine: EngineState::new(),
             store: Some(SqliteStore::open(directory.path().join("test.sqlite")).unwrap()),
             secrets: MacosKeychainStore::default(),
             runtime_factory: Box::new(move || factory_runtime.clone()),
             sessions: SessionPool::new(),
-            prompts: dialogs::Queue::new(),
+            prompts: Vec::new(),
+            closed: Vec::new(),
+            attached: Vec::new(),
+            clipboard: None,
             capability_resolver: ModelCapabilityResolver::new(
                 &pi_whim_catalog::SharedCatalog::default(),
                 false,
@@ -1833,10 +1844,7 @@ mod tests {
             sessions_root_override: Some(directory.path().join("sessions")),
             agent_directory_override: Some(directory.path().join("agent")),
             attachment_store: AttachmentStore::open(directory.path().join("attachments")).unwrap(),
-            finder_paste_monitor: None,
-            finder_paste_monitor_install_pending: false,
             notices: notice::Outbox::new(),
-            showing: None,
             control_updates: crossbeam_channel::unbounded(),
         }
     }
@@ -1856,8 +1864,7 @@ mod tests {
     fn start_test_session(app: &mut PiWhimApplication<FakeRuntime>, directory: &TempDir) {
         let project = project("test", directory.path());
         app.store.as_ref().unwrap().save_project(&project).unwrap();
-        app.workbench
-            .apply(Action::ProjectsLoaded(vec![project.clone()]));
+        app.apply(Action::ProjectsLoaded(vec![project.clone()]));
         app.start_new_session(project.id);
         assert!(app.sessions.active_key().is_some());
     }
@@ -1874,8 +1881,7 @@ mod tests {
         fs::create_dir_all(&second.path).unwrap();
         app.store.as_ref().unwrap().save_project(&first).unwrap();
         app.store.as_ref().unwrap().save_project(&second).unwrap();
-        app.workbench
-            .apply(Action::ProjectsLoaded(vec![first.clone(), second.clone()]));
+        app.apply(Action::ProjectsLoaded(vec![first.clone(), second.clone()]));
 
         app.start_new_session(first.id);
         assert_eq!(observer.starts().len(), 1);
@@ -1884,19 +1890,18 @@ mod tests {
         app.start_new_session(first.id);
         assert_eq!(observer.starts().len(), 1);
 
-        app.workbench
-            .apply(Action::UpsertConversation(ConversationItem {
-                id: "user-1".into(),
-                role: ConversationRole::User,
-                full_text: "hello".into(),
-                streaming: false,
-                tool_name: None,
-                tool_report: None,
-                tool_details: None,
-                is_error: false,
-                model: None,
-                attachments: Vec::new(),
-            }));
+        app.apply(Action::UpsertConversation(ConversationItem {
+            id: "user-1".into(),
+            role: ConversationRole::User,
+            full_text: "hello".into(),
+            streaming: false,
+            tool_name: None,
+            tool_report: None,
+            tool_details: None,
+            is_error: false,
+            model: None,
+            attachments: Vec::new(),
+        }));
         app.start_new_session(first.id);
         assert_eq!(observer.starts().len(), 2);
 
@@ -1922,7 +1927,7 @@ mod tests {
         let observer = runtime.clone();
         let mut app = test_application(&directory, runtime);
         start_test_session(&mut app, &directory);
-        let project_id = app.workbench.state().selected_project.unwrap();
+        let project_id = app.state().selected_project.unwrap();
         let running_key = app.sessions.active_key().unwrap().to_owned();
 
         // Session A starts streaming.
@@ -1996,9 +2001,9 @@ mod tests {
         );
         app.settle_control_updates();
 
-        assert_eq!(app.workbench.state().thinking_level, ThinkingLevel::Off);
+        assert_eq!(app.state().thinking_level, ThinkingLevel::Off);
         assert_eq!(
-            app.workbench.state().available_thinking_levels,
+            app.state().available_thinking_levels,
             vec![ThinkingLevel::Off, ThinkingLevel::Low, ThinkingLevel::High]
         );
         let recorded_commands = observer.commands();
@@ -2035,10 +2040,7 @@ mod tests {
 
         // Switch is deferred: the pending model is recorded but no set_model
         // RPC is sent until the next prompt triggers compaction.
-        assert_eq!(
-            app.workbench.state().pending_model.as_ref().unwrap().id,
-            "model-b"
-        );
+        assert_eq!(app.state().pending_model.as_ref().unwrap().id, "model-b");
         assert!(
             observer
                 .commands()
@@ -2054,8 +2056,7 @@ mod tests {
         let observer = runtime.clone();
         let mut app = test_application(&directory, runtime);
         start_test_session(&mut app, &directory);
-        app.workbench
-            .apply(Action::SetSessionStatus(SessionStatus::Ready));
+        app.apply(Action::SetSessionStatus(SessionStatus::Ready));
         let attachment_path = directory.path().join("notes.txt");
         fs::write(&attachment_path, "notes").unwrap();
         let attachment = attachment_from_path(&attachment_path, false).unwrap();
@@ -2098,7 +2099,7 @@ mod tests {
         app.set_auto_compaction(false);
         app.settle_control_updates();
 
-        assert!(!app.workbench.state().auto_compaction_enabled);
+        assert!(!app.state().auto_compaction_enabled);
         let command = observer
             .commands()
             .into_iter()
@@ -2130,7 +2131,7 @@ mod tests {
         let project = project("test", directory.path());
         let project_id = project.id;
         app.store.as_ref().unwrap().save_project(&project).unwrap();
-        app.workbench.apply(Action::ProjectsLoaded(vec![project]));
+        app.apply(Action::ProjectsLoaded(vec![project]));
         let session_path = "/sessions/agent-model-b.jsonl";
 
         app.switch_session(project_id, session_path.into());
@@ -2143,8 +2144,7 @@ mod tests {
             Some(session_path)
         );
         assert_eq!(
-            app.workbench
-                .state()
+            app.state()
                 .current_model
                 .as_ref()
                 .map(|model| (model.provider.clone(), model.id.clone())),

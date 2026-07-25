@@ -18,6 +18,7 @@ use gpui_component::{
     // Aliased because this module's own `Paste` is the classification, and the
     // action is the keystroke that produces one.
     input::{Input, InputEvent, InputState, Paste as PasteAction},
+    menu::{DropdownMenu, PopupMenuItem},
 };
 use pi_whim_core::{Attachment, SubmitMode};
 use pi_whim_engine::composer::Composer as Draft;
@@ -55,6 +56,12 @@ pub enum ComposerEvent {
     /// Reported rather than handled: writing it needs the attachment store, which
     /// this crate does not own.
     AttachPaste(Paste),
+    /// Ask for something on disk to attach.
+    ///
+    /// Two kinds because a folder is attached whole — the model is handed the
+    /// directory and reads what it needs — and a file picker that also accepted
+    /// directories would make "one file inside" and "the folder" the same gesture.
+    PickAttachments { directories: bool },
 }
 
 /// The prompt input, its attachments, and the send controls.
@@ -264,6 +271,30 @@ impl Render for Composer {
                 .on_click(cx.listener(|composer, _, window, cx| composer.submit(window, cx)))
         };
 
+        // The only way to attach from disk. A paste covers the common case, but a
+        // file the reader has not copied still has to be reachable, and the egui
+        // build's menu on the same "+" is where they will look for it.
+        let attach = Button::new("attach")
+            .ghost()
+            .icon(icons::add())
+            .xsmall()
+            .tooltip("Attach files or a folder")
+            .dropdown_menu({
+                let composer = cx.entity();
+                move |menu, _, _| {
+                    [("Choose files…", false), ("Choose folder…", true)]
+                        .into_iter()
+                        .fold(menu, |menu, (label, directories)| {
+                            let composer = composer.clone();
+                            menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                                composer.update(cx, |_, cx| {
+                                    cx.emit(ComposerEvent::PickAttachments { directories });
+                                });
+                            }))
+                        })
+                }
+            });
+
         div()
             // Captured, not bubbled: an action reaches the focused element first
             // in the bubble phase, so by then the input would already have
@@ -308,7 +339,7 @@ impl Render for Composer {
             })
             // The action rides in the field's suffix slot, which the component
             // lays out inside the border and vertically centred.
-            .child(Input::new(&self.input).suffix(action))
+            .child(Input::new(&self.input).prefix(attach).suffix(action))
             .child(
                 div()
                     .text_size(px(text::LABEL_SIZE))

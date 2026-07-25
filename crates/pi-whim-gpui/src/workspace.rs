@@ -7,8 +7,8 @@
 use std::collections::BTreeSet;
 
 use gpui::{
-    AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render, Styled,
-    Window, div, prelude::FluentBuilder, px,
+    AppContext, Context, Entity, EventEmitter, InteractiveElement, IntoElement, ParentElement,
+    Render, Styled, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::theme::{Theme as ComponentTheme, ThemeMode as ComponentMode};
 use pi_whim_core::{
@@ -87,6 +87,13 @@ pub enum Request {
     /// Turn a paste into an attachment. Copied files need canonicalizing and
     /// pasted bytes need writing, both of which need the attachment store.
     AttachPaste(Paste),
+    /// Ask for files, or a folder, to attach.
+    ///
+    /// The picker is the platform's and blocks until it is answered, so it cannot
+    /// run where a view is being rendered.
+    PickAttachments {
+        directories: bool,
+    },
     /// Delete an attachment the app wrote, now that the draft has dropped it.
     ///
     /// Only for the generated ones — a pasted image, a long paste saved to a file.
@@ -143,6 +150,14 @@ pub enum Request {
     },
 }
 
+/// The shell reporting that it has something for the host to carry out.
+///
+/// A bare signal rather than the request itself: it is already on a queue the
+/// host drains, and carrying it in the event as well would give two paths to the
+/// same work. Notification is not enough on its own — the host answers by handing
+/// back a snapshot, which notifies again, and an observer would loop.
+pub struct RequestsRaised;
+
 /// The application shell.
 pub struct Workspace {
     preference: ThemePreference,
@@ -178,6 +193,8 @@ pub struct Workspace {
     /// Requests waiting for the backend owner to drain.
     requests: Vec<Request>,
 }
+
+impl EventEmitter<RequestsRaised> for Workspace {}
 
 impl Workspace {
     pub fn new(preference: ThemePreference, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -233,21 +250,20 @@ impl Workspace {
             let PromptEvent::Answered(answer) = event;
             // Straight through: the shell has no session pool, and an unanswered
             // question leaves the agent that asked it blocked.
-            workspace
-                .requests
-                .push(Request::AnswerPrompt(answer.clone()));
-            cx.notify();
+            workspace.request(Request::AnswerPrompt(answer.clone()), cx);
         })
         .detach();
 
         let rename = cx.new(|cx| Rename::new(tokens, window, cx));
         cx.subscribe(&rename, |workspace, _, event, cx| {
             let RenameEvent::Renamed { path, title } = event;
-            workspace.requests.push(Request::RenameSession {
-                path: path.clone(),
-                title: title.clone(),
-            });
-            cx.notify();
+            workspace.request(
+                Request::RenameSession {
+                    path: path.clone(),
+                    title: title.clone(),
+                },
+                cx,
+            );
         })
         .detach();
 
@@ -319,6 +335,17 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Queue something for the host, and tell it there is something to take.
+    ///
+    /// Every request goes through here so the signal cannot be forgotten at one
+    /// call site out of twenty-six — a queued request the host is never told about
+    /// waits until the next unrelated one arrives.
+    fn request(&mut self, request: Request, cx: &mut Context<Self>) {
+        self.requests.push(request);
+        cx.emit(RequestsRaised);
+        cx.notify();
+    }
+
     /// Take the requests the views have raised since the last drain.
     ///
     /// The app calls this; the shell does not know how they are carried out.
@@ -338,15 +365,15 @@ impl Workspace {
             // stores a project, the other launches a Pi session. Neither is
             // reachable until the shell is connected, so they are recorded as
             // requests rather than silently doing nothing.
-            SidebarEvent::AddProject => self.requests.push(Request::AddProject),
-            SidebarEvent::NewSession(id) => self.requests.push(Request::NewSession(id)),
+            SidebarEvent::AddProject => self.request(Request::AddProject, cx),
+            SidebarEvent::NewSession(id) => self.request(Request::NewSession(id), cx),
             SidebarEvent::ToggleProject(id) | SidebarEvent::OpenProject(id) => {
                 // Whether the rows are listed is view-local, so it is decided
                 // here; which project is selected is not, so it is asked for.
                 // Both from one click, because a header that expanded without
                 // selecting would leave the conversation on another project.
                 toggle_expanded(&mut self.expanded_projects, id);
-                self.requests.push(Request::OpenProject(id));
+                self.request(Request::OpenProject(id), cx);
             }
             SidebarEvent::OpenSession {
                 project_id,
@@ -356,21 +383,24 @@ impl Workspace {
                 // session is visible and the transcript has to be re-read, so a
                 // local select would move the sidebar while the conversation kept
                 // showing the previous session.
-                self.requests.push(Request::ActivateSession {
-                    project_id,
-                    path: pi_path,
-                });
+                self.request(
+                    Request::ActivateSession {
+                        project_id,
+                        path: pi_path,
+                    },
+                    cx,
+                );
             }
             // The rest of the row menu is the backend's: Finder, the store, the
             // clipboard, and the trash all sit behind the boundary this crate
             // does not cross.
-            SidebarEvent::RevealProject(id) => self.requests.push(Request::RevealProject(id)),
-            SidebarEvent::RemoveProject(id) => self.requests.push(Request::RemoveProject(id)),
-            SidebarEvent::CloneSession => self.requests.push(Request::CloneSession),
+            SidebarEvent::RevealProject(id) => self.request(Request::RevealProject(id), cx),
+            SidebarEvent::RemoveProject(id) => self.request(Request::RemoveProject(id), cx),
+            SidebarEvent::CloneSession => self.request(Request::CloneSession, cx),
             SidebarEvent::CopySessionId(id) => {
-                self.requests.push(Request::CopyToClipboard(id.to_string()))
+                self.request(Request::CopyToClipboard(id.to_string()), cx)
             }
-            SidebarEvent::DeleteSession(path) => self.requests.push(Request::DeleteSession(path)),
+            SidebarEvent::DeleteSession(path) => self.request(Request::DeleteSession(path), cx),
             SidebarEvent::RenameSession { pi_path, title } => {
                 self.rename.update(cx, |rename, cx| {
                     rename.open(pi_path, &title, window, cx);
@@ -397,19 +427,20 @@ impl Workspace {
                 // list arrives deduplicated. Showing it is the host's too: it
                 // puts the prompt in the conversation before sending, so the
                 // sent and the shown text cannot diverge.
-                self.requests.push(Request::SubmitPrompt {
-                    content,
-                    attachments,
-                    mode,
-                });
-                cx.notify();
+                self.request(
+                    Request::SubmitPrompt {
+                        content,
+                        attachments,
+                        mode,
+                    },
+                    cx,
+                );
             }
             ComposerEvent::Stop => {
                 // Requested, not applied: the status has to follow what the agent
                 // actually did. Setting it Ready here would show a stopped session
                 // while the process kept streaming.
-                self.requests.push(Request::Stop);
-                cx.notify();
+                self.request(Request::Stop, cx);
             }
             ComposerEvent::RemoveAttachment(path) => {
                 // The draft is view-local, so the row goes now. The file behind it
@@ -425,7 +456,7 @@ impl Workspace {
                     composer.remove_attachment(&path, cx);
                 });
                 if generated {
-                    self.requests.push(Request::DiscardAttachment(path));
+                    self.request(Request::DiscardAttachment(path), cx);
                 }
             }
             ComposerEvent::TextChanged(text) => {
@@ -440,7 +471,10 @@ impl Workspace {
                 // Straight through: the copied files have to be canonicalized and
                 // the pasted bytes written somewhere Pi can read them, and both
                 // need the store.
-                self.requests.push(Request::AttachPaste(paste));
+                self.request(Request::AttachPaste(paste), cx);
+            }
+            ComposerEvent::PickAttachments { directories } => {
+                self.request(Request::PickAttachments { directories }, cx);
             }
         }
     }
@@ -471,7 +505,7 @@ impl Workspace {
                 self.composer.update(cx, |composer, cx| {
                     composer.set_text("", window, cx);
                 });
-                self.requests.push(Request::RunCommand(command));
+                self.request(Request::RunCommand(command), cx);
             }
         }
         cx.notify();
@@ -482,27 +516,32 @@ impl Workspace {
     /// All three reach the agent over RPC, which lives behind `AgentRuntime`, so
     /// they queue as requests the same way the sidebar's do.
     fn handle_controls_event(&mut self, event: ControlsEvent, cx: &mut Context<Self>) {
+        // No `cx.notify()` at the end: every arm here is a request, and `request`
+        // notifies. The picker keeps showing the old value until the snapshot
+        // arrives, which is the point.
         match event {
             ControlsEvent::SetModel(model) => {
                 // The host records the choice as pending — a switch waits for the
                 // next prompt so the prior model compacts the history first — and
                 // the picker shows it when that snapshot comes back.
-                self.requests.push(Request::SetModel(model));
+                self.request(Request::SetModel(model), cx);
             }
             ControlsEvent::SetThinkingLevel(level) => {
-                self.requests.push(Request::SetThinkingLevel(level));
+                self.request(Request::SetThinkingLevel(level), cx);
             }
             ControlsEvent::SetQueueModes {
                 steering,
                 follow_up,
             } => {
-                self.requests.push(Request::SetQueueModes {
-                    steering,
-                    follow_up,
-                });
+                self.request(
+                    Request::SetQueueModes {
+                        steering,
+                        follow_up,
+                    },
+                    cx,
+                );
             }
         }
-        cx.notify();
     }
 
     /// Act on what the settings page reported.
@@ -522,8 +561,7 @@ impl Workspace {
         // needs is decided by one function rather than by six near-identical
         // arms — and that function is assertable without a window.
         if let Some(request) = preference_change(&event) {
-            self.requests.push(request);
-            cx.notify();
+            self.request(request, cx);
             return;
         }
 
@@ -570,25 +608,31 @@ impl Workspace {
             }
             SettingsEvent::DiscoverModels => {
                 let draft = self.settings.read(cx).provider_draft().clone();
-                self.requests.push(Request::DiscoverProviderModels {
-                    profile_id: draft.id,
-                    provider_name: draft.name.trim().to_owned(),
-                    base_url: draft.base_url.trim().to_owned(),
-                    protocol: draft.protocol,
-                    // Only what was typed: a stored key is looked up by the
-                    // backend, which is the only side that can read the keychain.
-                    api_key: draft.typed_api_key(),
-                });
+                self.request(
+                    Request::DiscoverProviderModels {
+                        profile_id: draft.id,
+                        provider_name: draft.name.trim().to_owned(),
+                        base_url: draft.base_url.trim().to_owned(),
+                        protocol: draft.protocol,
+                        // Only what was typed: a stored key is looked up by the
+                        // backend, which is the only side that can read the keychain.
+                        api_key: draft.typed_api_key(),
+                    },
+                    cx,
+                );
             }
             SettingsEvent::SaveProvider => {
                 let draft = self.settings.read(cx).provider_draft().clone();
-                self.requests.push(Request::SaveProvider {
-                    profile: draft.to_profile(now_ms()),
-                    api_key: draft.typed_api_key(),
-                });
+                self.request(
+                    Request::SaveProvider {
+                        profile: draft.to_profile(now_ms()),
+                        api_key: draft.typed_api_key(),
+                    },
+                    cx,
+                );
             }
             SettingsEvent::DeleteProvider(id) => {
-                self.requests.push(Request::DeleteProvider(id));
+                self.request(Request::DeleteProvider(id), cx);
                 self.settings
                     .update(cx, |settings, cx| settings.new_provider(window, cx));
             }
@@ -604,11 +648,11 @@ impl Workspace {
                 });
             }
             SettingsEvent::SaveSearchEngines(profiles) => {
-                self.requests.push(Request::SaveSearchEngines(profiles));
+                self.request(Request::SaveSearchEngines(profiles), cx);
             }
             SettingsEvent::SaveSearchEngine => {
                 let profiles = self.settings.read(cx).search_engines_with_draft();
-                self.requests.push(Request::SaveSearchEngines(profiles));
+                self.request(Request::SaveSearchEngines(profiles), cx);
             }
             SettingsEvent::TestSearchEngine => {
                 // Tested as it would be stored — trimmed URL, chosen protocol —
@@ -620,14 +664,14 @@ impl Workspace {
             }
             SettingsEvent::RemoveSearchEngine(index) => {
                 let profiles = self.settings.read(cx).search_engines_without(index);
-                self.requests.push(Request::SaveSearchEngines(profiles));
+                self.request(Request::SaveSearchEngines(profiles), cx);
                 self.settings.update(cx, |settings, cx| {
                     settings.clear_search_engine_draft(window, cx);
                 });
             }
             SettingsEvent::MoveSearchEngine { index, delta } => {
                 let profiles = self.settings.read(cx).search_engines_moved(index, delta);
-                self.requests.push(Request::SaveSearchEngines(profiles));
+                self.request(Request::SaveSearchEngines(profiles), cx);
             }
 
             // Handled above by `preference_change`, which returned `Some` for
@@ -1105,6 +1149,35 @@ mod tests {
                     workspace.take_requests().as_slice(),
                     [Request::SubmitPrompt { content, .. }] if content == "what changed?"
                 ));
+            })
+            .expect("the window is open");
+    }
+
+    #[gpui::test]
+    async fn attaching_from_disk_asks_for_the_picker(cx: &mut gpui::TestAppContext) {
+        // The platform picker blocks until it is answered, so it cannot open from
+        // a view. Files and folders travel as separate asks because a folder is
+        // attached whole rather than as the files inside it.
+        let shell = shell(cx);
+
+        shell
+            .update(cx, |workspace, _, cx| {
+                workspace.handle_composer_event(
+                    ComposerEvent::PickAttachments { directories: false },
+                    cx,
+                );
+                workspace.handle_composer_event(
+                    ComposerEvent::PickAttachments { directories: true },
+                    cx,
+                );
+
+                assert_eq!(
+                    workspace.take_requests(),
+                    vec![
+                        Request::PickAttachments { directories: false },
+                        Request::PickAttachments { directories: true },
+                    ]
+                );
             })
             .expect("the window is open");
     }

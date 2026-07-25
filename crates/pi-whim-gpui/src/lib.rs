@@ -20,7 +20,7 @@ pub mod theme;
 
 mod workspace;
 
-pub use workspace::{Request, Workspace};
+pub use workspace::{Request, RequestsRaised, Workspace};
 
 use gpui::{App, Bounds, WindowBounds, WindowOptions, px, size};
 use pi_whim_theme::ThemePreference;

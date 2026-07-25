@@ -10,6 +10,10 @@
 //! without freezing the window. The loop therefore alternates: block on a
 //! background thread, hand the batch back to the main thread, repeat.
 //!
+//! What travels on the channel is not fixed here. Session events are one stream;
+//! the answers to the control-state RPCs the host issues on worker threads are
+//! another, and both need the same "wait without a frame to wait in".
+//!
 //! The returned [`gpui::Task`] must be **stored**, not detached. Dropping a task
 //! cancels it, which is exactly the lifetime wanted: when the view that owns the
 //! pump goes away, the loop stops with it.
@@ -36,17 +40,17 @@ const BATCH: usize = 64;
 ///
 /// Taking a callback rather than an entity keeps this module free of any view
 /// type, so the pump can be tested and reused without one.
-pub type Handler<T> = fn(&mut T, Vec<Delivery>, &mut Window, &mut Context<T>);
+pub type Handler<T, I> = fn(&mut T, Vec<I>, &mut Window, &mut Context<T>);
 
 /// Start delivering `events` to `view` until the returned task is dropped.
 ///
 /// Blocks on a background thread and returns to the main thread with each batch,
 /// so a quiet app costs nothing and a busy one still yields between batches.
-pub fn spawn<T: 'static>(
-    events: crossbeam_channel::Receiver<Delivery>,
+pub fn spawn<T: 'static, I: Send + 'static>(
+    events: crossbeam_channel::Receiver<I>,
     window: &Window,
     cx: &mut Context<T>,
-    handle: Handler<T>,
+    handle: Handler<T, I>,
 ) -> Task<()> {
     cx.spawn_in(window, async move |view, cx| {
         pump(events, view, cx, handle).await;
@@ -54,11 +58,11 @@ pub fn spawn<T: 'static>(
 }
 
 /// Block, deliver, repeat.
-async fn pump<T: 'static>(
-    events: crossbeam_channel::Receiver<Delivery>,
+async fn pump<T: 'static, I: Send + 'static>(
+    events: crossbeam_channel::Receiver<I>,
     view: WeakEntity<T>,
     cx: &mut AsyncWindowContext,
-    handle: Handler<T>,
+    handle: Handler<T, I>,
 ) {
     loop {
         // The blocking wait happens here, on a thread that is allowed to block.
@@ -89,7 +93,7 @@ async fn pump<T: 'static>(
 ///
 /// Returns empty only on disconnect, which is the pump's signal to stop: an
 /// empty batch from a still-connected channel would spin.
-fn collect(events: &crossbeam_channel::Receiver<Delivery>, limit: usize) -> Vec<Delivery> {
+fn collect<I>(events: &crossbeam_channel::Receiver<I>, limit: usize) -> Vec<I> {
     let Ok(first) = events.recv() else {
         return Vec::new();
     };
