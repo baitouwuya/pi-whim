@@ -6,11 +6,11 @@
 //! ended up with.
 
 mod banner;
+mod metrics;
 mod status_pill;
-mod status_strip;
 mod top_bar;
 
 pub use banner::{Banner, Severity};
+pub use metrics::{SessionMeter, format_cost, format_tokens};
 pub use status_pill::{StatusPill, status_label};
-pub use status_strip::{StatusStrip, format_cost, format_tokens};
 pub use top_bar::TopBar;

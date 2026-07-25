@@ -20,7 +20,7 @@ use pi_whim_core::{AppState, ConversationItem, ConversationRole};
 use pi_whim_engine::typewriter::Typewriter;
 use pi_whim_theme::Tokens;
 
-use crate::{chat::MessageCard, theme::IntoHsla};
+use crate::chat::MessageCard;
 
 /// How far beyond the visible span to render, so scrolling does not flash blank.
 const OVERDRAW: f32 = 400.0;
@@ -166,15 +166,26 @@ pub fn visible_messages(state: &AppState) -> Vec<ConversationItem> {
 
 impl Render for Conversation {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let tokens = self.tokens;
         let entity = cx.entity();
 
-        div().flex_1().h_full().bg(tokens.bg_canvas.hsla()).child(
-            list(self.list.clone(), move |index, _window, cx| {
-                entity.read(cx).render_entry(index)
-            })
-            .flex_1(),
-        )
+        // No background: the graph paper the shell lays down behind everything
+        // shows through here, which is the whole point of it being at the root.
+        //
+        // The container has to be a flex box: `list` measures nothing itself, so
+        // outside a flex context `flex_1` does not apply and it lays out at zero
+        // height — a blank conversation with no error anywhere.
+        div()
+            .flex_1()
+            .h_full()
+            .flex()
+            .flex_col()
+            .min_h(px(0.0))
+            .child(
+                list(self.list.clone(), move |index, _window, cx| {
+                    entity.read(cx).render_entry(index)
+                })
+                .flex_1(),
+            )
     }
 }
 

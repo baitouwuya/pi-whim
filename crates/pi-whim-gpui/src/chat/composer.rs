@@ -11,7 +11,7 @@ use gpui::{
     ParentElement, Render, Styled, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::{
-    Icon,
+    Icon, Sizable,
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
 };
@@ -156,19 +156,22 @@ impl Render for Composer {
             .map(|attachment| attachment.name.clone())
             .collect();
 
-        // Icon plus label: this is the primary action, and the pair reads faster
-        // than either alone.
+        // Icon only, and inside the field: the glyph is unambiguous next to the
+        // text it acts on, and a labelled button below the input spent a whole
+        // row on a control Enter already reaches.
         let action = if self.busy {
             Button::new("stop")
                 .danger()
                 .icon(icons::stop())
-                .label("Stop")
+                .xsmall()
+                .tooltip("Stop the turn in flight")
                 .on_click(cx.listener(|_, _, _, cx| cx.emit(ComposerEvent::Stop)))
         } else {
             Button::new("send")
                 .primary()
                 .icon(icons::send())
-                .label("Send")
+                .xsmall()
+                .tooltip("Send · Enter")
                 .on_click(cx.listener(|composer, _, window, cx| composer.submit(window, cx)))
         };
 
@@ -200,20 +203,14 @@ impl Render for Composer {
                     }),
                 ))
             })
-            .child(Input::new(&self.input))
+            // The action rides in the field's suffix slot, which the component
+            // lays out inside the border and vertically centred.
+            .child(Input::new(&self.input).suffix(action))
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_size(px(text::LABEL_SIZE))
-                            .text_color(tokens.muted.hsla())
-                            .child("Enter to send · Shift+Enter for a newline"),
-                    )
-                    .child(action),
+                    .text_size(px(text::LABEL_SIZE))
+                    .text_color(tokens.muted.hsla())
+                    .child("Enter to send · Shift+Enter for a newline"),
             )
     }
 }

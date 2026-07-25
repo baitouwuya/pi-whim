@@ -9,13 +9,13 @@
 //! and is rendered muted rather than shown as markup.
 
 use gpui::{
-    AnyElement, App, IntoElement, ParentElement, RenderOnce, SharedString, Styled, Window, div,
-    prelude::FluentBuilder, px,
+    AnyElement, App, Hsla, IntoElement, ParentElement, RenderOnce, SharedString, Styled, Window,
+    div, prelude::FluentBuilder, px,
 };
 use gpui_component::{Icon, text::TextView};
 use pi_whim_core::{ConversationItem, ConversationRole};
 use pi_whim_engine::thinking::{Segment, split_thinking_segments};
-use pi_whim_theme::{Tokens, layout, text};
+use pi_whim_theme::{Rgba, Tokens, layout, text};
 
 use crate::{icons, theme::IntoHsla};
 
@@ -47,15 +47,21 @@ impl MessageCard {
         }
     }
 
-    /// How wide this entry's content may be.
+    /// The most this entry's content may span.
     ///
-    /// User prompts are held narrower than the column so the alternation between
-    /// asking and answering is legible without reading the text.
+    /// A ceiling, not a width: a short prompt hugs its text. Held narrower than
+    /// the column for a prompt so the alternation between asking and answering is
+    /// legible without reading the text.
     fn content_width(&self) -> f32 {
         match self.message.role {
             ConversationRole::User => layout::USER_MESSAGE_WIDTH,
             _ => layout::CHAT_CONTENT_WIDTH,
         }
+    }
+
+    /// Whether this entry shrinks to its text rather than filling the measure.
+    fn hugs_its_content(&self) -> bool {
+        matches!(self.message.role, ConversationRole::User)
     }
 
     /// Render assistant text, muting any reasoning it contains.
@@ -93,108 +99,131 @@ impl MessageCard {
     }
 }
 
+/// A card fill, flattened against the canvas it sits on.
+///
+/// pi.dev's surfaces are alpha steps over the page, which works there because the
+/// page behind them is flat. Here the canvas carries the graph paper, so a
+/// translucent fill lets the grid run straight through the text. Compositing
+/// against `bg_canvas` keeps the intended colour and stops the paper at the card's
+/// edge.
+fn opaque_over(fill: Rgba, tokens: Tokens) -> Hsla {
+    fill.over(tokens.bg_canvas).hsla()
+}
+
 impl RenderOnce for MessageCard {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
         let tokens = self.tokens;
         let width = self.content_width();
         let role = self.message.role.clone();
 
-        let body = div().w(px(width)).child(match role {
-            ConversationRole::User => div()
-                .p(px(10.0))
-                .bg(tokens.accent_surface_soft().hsla())
-                .border_1()
-                .border_color(tokens.accent_border_muted().hsla())
-                .text_color(tokens.text.hsla())
-                .child(self.visible_text.clone())
-                .into_any_element(),
+        // A prompt is a bubble, so it shrinks to its text; everything else fills
+        // the measure, because markdown and tool reports need a stable column to
+        // wrap against. `w(width)` for both would pad a three-word question out to
+        // 620px of empty fill.
+        let body = div()
+            .max_w(px(width))
+            .when(!self.hugs_its_content(), |this| this.w(px(width)))
+            .child(match role {
+                ConversationRole::User => div()
+                    .p(px(10.0))
+                    // Composited rather than translucent: a card sitting on the graph
+                    // paper would otherwise have the grid running through the text
+                    // behind it.
+                    .bg(opaque_over(tokens.accent_surface_soft(), tokens))
+                    .border_1()
+                    .border_color(tokens.accent_border_muted().hsla())
+                    .text_color(tokens.text.hsla())
+                    .child(self.visible_text.clone())
+                    .into_any_element(),
 
-            ConversationRole::Assistant => div()
-                .flex()
-                .flex_col()
-                .gap(px(8.0))
-                .children(self.assistant_body())
-                .into_any_element(),
-
-            ConversationRole::Tool => {
-                let name = self
-                    .message
-                    .tool_name
-                    .clone()
-                    .unwrap_or_else(|| "tool".to_owned());
-                let accent = if self.message.is_error {
-                    tokens.error
-                } else {
-                    tokens.accent
-                };
-                div()
+                ConversationRole::Assistant => div()
                     .flex()
                     .flex_col()
-                    .gap(px(4.0))
-                    .p(px(8.0))
-                    .bg(tokens.surface_tint().hsla())
-                    .border_1()
-                    .border_color(accent.alpha(0.25).hsla())
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(5.0))
-                            .when_some(icons::role(&ConversationRole::Tool), |this, icon| {
-                                this.child(Icon::new(icon).size(px(12.0)).text_color(accent.hsla()))
-                            })
-                            .child(
-                                div()
-                                    .text_size(px(text::LABEL_SIZE))
-                                    .text_color(accent.hsla())
-                                    .child(name),
-                            ),
-                    )
-                    .when_some(self.message.tool_report.clone(), |this, report| {
-                        this.child(
+                    .gap(px(8.0))
+                    .children(self.assistant_body())
+                    .into_any_element(),
+
+                ConversationRole::Tool => {
+                    let name = self
+                        .message
+                        .tool_name
+                        .clone()
+                        .unwrap_or_else(|| "tool".to_owned());
+                    let accent = if self.message.is_error {
+                        tokens.error
+                    } else {
+                        tokens.accent
+                    };
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.0))
+                        .p(px(8.0))
+                        .bg(opaque_over(tokens.surface_tint(), tokens))
+                        .border_1()
+                        .border_color(accent.alpha(0.25).hsla())
+                        .child(
                             div()
-                                .text_size(px(text::MONO_DETAIL_SIZE))
-                                .text_color(tokens.muted.hsla())
-                                .child(report),
+                                .flex()
+                                .items_center()
+                                .gap(px(5.0))
+                                .when_some(icons::role(&ConversationRole::Tool), |this, icon| {
+                                    this.child(
+                                        Icon::new(icon).size(px(12.0)).text_color(accent.hsla()),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .text_size(px(text::LABEL_SIZE))
+                                        .text_color(accent.hsla())
+                                        .child(name),
+                                ),
                         )
-                    })
-                    // Raw event data is a second level of detail, shown only when
-                    // asked for: it is diagnostic, not part of reading the
-                    // conversation.
-                    .when(self.expanded, |this| {
-                        this.when_some(self.message.tool_details.clone(), |this, details| {
+                        .when_some(self.message.tool_report.clone(), |this, report| {
                             this.child(
                                 div()
-                                    .p(px(6.0))
-                                    .bg(tokens.panel_soft.hsla())
                                     .text_size(px(text::MONO_DETAIL_SIZE))
                                     .text_color(tokens.muted.hsla())
-                                    .child(details),
+                                    .child(report),
                             )
                         })
-                    })
-                    .into_any_element()
-            }
+                        // Raw event data is a second level of detail, shown only when
+                        // asked for: it is diagnostic, not part of reading the
+                        // conversation.
+                        .when(self.expanded, |this| {
+                            this.when_some(self.message.tool_details.clone(), |this, details| {
+                                this.child(
+                                    div()
+                                        .p(px(6.0))
+                                        .bg(opaque_over(tokens.panel_soft, tokens))
+                                        .text_size(px(text::MONO_DETAIL_SIZE))
+                                        .text_color(tokens.muted.hsla())
+                                        .child(details),
+                                )
+                            })
+                        })
+                        .into_any_element()
+                }
 
-            ConversationRole::System => div()
-                .flex()
-                .items_center()
-                .gap(px(5.0))
-                .when_some(icons::role(&ConversationRole::System), |this, icon| {
-                    this.child(
-                        Icon::new(icon)
-                            .size(px(12.0))
-                            .text_color(tokens.muted.hsla()),
+                ConversationRole::System => div()
+                    .flex()
+                    .items_center()
+                    .gap(px(5.0))
+                    .when_some(icons::role(&ConversationRole::System), |this, icon| {
+                        this.child(
+                            Icon::new(icon)
+                                .size(px(12.0))
+                                .text_color(tokens.muted.hsla()),
+                        )
+                    })
+                    .child(
+                        div()
+                            .text_size(px(text::MONO_DETAIL_SIZE))
+                            .text_color(tokens.muted.hsla())
+                            .child(self.visible_text.clone()),
                     )
-                })
-                .child(
-                    div()
-                        .text_size(px(text::MONO_DETAIL_SIZE))
-                        .text_color(tokens.muted.hsla())
-                        .child(self.visible_text.clone()),
-                )
-                .into_any_element(),
-        });
+                    .into_any_element(),
+            });
 
         div()
             .w_full()
@@ -284,6 +313,38 @@ mod tests {
                 .assistant_body()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn a_prompt_hugs_its_text_while_a_reply_fills_the_measure() {
+        // A prompt bubble sized to the full 620px would pad a three-word question
+        // out with empty fill; a reply needs the stable column to wrap against.
+        assert!(card(ConversationRole::User, "hi").hugs_its_content());
+        assert!(!card(ConversationRole::Assistant, "hi").hugs_its_content());
+        assert!(!card(ConversationRole::Tool, "hi").hugs_its_content());
+        assert!(!card(ConversationRole::System, "hi").hugs_its_content());
+    }
+
+    #[test]
+    fn card_fills_are_opaque_so_the_grid_stops_at_their_edge() {
+        for tokens in [Tokens::light(), Tokens::dark()] {
+            for fill in [
+                tokens.accent_surface_soft(),
+                tokens.surface_tint(),
+                tokens.panel_soft,
+            ] {
+                assert_eq!(opaque_over(fill, tokens).a, 1.0);
+            }
+        }
+    }
+
+    #[test]
+    fn compositing_preserves_the_intended_tint() {
+        // Flattening must not turn the accent wash into plain canvas: the card
+        // still has to read as tinted, just without the paper showing through.
+        let tokens = Tokens::light();
+        let flattened = tokens.accent_surface_soft().over(tokens.bg_canvas);
+        assert_ne!(flattened.to_hexa(), tokens.bg_canvas.to_hexa());
     }
 
     #[test]

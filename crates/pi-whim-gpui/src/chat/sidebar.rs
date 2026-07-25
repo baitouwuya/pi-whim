@@ -9,9 +9,12 @@ use gpui::{
     SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
     uniform_list,
 };
-use gpui_component::Icon;
+use gpui_component::{
+    Icon, Sizable,
+    button::{Button, ButtonVariants},
+};
 use pi_whim_core::ProjectId;
-use pi_whim_theme::{Tokens, layout, radius, text};
+use pi_whim_theme::{Tokens, font, layout, radius, text};
 
 use crate::{chat::Row, icons, theme::IntoHsla};
 
@@ -26,10 +29,14 @@ const ICON_SIZE: f32 = 13.0;
 /// What the sidebar asks the shell to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SidebarEvent {
+    /// Add a project to the list, which means asking for a folder.
+    AddProject,
     /// Collapse or expand a project's sessions.
     ToggleProject(ProjectId),
     /// Show a project, starting or resuming a session for it.
     OpenProject(ProjectId),
+    /// Start a fresh session in a project.
+    NewSession(ProjectId),
     /// Show a specific session.
     OpenSession {
         project_id: ProjectId,
@@ -71,6 +78,41 @@ impl Sidebar {
 
     pub fn rows(&self) -> &[Row] {
         &self.rows
+    }
+
+    /// The header above the list: what this column is, and how to add to it.
+    ///
+    /// Adding a project is the only way into an empty app, so it is always
+    /// visible rather than hidden behind a hover or a menu.
+    fn render_header(&self, cx: &mut Context<Self>) -> AnyElement {
+        let tokens = self.tokens;
+        div()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .w_full()
+            .pl(px(10.0))
+            .pr(px(6.0))
+            .py(px(6.0))
+            .border_b_1()
+            .border_color(tokens.line.hsla())
+            .child(
+                div()
+                    .flex_1()
+                    .font_family(font::MONO)
+                    .text_size(px(text::LABEL_SIZE))
+                    .text_color(tokens.muted.hsla())
+                    .child("PROJECTS"),
+            )
+            .child(
+                Button::new("add-project")
+                    .ghost()
+                    .xsmall()
+                    .icon(icons::add())
+                    .tooltip("Add a project folder")
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::AddProject))),
+            )
+            .into_any_element()
     }
 
     fn render_row(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -119,8 +161,36 @@ impl Sidebar {
             },
         };
 
+        // A project header carries its own "new session" button, revealed on
+        // hover: one visible per project would be a column of plus signs down the
+        // sidebar, and the control is most discoverable where it acts.
+        let group = SharedString::from(format!("sidebar-row-{index}"));
+        let new_session = match row {
+            Row::Project { id, .. } => {
+                let id = *id;
+                let group = group.clone();
+                Some(
+                    Button::new(("new-session", index))
+                        .ghost()
+                        .xsmall()
+                        .icon(icons::add())
+                        .tooltip("New session in this project")
+                        .invisible()
+                        .group_hover(group, |this| this.visible())
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            // Without this the row's own handler also fires and
+                            // the click would toggle the project as well.
+                            cx.stop_propagation();
+                            cx.emit(SidebarEvent::NewSession(id));
+                        })),
+                )
+            }
+            Row::Session { .. } => None,
+        };
+
         div()
             .id(("sidebar-row", index))
+            .group(group)
             .flex()
             .items_center()
             .gap(px(6.0))
@@ -175,6 +245,7 @@ impl Sidebar {
                         .bg(tokens.accent.hsla()),
                 )
             })
+            .when_some(new_session, |this, button| this.child(button))
             .on_click(cx.listener(move |_, _, _, cx| {
                 cx.emit(event.clone());
             }))
@@ -196,6 +267,7 @@ impl Render for Sidebar {
             .bg(tokens.panel_soft.hsla())
             .border_r_1()
             .border_color(tokens.line.hsla())
+            .child(self.render_header(cx))
             .child(
                 uniform_list("sidebar", count, {
                     move |range, _window, cx| {
@@ -206,6 +278,18 @@ impl Render for Sidebar {
                 })
                 .flex_1(),
             )
+            // With no projects there is nothing to click but the plus, so say so
+            // rather than leaving an empty column.
+            .when(count == 0, |this| {
+                this.child(
+                    div()
+                        .px(px(10.0))
+                        .pb(px(10.0))
+                        .text_size(px(text::LABEL_SIZE))
+                        .text_color(tokens.muted.hsla())
+                        .child("Add a project folder to begin."),
+                )
+            })
     }
 }
 
@@ -220,6 +304,21 @@ mod tests {
         // uniform_list clips to the row height, so the label has to fit.
         assert!(ROW_HEIGHT > text::DETAIL_SIZE);
     };
+
+    #[test]
+    fn adding_a_project_names_no_project() {
+        // It cannot: the folder has not been picked yet. This is the one sidebar
+        // event that carries nothing.
+        assert_eq!(SidebarEvent::AddProject, SidebarEvent::AddProject);
+    }
+
+    #[test]
+    fn starting_a_session_is_distinct_from_opening_the_project() {
+        // Clicking a header resumes whatever session was last shown; the plus
+        // starts a fresh one. Conflating them would lose the distinction.
+        let id = uuid::Uuid::new_v4();
+        assert_ne!(SidebarEvent::NewSession(id), SidebarEvent::OpenProject(id));
+    }
 
     #[test]
     fn opening_a_session_carries_the_path_running_state_is_keyed_by() {

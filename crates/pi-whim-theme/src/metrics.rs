@@ -90,10 +90,16 @@ pub mod layout {
     pub const USER_MESSAGE_WIDTH: f32 = 620.0;
     /// Fixed sidebar width.
     pub const SIDEBAR_WIDTH: f32 = 260.0;
-    /// Spacing of the graph-paper grid.
-    pub const GRID_STEP: f32 = 28.0;
-    /// Every fourth grid line is drawn at major weight.
-    pub const GRID_MAJOR_EVERY: u32 = 4;
+    /// Spacing of the graph-paper grid's finest lines — pi.dev's `--grid-gap`.
+    pub const GRID_STEP: f32 = 4.0;
+    /// Every fifth line is drawn at major weight: pi.dev states the major
+    /// layer's tile as `calc(var(--grid-gap) * 5)`.
+    pub const GRID_MAJOR_EVERY: u32 = 5;
+    /// Length of a cross mark's arms, centred on a major intersection.
+    ///
+    /// pi.dev punches these through with a radial gradient of radius
+    /// `--grid-gap / 2`, so an arm reaches one step in each direction.
+    pub const GRID_CROSS_ARM: f32 = GRID_STEP;
 }
 
 /// Font families.

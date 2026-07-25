@@ -1,13 +1,18 @@
 //! Title row: what is running, and the controls that are always reachable.
 
 use gpui::{
-    App, ClickEvent, IntoElement, ParentElement, RenderOnce, Styled, Window, div, px, rems,
+    App, ClickEvent, IntoElement, ParentElement, RenderOnce, Styled, Window, div,
+    prelude::FluentBuilder, px, rems,
 };
 use gpui_component::button::{Button, ButtonVariants};
-use pi_whim_core::SessionStatus;
+use pi_whim_core::{SessionMetrics, SessionStatus};
 use pi_whim_theme::{ThemeMode, Tokens, text};
 
-use crate::{chrome::StatusPill, icons, theme::IntoHsla};
+use crate::{
+    chrome::{SessionMeter, StatusPill},
+    icons,
+    theme::IntoHsla,
+};
 
 /// A click handler a caller can hand to a chrome control.
 type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
@@ -18,6 +23,8 @@ pub struct TopBar {
     status: SessionStatus,
     mode: ThemeMode,
     tokens: Tokens,
+    /// What the visible session has cost, once it has reported anything.
+    meter: Option<SessionMeter>,
     on_toggle_theme: Option<ClickHandler>,
     on_open_settings: Option<ClickHandler>,
 }
@@ -28,9 +35,19 @@ impl TopBar {
             status,
             mode,
             tokens,
+            meter: None,
             on_toggle_theme: None,
             on_open_settings: None,
         }
+    }
+
+    /// Show the session's cost and token counts beside the status.
+    ///
+    /// These used to occupy a strip along the bottom of the window, which spent a
+    /// whole row of chrome and a border on four short figures.
+    pub fn metrics(mut self, metrics: Option<&SessionMetrics>) -> Self {
+        self.meter = SessionMeter::from_metrics(metrics, self.tokens);
+        self
     }
 
     pub fn on_toggle_theme(
@@ -98,6 +115,7 @@ impl RenderOnce for TopBar {
             .child(StatusPill::new(self.status, tokens))
             // Push the controls to the trailing edge.
             .child(div().flex_1())
+            .when_some(self.meter, |this, meter| this.child(meter))
             .child(theme_button)
             .child(settings_button)
     }

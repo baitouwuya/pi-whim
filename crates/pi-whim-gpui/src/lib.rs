@@ -10,13 +10,14 @@
 
 pub mod chat;
 pub mod chrome;
+pub mod elements;
 pub mod fonts;
 pub mod icons;
 pub mod theme;
 
 mod workspace;
 
-pub use workspace::Workspace;
+pub use workspace::{Request, Workspace};
 
 use gpui::{App, Bounds, WindowBounds, WindowOptions, px, size};
 use pi_whim_theme::ThemePreference;

@@ -20,9 +20,25 @@ use pi_whim_theme::{ThemeMode, ThemePreference, Tokens, text};
 
 use crate::{
     chat::{self, Composer, ComposerEvent, Conversation, ConversationEvent, Sidebar, SidebarEvent},
-    chrome::{Banner, StatusStrip, TopBar},
+    chrome::{Banner, TopBar},
+    elements::GraphPaper,
     theme::IntoHsla,
 };
+
+/// Something the shell cannot do itself, queued for whoever owns the backend.
+///
+/// Adding a project opens a folder picker and writes to the store; starting a
+/// session launches a Pi process. Both live behind `AgentRuntime`, which this
+/// crate deliberately does not depend on, so the views record the request and the
+/// app drains it. This is the same pull model the egui build used for `UiIntent`,
+/// kept only for the actions that genuinely cross the boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Request {
+    /// Ask for a folder, and add it as a project.
+    AddProject,
+    /// Start a fresh session in a project.
+    NewSession(ProjectId),
+}
 
 /// The application shell.
 pub struct Workspace {
@@ -35,6 +51,8 @@ pub struct Workspace {
     /// Projects whose sessions are listed. View-local: which projects a reader
     /// has open says nothing about the session.
     expanded_projects: BTreeSet<ProjectId>,
+    /// Requests waiting for the backend owner to drain.
+    requests: Vec<Request>,
 }
 
 impl Workspace {
@@ -79,12 +97,29 @@ impl Workspace {
             conversation,
             composer,
             expanded_projects: BTreeSet::new(),
+            requests: Vec::new(),
         }
+    }
+
+    /// Take the requests the views have raised since the last drain.
+    ///
+    /// The app calls this; the shell does not know how they are carried out.
+    pub fn take_requests(&mut self) -> Vec<Request> {
+        std::mem::take(&mut self.requests)
     }
 
     /// Act on what the sidebar reported, and refresh its rows.
     fn handle_sidebar_event(&mut self, event: SidebarEvent, cx: &mut Context<Self>) {
         match event {
+            // Both of these need the backend: one opens a folder picker and
+            // stores a project, the other launches a Pi session. Neither is
+            // reachable until the shell is connected, so they are recorded as
+            // requests rather than silently doing nothing.
+            SidebarEvent::AddProject => self.requests.push(Request::AddProject),
+            SidebarEvent::NewSession(id) => {
+                self.engine.apply(Action::SelectProject(id));
+                self.requests.push(Request::NewSession(id));
+            }
             SidebarEvent::ToggleProject(id) | SidebarEvent::OpenProject(id) => {
                 // Selecting a project also toggles whether its sessions show,
                 // so one click on a header does the obvious thing.
@@ -275,41 +310,52 @@ impl Render for Workspace {
 
         div()
             .size_full()
-            .flex()
-            .flex_col()
+            // pi.dev fixes its graph paper to the page and lets the panels sit
+            // over it translucently, so it belongs here rather than inside any
+            // one pane. This box is the containing block it positions against.
+            .relative()
             .bg(tokens.bg_canvas.hsla())
-            .text_color(tokens.text.hsla())
-            .text_size(px(text::BODY_SIZE))
-            .child(
-                TopBar::new(status.clone(), tokens.mode, tokens)
-                    .on_toggle_theme(cx.listener(|workspace, _, window, cx| {
-                        workspace.toggle_theme(window, cx);
-                    }))
-                    .on_open_settings(cx.listener(|_, _, _, _| {
-                        // The settings page lands in a later change.
-                    })),
-            )
-            .when_some(banner_for(&status, tokens), |this, banner| {
-                this.child(banner)
-            })
-            // The conversation and sidebar fill whatever the chrome leaves.
+            .child(GraphPaper::new(tokens))
             .child(
                 div()
-                    .flex_1()
+                    .relative()
+                    .size_full()
                     .flex()
-                    .min_h(px(0.0))
-                    .child(self.sidebar.clone())
+                    .flex_col()
+                    .text_color(tokens.text.hsla())
+                    .text_size(px(text::BODY_SIZE))
+                    .child(
+                        TopBar::new(status.clone(), tokens.mode, tokens)
+                            .metrics(state.session_metrics.as_ref())
+                            .on_toggle_theme(cx.listener(|workspace, _, window, cx| {
+                                workspace.toggle_theme(window, cx);
+                            }))
+                            .on_open_settings(cx.listener(|_, _, _, _| {
+                                // The settings page lands in a later change.
+                            })),
+                    )
+                    .when_some(banner_for(&status, tokens), |this, banner| {
+                        this.child(banner)
+                    })
+                    // The conversation and sidebar fill whatever the chrome
+                    // leaves.
                     .child(
                         div()
                             .flex_1()
                             .flex()
-                            .flex_col()
-                            .min_w(px(0.0))
-                            .child(self.conversation.clone())
-                            .child(self.composer.clone()),
+                            .min_h(px(0.0))
+                            .child(self.sidebar.clone())
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .flex()
+                                    .flex_col()
+                                    .min_w(px(0.0))
+                                    .child(self.conversation.clone())
+                                    .child(self.composer.clone()),
+                            ),
                     ),
             )
-            .child(StatusStrip::from_state(self.engine.get(), tokens))
     }
 }
 
