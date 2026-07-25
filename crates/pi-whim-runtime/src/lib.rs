@@ -53,6 +53,27 @@ pub enum RuntimeEvent {
     Error(String),
 }
 
+/// Issues commands to a running agent from any thread.
+///
+/// `AgentRuntime` is `Send` but not `Sync`, so it cannot be shared with a
+/// worker. The parts needed to make a request are shareable, though, and this
+/// hands out just those — which is what lets the app fetch runtime state
+/// without blocking the frame it is drawing.
+/// The RPC client is `Send + Sync`, so it can serve as its own commander.
+impl RuntimeCommander for PiRpcClient {
+    fn command(&self, command: Value) -> Result<Value, RuntimeError> {
+        let response = self.request(command, COMMAND_TIMEOUT)?;
+        Ok(response.data.unwrap_or(Value::Null))
+    }
+}
+
+/// How long a command waits for Pi to answer.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
+
+pub trait RuntimeCommander: Send + Sync {
+    fn command(&self, command: Value) -> Result<Value, RuntimeError>;
+}
+
 pub trait AgentRuntime: Send {
     fn start(&mut self, config: RuntimeStart) -> Result<(), RuntimeError>;
     fn send_prompt(
@@ -69,6 +90,9 @@ pub trait AgentRuntime: Send {
         decision: String,
     ) -> Result<Value, RuntimeError>;
     fn events(&self) -> Receiver<RuntimeEvent>;
+    /// A handle for issuing commands off the calling thread, if the agent is
+    /// running.
+    fn commander(&self) -> Option<Arc<dyn RuntimeCommander>>;
     fn stop(&mut self) -> Result<(), RuntimeError>;
     fn generation(&self) -> u64;
 }
@@ -264,7 +288,7 @@ impl AgentRuntime for PiRpcRuntime {
             .client
             .as_ref()
             .ok_or(RpcError::Unavailable)?
-            .request(command, Duration::from_secs(20))?;
+            .request(command, COMMAND_TIMEOUT)?;
         Ok(response.data.unwrap_or(Value::Null))
     }
 
@@ -298,6 +322,12 @@ impl AgentRuntime for PiRpcRuntime {
 
     fn events(&self) -> Receiver<RuntimeEvent> {
         self.event_receiver.clone()
+    }
+
+    fn commander(&self) -> Option<Arc<dyn RuntimeCommander>> {
+        self.client
+            .as_ref()
+            .map(|client| client.clone() as Arc<dyn RuntimeCommander>)
     }
 
     fn stop(&mut self) -> Result<(), RuntimeError> {
@@ -362,6 +392,12 @@ impl Default for FakeRuntime {
 }
 
 impl FakeRuntime {
+    fn fake_commander(&self) -> FakeCommander {
+        FakeCommander {
+            commands: self.commands.clone(),
+            responses: self.responses.clone(),
+        }
+    }
     pub fn commands(&self) -> Vec<Value> {
         self.commands.lock().expect("fake runtime commands").clone()
     }
@@ -375,6 +411,47 @@ impl FakeRuntime {
             .lock()
             .expect("fake runtime responses")
             .insert(command_type.to_owned(), response);
+    }
+}
+
+/// Shared recording state behind a [`FakeRuntime`], so tests can issue commands
+/// from a worker exactly as the real client allows.
+#[derive(Clone, Default)]
+pub struct FakeCommander {
+    commands: Arc<Mutex<Vec<Value>>>,
+    responses: Arc<Mutex<HashMap<String, Value>>>,
+}
+
+impl RuntimeCommander for FakeCommander {
+    fn command(&self, command: Value) -> Result<Value, RuntimeError> {
+        let command_type = command
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        self.commands
+            .lock()
+            .expect("fake runtime commands")
+            .push(command);
+        Ok(self
+            .responses
+            .lock()
+            .expect("fake runtime responses")
+            .get(&command_type)
+            .cloned()
+            .unwrap_or_else(|| default_response(&command_type)))
+    }
+}
+
+/// Stand-in responses for the commands the app issues on every refresh, so a
+/// test that does not care about them need not stub each one.
+fn default_response(command_type: &str) -> Value {
+    match command_type {
+        "get_state" => json!({}),
+        "get_available_models" => json!({"models": []}),
+        "get_available_thinking_levels" => json!({"levels": ["off"]}),
+        "get_session_stats" => json!({}),
+        _ => Value::Null,
     }
 }
 
@@ -397,28 +474,7 @@ impl AgentRuntime for FakeRuntime {
         Ok(())
     }
     fn command(&self, command: Value) -> Result<Value, RuntimeError> {
-        let command_type = command
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-        self.commands
-            .lock()
-            .expect("fake runtime commands")
-            .push(command);
-        Ok(self
-            .responses
-            .lock()
-            .expect("fake runtime responses")
-            .get(&command_type)
-            .cloned()
-            .unwrap_or_else(|| match command_type.as_str() {
-                "get_state" => json!({}),
-                "get_available_models" => json!({"models": []}),
-                "get_available_thinking_levels" => json!({"levels": ["off"]}),
-                "get_session_stats" => json!({}),
-                _ => Value::Null,
-            }))
+        self.fake_commander().command(command)
     }
     fn send(&self, command: Value) -> Result<(), RuntimeError> {
         self.commands
@@ -448,6 +504,10 @@ impl AgentRuntime for FakeRuntime {
     }
     fn events(&self) -> Receiver<RuntimeEvent> {
         self.receiver.clone()
+    }
+
+    fn commander(&self) -> Option<Arc<dyn RuntimeCommander>> {
+        Some(Arc::new(self.fake_commander()))
     }
     fn stop(&mut self) -> Result<(), RuntimeError> {
         Ok(())
