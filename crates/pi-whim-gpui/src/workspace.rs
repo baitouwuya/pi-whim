@@ -545,6 +545,11 @@ impl Workspace {
         match event {
             SettingsEvent::Close => {
                 self.showing_settings = false;
+                // Focus goes back to the prompt, not to whatever the settings
+                // page left it on: the field it was in is no longer rendered, and
+                // focus on an absent element means the next keystroke reaches
+                // nothing at all.
+                self.focus_composer(window, cx);
             }
             SettingsEvent::Show(section) => {
                 self.settings

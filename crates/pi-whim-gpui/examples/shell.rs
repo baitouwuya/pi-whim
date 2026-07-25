@@ -136,15 +136,30 @@ fn main() {
         pi_whim_gpui::init(ThemePreference::default(), cx).expect("bundled fonts should load");
 
         let options = pi_whim_gpui::window_options(cx);
-        cx.open_window(options, |window, cx| {
-            let workspace = cx.new(|cx| {
-                let mut workspace = Workspace::new(ThemePreference::default(), window, cx);
-                seed(&mut workspace, window, cx);
-                workspace
-            });
-            cx.new(|cx| Root::new(workspace, window, cx))
-        })
-        .expect("window should open");
+        // Kept at the call site because `Root` erases what it wraps, and focusing
+        // needs the workspace itself.
+        let mut shell = None;
+        let window = cx
+            .open_window(options, |window, cx| {
+                let workspace = cx.new(|cx| {
+                    let mut workspace = Workspace::new(ThemePreference::default(), window, cx);
+                    seed(&mut workspace, window, cx);
+                    workspace
+                });
+                shell = Some(workspace.clone());
+                cx.new(|cx| Root::new(workspace, window, cx))
+            })
+            .expect("window should open");
+
+        // After open rather than during construction: focusing paints, and there
+        // is nothing to paint into until the window exists. Without this the first
+        // keystroke goes nowhere until the field is clicked.
+        let shell = shell.expect("the window builder ran");
+        window
+            .update(cx, |_, window, cx| {
+                shell.update(cx, |workspace, cx| workspace.focus_composer(window, cx));
+            })
+            .expect("the window is open");
 
         cx.activate(true);
     });
