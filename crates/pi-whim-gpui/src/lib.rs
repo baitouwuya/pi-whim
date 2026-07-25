@@ -8,6 +8,7 @@
 //! on one struct, which is what keeps this crate from growing into the single
 //! 3.5k-line file the egui build ended up with.
 
+pub mod chat;
 pub mod chrome;
 pub mod fonts;
 pub mod theme;

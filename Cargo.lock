@@ -5670,6 +5670,7 @@ dependencies = [
  "pi-whim-core",
  "pi-whim-engine",
  "pi-whim-theme",
+ "uuid",
 ]
 
 [[package]]

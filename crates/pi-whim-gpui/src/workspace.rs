@@ -4,15 +4,19 @@
 //! the space the conversation and sidebar will fill. Those two, along with the
 //! settings page, land as their own modules.
 
+use std::collections::BTreeSet;
+
 use gpui::{
-    Context, IntoElement, ParentElement, Render, Styled, Window, div, prelude::FluentBuilder, px,
+    AppContext, Context, Entity, IntoElement, ParentElement, Render, Styled, Window, div,
+    prelude::FluentBuilder, px,
 };
 use gpui_component::theme::{Theme as ComponentTheme, ThemeMode as ComponentMode};
-use pi_whim_core::{Action, AppState, SessionStatus};
+use pi_whim_core::{Action, AppState, ProjectId, SessionStatus, stable_session_id};
 use pi_whim_engine::state::EngineState;
-use pi_whim_theme::{ThemeMode, ThemePreference, Tokens, layout, text};
+use pi_whim_theme::{ThemeMode, ThemePreference, Tokens, text};
 
 use crate::{
+    chat::{self, Sidebar, SidebarEvent},
     chrome::{Banner, StatusStrip, TopBar},
     theme::IntoHsla,
 };
@@ -22,6 +26,10 @@ pub struct Workspace {
     preference: ThemePreference,
     tokens: Tokens,
     engine: EngineState,
+    sidebar: Entity<Sidebar>,
+    /// Projects whose sessions are listed. View-local: which projects a reader
+    /// has open says nothing about the session.
+    expanded_projects: BTreeSet<ProjectId>,
 }
 
 impl Workspace {
@@ -31,11 +39,52 @@ impl Workspace {
         } else {
             ThemeMode::Light
         };
+        let tokens = Tokens::new(mode);
+        let sidebar = cx.new(|_| Sidebar::new(tokens));
+        cx.subscribe(&sidebar, |workspace, _, event, cx| {
+            workspace.handle_sidebar_event(event.clone(), cx);
+        })
+        .detach();
+
         Self {
             preference,
-            tokens: Tokens::new(mode),
+            tokens,
             engine: EngineState::new(),
+            sidebar,
+            expanded_projects: BTreeSet::new(),
         }
+    }
+
+    /// Act on what the sidebar reported, and refresh its rows.
+    fn handle_sidebar_event(&mut self, event: SidebarEvent, cx: &mut Context<Self>) {
+        match event {
+            SidebarEvent::ToggleProject(id) | SidebarEvent::OpenProject(id) => {
+                // Selecting a project also toggles whether its sessions show,
+                // so one click on a header does the obvious thing.
+                toggle_expanded(&mut self.expanded_projects, id);
+                self.engine.apply(Action::SelectProject(id));
+            }
+            SidebarEvent::OpenSession {
+                project_id,
+                pi_path,
+            } => {
+                self.engine.apply(Action::SelectProject(project_id));
+                self.engine
+                    .apply(Action::SelectSession(stable_session_id(&pi_path)));
+            }
+        }
+        self.sync_sidebar(cx);
+        cx.notify();
+    }
+
+    /// Push the current rows into the sidebar.
+    fn sync_sidebar(&mut self, cx: &mut Context<Self>) {
+        let rows = chat::rows(self.engine.get(), &self.expanded_projects);
+        let tokens = self.tokens;
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.set_tokens(tokens, cx);
+            sidebar.set_rows(rows, cx);
+        });
     }
 
     /// Read-only domain state, for rendering.
@@ -49,22 +98,8 @@ impl Workspace {
     /// caches nothing per message, so there is nothing to invalidate yet.
     pub fn apply(&mut self, action: Action, cx: &mut Context<Self>) {
         let _effect = self.engine.apply(action);
+        self.sync_sidebar(cx);
         cx.notify();
-    }
-
-    /// The banner to show above the conversation, if any.
-    ///
-    /// Failure takes precedence: if the session has broken, that matters more
-    /// than reporting that it is busy.
-    fn banner(&self) -> Option<Banner> {
-        match &self.engine.get().session_status {
-            SessionStatus::Failed(error) => Some(Banner::error(error.clone(), self.tokens)),
-            SessionStatus::Compacting => Some(Banner::progress(
-                "Compacting the conversation…",
-                self.tokens,
-            )),
-            _ => None,
-        }
     }
 
     pub fn mode(&self) -> ThemeMode {
@@ -78,6 +113,7 @@ impl Workspace {
         self.preference = ThemePreference::Fixed(next);
         self.tokens = Tokens::new(next);
         crate::theme::reapply(next, Some(window), cx);
+        self.sync_sidebar(cx);
         cx.notify();
     }
 
@@ -98,7 +134,30 @@ impl Workspace {
         }
         self.tokens = Tokens::new(system);
         crate::theme::reapply(system, Some(window), cx);
+        self.sync_sidebar(cx);
         cx.notify();
+    }
+}
+
+/// The banner a session status calls for, if any.
+///
+/// Failure takes precedence: if the session has broken, that matters more than
+/// reporting that it is busy.
+fn banner_for(status: &SessionStatus, tokens: Tokens) -> Option<Banner> {
+    match status {
+        SessionStatus::Failed(error) => Some(Banner::error(error.clone(), tokens)),
+        SessionStatus::Compacting => Some(Banner::progress("Compacting the conversation…", tokens)),
+        _ => None,
+    }
+}
+
+/// Toggle whether `id`'s sessions are listed, returning the new state.
+fn toggle_expanded(expanded: &mut BTreeSet<ProjectId>, id: ProjectId) -> bool {
+    if expanded.remove(&id) {
+        false
+    } else {
+        expanded.insert(id);
+        true
     }
 }
 
@@ -124,21 +183,16 @@ impl Render for Workspace {
                         // The settings page lands in a later change.
                     })),
             )
-            .when_some(self.banner(), |this, banner| this.child(banner))
+            .when_some(banner_for(&status, tokens), |this, banner| {
+                this.child(banner)
+            })
             // The conversation and sidebar fill whatever the chrome leaves.
             .child(
                 div()
                     .flex_1()
                     .flex()
                     .min_h(px(0.0))
-                    .child(
-                        div()
-                            .w(px(layout::SIDEBAR_WIDTH))
-                            .h_full()
-                            .bg(tokens.panel_soft.hsla())
-                            .border_r_1()
-                            .border_color(tokens.line.hsla()),
-                    )
+                    .child(self.sidebar.clone())
                     .child(div().flex_1().h_full()),
             )
             .child(StatusStrip::from_state(self.engine.get(), tokens))
@@ -150,59 +204,53 @@ mod tests {
     use super::*;
     use crate::chrome::Severity;
 
-    /// A workspace built without a window, for testing the parts that do not
-    /// need one. `Workspace::new` reads the component theme from the app
-    /// context, which a bare unit test has no access to.
-    fn workspace(mode: ThemeMode) -> Workspace {
-        Workspace {
-            preference: ThemePreference::Fixed(mode),
-            tokens: Tokens::new(mode),
-            engine: EngineState::new(),
-        }
-    }
-
     #[test]
     fn an_idle_session_shows_no_banner() {
-        let mut shell = workspace(ThemeMode::Light);
-        assert!(shell.banner().is_none());
-
-        shell
-            .engine
-            .apply(Action::SetSessionStatus(SessionStatus::Ready));
-        assert!(shell.banner().is_none());
+        let tokens = Tokens::light();
+        assert!(banner_for(&SessionStatus::Offline, tokens).is_none());
+        assert!(banner_for(&SessionStatus::Ready, tokens).is_none());
+        assert!(banner_for(&SessionStatus::Streaming, tokens).is_none());
     }
 
     #[test]
     fn compaction_shows_a_progress_banner() {
-        let mut shell = workspace(ThemeMode::Light);
-        shell
-            .engine
-            .apply(Action::SetSessionStatus(SessionStatus::Compacting));
-
-        let banner = shell.banner().expect("a banner while compacting");
+        let banner = banner_for(&SessionStatus::Compacting, Tokens::light())
+            .expect("a banner while compacting");
         assert_eq!(banner.severity(), Severity::Progress);
     }
 
     #[test]
-    fn failure_takes_precedence_over_progress() {
-        // A broken session matters more than reporting that it is busy.
-        let mut shell = workspace(ThemeMode::Light);
-        shell
-            .engine
-            .apply(Action::SetSessionStatus(SessionStatus::Compacting));
-        shell
-            .engine
-            .apply(Action::SetSessionStatus(SessionStatus::Failed(
-                "boom".into(),
-            )));
-
-        let banner = shell.banner().expect("a banner after failure");
+    fn failure_shows_an_error_banner() {
+        // A broken session matters more than reporting that it is busy, so this
+        // is the variant that wins when both could apply.
+        let banner = banner_for(&SessionStatus::Failed("boom".into()), Tokens::light())
+            .expect("a banner after failure");
         assert_eq!(banner.severity(), Severity::Error);
     }
 
     #[test]
-    fn the_shell_starts_in_the_requested_mode() {
-        assert_eq!(workspace(ThemeMode::Dark).mode(), ThemeMode::Dark);
-        assert_eq!(workspace(ThemeMode::Light).mode(), ThemeMode::Light);
+    fn toggling_a_project_flips_it_and_back() {
+        let mut expanded = BTreeSet::new();
+        let id = uuid::Uuid::new_v4();
+
+        assert!(toggle_expanded(&mut expanded, id));
+        assert!(expanded.contains(&id));
+
+        assert!(!toggle_expanded(&mut expanded, id));
+        assert!(!expanded.contains(&id));
+    }
+
+    #[test]
+    fn projects_expand_independently() {
+        let mut expanded = BTreeSet::new();
+        let first = uuid::Uuid::new_v4();
+        let second = uuid::Uuid::new_v4();
+
+        toggle_expanded(&mut expanded, first);
+        toggle_expanded(&mut expanded, second);
+        toggle_expanded(&mut expanded, first);
+
+        assert!(!expanded.contains(&first));
+        assert!(expanded.contains(&second));
     }
 }

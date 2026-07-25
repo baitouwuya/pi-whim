@@ -13,5 +13,6 @@ pi-whim-engine = { path = "../pi-whim-engine" }
 pi-whim-theme = { path = "../pi-whim-theme" }
 
 [dev-dependencies]
+uuid.workspace = true
 gpui_platform.workspace = true
 gpui-component-assets.workspace = true
