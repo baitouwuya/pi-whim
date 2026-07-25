@@ -14,6 +14,7 @@ const BORDER: Color32 = Color32::from_rgb(214, 209, 200);
 const TABLE_HEADER: Color32 = Color32::from_rgb(236, 231, 222);
 const TABLE_STRIPE: Color32 = Color32::from_rgb(244, 241, 235);
 const CODE_BACKGROUND: Color32 = Color32::from_rgb(233, 229, 221);
+const THINKING_TEXT: Color32 = Color32::from_rgb(122, 116, 106);
 const HEADER_HEIGHT: f32 = 38.0;
 const CELL_HORIZONTAL_PADDING: f32 = 10.0;
 const MAX_TABLE_WIDTH: f32 = 760.0;
@@ -34,6 +35,50 @@ impl MarkdownRenderer {
     }
 
     fn show_document(&mut self, ui: &mut Ui, source: &str) {
+        for (index, segment) in split_thinking_segments(source).iter().enumerate() {
+            match segment {
+                Segment::Markdown(range) => {
+                    ui.push_id(("markdown", index), |ui| {
+                        self.show_markdown(ui, &source[range.clone()]);
+                    });
+                }
+                Segment::Thinking(range) => {
+                    ui.push_id(("thinking", index), |ui| {
+                        self.show_thinking(ui, &source[range.clone()]);
+                    });
+                }
+            }
+        }
+    }
+
+    fn show_thinking(&mut self, ui: &mut Ui, source: &str) {
+        let source = source.trim_matches('\n');
+        if source.trim().is_empty() {
+            return;
+        }
+        ui.add_space(4.0);
+        egui::CollapsingHeader::new(
+            RichText::new("Thinking")
+                .font(FontId::new(13.0, FontFamily::Proportional))
+                .italics()
+                .color(THINKING_TEXT),
+        )
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.scope(|ui| {
+                let visuals = ui.visuals_mut();
+                visuals.override_text_color = Some(THINKING_TEXT);
+                visuals.widgets.active.fg_stroke.color = THINKING_TEXT;
+                CommonMarkViewer::new()
+                    .indentation_spaces(2)
+                    .default_width(Some(ui.available_width().max(1.0) as usize))
+                    .show(ui, &mut self.cache, source);
+            });
+        });
+        ui.add_space(4.0);
+    }
+
+    fn show_markdown(&mut self, ui: &mut Ui, source: &str) {
         let tables = parse_tables(source);
         if tables.is_empty() {
             self.show_commonmark(ui, source);
@@ -63,6 +108,106 @@ impl MarkdownRenderer {
             .default_width(Some(ui.available_width().max(1.0) as usize))
             .show(ui, &mut self.cache, source);
     }
+}
+
+/// A region of the source document, split at `<thinking>` tag boundaries.
+#[derive(Debug)]
+enum Segment {
+    Markdown(Range<usize>),
+    Thinking(Range<usize>),
+}
+
+/// Split `source` into markdown and thinking segments.
+///
+/// `<thinking>...</thinking>` blocks become `Segment::Thinking`; everything
+/// else stays `Segment::Markdown`. Tags inside fenced code blocks are left
+/// literal so they keep rendering as code. An unclosed `<thinking>` (still
+/// streaming) captures the rest of the document.
+fn split_thinking_segments(source: &str) -> Vec<Segment> {
+    const OPEN: &str = "<thinking>";
+    const CLOSE: &str = "</thinking>";
+
+    let fenced = fenced_ranges(source);
+    let in_fence = |offset: usize| fenced.iter().any(|range| range.contains(&offset));
+
+    let mut segments = Vec::new();
+    let mut markdown_start = 0;
+    let mut cursor = 0;
+    while cursor < source.len() {
+        let Some(open) = source[cursor..].find(OPEN).map(|index| cursor + index) else {
+            break;
+        };
+        if in_fence(open) {
+            cursor = open + OPEN.len();
+            continue;
+        }
+        if markdown_start < open {
+            segments.push(Segment::Markdown(markdown_start..open));
+        }
+        let thinking_start = open + OPEN.len();
+        let mut search = thinking_start;
+        let close = loop {
+            let Some(close) = source[search..].find(CLOSE).map(|index| search + index) else {
+                break None;
+            };
+            if in_fence(close) {
+                search = close + CLOSE.len();
+                continue;
+            }
+            break Some(close);
+        };
+        match close {
+            Some(close) => {
+                segments.push(Segment::Thinking(thinking_start..close));
+                markdown_start = close + CLOSE.len();
+                cursor = markdown_start;
+            }
+            None => {
+                segments.push(Segment::Thinking(thinking_start..source.len()));
+                return segments;
+            }
+        }
+    }
+    if markdown_start < source.len() {
+        segments.push(Segment::Markdown(markdown_start..source.len()));
+    }
+    segments
+}
+
+/// Byte ranges of fenced code blocks (``` or ~~~), fences included.
+///
+/// An unclosed opening fence (still streaming) swallows the rest of the
+/// document, mirroring how CommonMark would parse the partial input.
+fn fenced_ranges(source: &str) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut open: Option<(u8, usize, usize)> = None; // (marker, fence length, block start)
+    let mut offset = 0;
+    for line in source.split_inclusive('\n') {
+        let trimmed = line.trim_start_matches([' ', '\t']);
+        let indent = line.len() - trimmed.len();
+        let marker = trimmed.as_bytes().first().copied();
+        if indent <= 3 && matches!(marker, Some(b'`') | Some(b'~')) {
+            let marker = marker.expect("marker checked above");
+            let fence_len = trimmed.bytes().take_while(|byte| *byte == marker).count();
+            if fence_len >= 3 {
+                match open {
+                    Some((open_marker, open_len, start))
+                        if open_marker == marker && fence_len >= open_len =>
+                    {
+                        ranges.push(start..offset + line.len());
+                        open = None;
+                    }
+                    None => open = Some((marker, fence_len, offset)),
+                    _ => {}
+                }
+            }
+        }
+        offset += line.len();
+    }
+    if let Some((_, _, start)) = open {
+        ranges.push(start..source.len());
+    }
+    ranges
 }
 
 fn apply_markdown_style(ui: &mut Ui) {
@@ -473,5 +618,53 @@ mod tests {
         assert_eq!(table.rows.len(), 1);
         assert!(table.rows[0][0].runs[0].style.strong);
         assert!(table.rows[0][1].runs[0].style.code);
+    }
+
+    #[test]
+    fn thinking_segments_split_closed_blocks() {
+        let source = "before\n\n<thinking>\nwhy\n</thinking>\n\nafter";
+        let segments = split_thinking_segments(source);
+        assert_eq!(segments.len(), 3);
+        match (&segments[0], &segments[1], &segments[2]) {
+            (Segment::Markdown(a), Segment::Thinking(b), Segment::Markdown(c)) => {
+                assert_eq!(&source[a.clone()], "before\n\n");
+                assert_eq!(&source[b.clone()], "\nwhy\n");
+                assert_eq!(&source[c.clone()], "\n\nafter");
+            }
+            _ => panic!("unexpected segments: {segments:?}"),
+        }
+    }
+
+    #[test]
+    fn thinking_segments_unclosed_block_runs_to_end() {
+        let source = "before\n\n<thinking>\nstill streaming";
+        let segments = split_thinking_segments(source);
+        assert_eq!(segments.len(), 2);
+        match (&segments[0], &segments[1]) {
+            (Segment::Markdown(a), Segment::Thinking(b)) => {
+                assert_eq!(&source[a.clone()], "before\n\n");
+                assert_eq!(&source[b.clone()], "\nstill streaming");
+            }
+            _ => panic!("unexpected segments"),
+        }
+    }
+
+    #[test]
+    fn thinking_tags_inside_code_fences_stay_markdown() {
+        let source = "text\n\n```\n<thinking>\nnot a block\n</thinking>\n```\n\nafter";
+        let segments = split_thinking_segments(source);
+        assert_eq!(segments.len(), 1);
+        match &segments[0] {
+            Segment::Markdown(range) => assert_eq!(&source[range.clone()], source),
+            Segment::Thinking(_) => panic!("expected a single markdown segment"),
+        }
+    }
+
+    #[test]
+    fn thinking_tags_after_unclosed_fence_stay_markdown() {
+        let source = "```\nunclosed fence\n<thinking>\nrest";
+        let segments = split_thinking_segments(source);
+        assert_eq!(segments.len(), 1);
+        assert!(matches!(segments[0], Segment::Markdown(_)));
     }
 }

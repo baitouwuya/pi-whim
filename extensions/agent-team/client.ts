@@ -4,6 +4,8 @@ import { randomUUID } from "node:crypto";
 const PROTOCOL_VERSION = 1;
 // A raw read may carry an 8 MiB image as Base64 plus JSON framing.
 const MAX_RESPONSE_BYTES = 12 * 1024 * 1024;
+const READ_TIMEOUT_MS = 120_000;
+const LONG_RUNNING_TIMEOUT_MS = 86_405_000;
 
 interface ToolResponse {
 	version: number;
@@ -52,10 +54,12 @@ export async function callAgentHost(
 		const abort = () => finish(new Error("Agent tool call aborted"));
 		if (signal?.aborted) return abort();
 		signal?.addEventListener("abort", abort, { once: true });
-		// The Rust host enforces command-specific limits. Keep the transport timeout
-		// above the largest supported foreground timeout so long jobs are not cut off
-		// by the thin TypeScript bridge.
-		socket.setTimeout(86_405_000, () => finish(new Error("Agent supervisor timed out")));
+		// Read is local filesystem work and must never become a day-long orphan.
+		// Other tools can intentionally run for the host's long command limit.
+		const timeoutMs = toolName === "read" ? READ_TIMEOUT_MS : LONG_RUNNING_TIMEOUT_MS;
+		socket.setTimeout(timeoutMs, () =>
+			finish(new Error(`Agent supervisor timed out after ${timeoutMs / 1000}s`)),
+		);
 		socket.on("connect", () => socket.write(`${request}\n`));
 		socket.on("data", (chunk) => {
 			buffer += chunk.toString("utf8");

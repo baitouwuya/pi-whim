@@ -502,6 +502,10 @@ pub struct AppState {
     pub sessions: BTreeMap<ProjectId, Vec<SessionSummary>>,
     pub selected_project: Option<ProjectId>,
     pub selected_session: Option<SessionId>,
+    /// Pi session file paths whose agent is currently streaming or compacting.
+    /// Sessions run in parallel processes, so background sessions stay busy
+    /// while another one is on screen; the sidebar marks these with a dot.
+    pub running_sessions: std::collections::HashSet<String>,
     pub conversation: Vec<ConversationItem>,
     pub composer: String,
     pub composer_attachments: Vec<Attachment>,
@@ -550,6 +554,10 @@ pub enum Action {
     },
     SelectProject(ProjectId),
     SelectSession(SessionId),
+    SessionRunning {
+        path: String,
+        running: bool,
+    },
     SetComposer(String),
     AddComposerAttachment(Attachment),
     RemoveComposerAttachment(String),
@@ -614,6 +622,13 @@ impl AppState {
                 }
             }
             Action::SelectSession(session_id) => self.selected_session = Some(session_id),
+            Action::SessionRunning { path, running } => {
+                if running {
+                    self.running_sessions.insert(path);
+                } else {
+                    self.running_sessions.remove(&path);
+                }
+            }
             Action::SetComposer(value) => self.composer = value,
             Action::AddComposerAttachment(attachment) => {
                 if !self

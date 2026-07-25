@@ -2,7 +2,7 @@ use std::io::Cursor;
 
 use image::{
     DynamicImage, ExtendedColorType, GenericImageView, ImageEncoder, ImageFormat, ImageReader,
-    Limits,
+    Limits, RgbImage,
     codecs::{jpeg::JpegEncoder, webp::WebPEncoder},
     imageops::FilterType,
 };
@@ -39,8 +39,14 @@ pub(crate) fn compress_to_limit(
         .decode()
         .map_err(|error| format!("could not decode {mime_type}: {error}"))?;
     let (original_width, original_height) = source.dimensions();
-    let has_transparency =
-        source.has_alpha() && source.to_rgba8().pixels().any(|pixel| pixel.0[3] < u8::MAX);
+    let has_transparency = if source.has_alpha() {
+        source
+            .as_rgba8()
+            .map(|image| image.pixels().any(|pixel| pixel.0[3] < u8::MAX))
+            .unwrap_or_else(|| source.to_rgba8().pixels().any(|pixel| pixel.0[3] < u8::MAX))
+    } else {
+        false
+    };
     let mut width = original_width;
     let mut height = original_height;
 
@@ -65,9 +71,12 @@ pub(crate) fn compress_to_limit(
             }
             bytes
         } else {
-            let lowest_quality = encode_jpeg(candidate, MIN_JPEG_QUALITY)?;
+            // Convert to RGB once per scale level. Quality probing otherwise
+            // repeats this full-frame conversion for every JPEG candidate.
+            let rgb = candidate.to_rgb8();
+            let lowest_quality = encode_jpeg(&rgb, MIN_JPEG_QUALITY)?;
             if lowest_quality.len() <= limit {
-                let (bytes, quality) = best_jpeg_within_limit(candidate, limit, lowest_quality)?;
+                let (bytes, quality) = best_jpeg_within_limit(&rgb, limit, lowest_quality)?;
                 return Ok(CompressedImage {
                     bytes,
                     mime_type: "image/jpeg",
@@ -94,7 +103,7 @@ pub(crate) fn compress_to_limit(
 }
 
 fn best_jpeg_within_limit(
-    image: &DynamicImage,
+    image: &RgbImage,
     limit: usize,
     initial: Vec<u8>,
 ) -> Result<(Vec<u8>, u8), String> {
@@ -114,14 +123,13 @@ fn best_jpeg_within_limit(
     Ok(best)
 }
 
-fn encode_jpeg(image: &DynamicImage, quality: u8) -> Result<Vec<u8>, String> {
-    let rgb = image.to_rgb8();
+fn encode_jpeg(image: &RgbImage, quality: u8) -> Result<Vec<u8>, String> {
     let mut output = Vec::new();
     JpegEncoder::new_with_quality(&mut output, quality)
         .write_image(
-            rgb.as_raw(),
-            rgb.width(),
-            rgb.height(),
+            image.as_raw(),
+            image.width(),
+            image.height(),
             ExtendedColorType::Rgb8,
         )
         .map_err(|error| format!("could not encode JPEG: {error}"))?;

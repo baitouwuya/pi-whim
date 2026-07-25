@@ -7,7 +7,7 @@ mod settings;
 mod slash_commands;
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
     time::Instant,
 };
@@ -18,10 +18,10 @@ use eframe::egui::{
     SidePanel, Stroke, TextEdit, TopBottomPanel, Ui, Vec2,
 };
 use pi_whim_core::{
-    Action, AgentStatus, AgentTeamConfig, AppState, BashPolicy, ConversationRole, Language,
-    MAX_AGENT_DEPTH, MAX_AGENTS_PER_LEVEL, ModelOption, ProjectId, ProviderId, ProviderModel,
-    ProviderProfile, ProviderProtocol, QueueMode, SearchEngineProfile, ThinkingLevel,
-    provider_name_key,
+    Action, AgentStatus, AgentTeamConfig, AppState, BashPolicy, ConversationItem, ConversationRole,
+    Language, MAX_AGENT_DEPTH, MAX_AGENTS_PER_LEVEL, ModelOption, ProjectId, ProviderId,
+    ProviderModel, ProviderProfile, ProviderProtocol, QueueMode, SearchEngineProfile,
+    ThinkingLevel, provider_name_key,
 };
 
 use markdown::MarkdownRenderer;
@@ -335,6 +335,58 @@ pub struct Workbench {
     bash_blocked_patterns_draft: Option<String>,
     dismissed_error: Option<String>,
     markdown: MarkdownRenderer,
+    message_layouts: HashMap<String, CachedMessageLayout>,
+}
+
+#[derive(Clone, Copy)]
+struct CachedMessageLayout {
+    width_bits: u32,
+    text_len: usize,
+    text_marker: u64,
+    revealed_graphemes: usize,
+    attachments: usize,
+    report_len: usize,
+    details_len: usize,
+    streaming: bool,
+    height: f32,
+}
+
+impl CachedMessageLayout {
+    fn for_message(message: &ConversationItem, width: f32) -> Self {
+        Self {
+            width_bits: width.to_bits(),
+            text_len: message.full_text.len(),
+            text_marker: text_marker(&message.full_text),
+            revealed_graphemes: message.revealed_graphemes,
+            attachments: message.attachments.len(),
+            report_len: message.tool_report.as_deref().map_or(0, str::len),
+            details_len: message.tool_details.as_deref().map_or(0, str::len),
+            streaming: message.streaming,
+            height: 0.0,
+        }
+    }
+
+    fn matches(self, other: Self) -> bool {
+        self.width_bits == other.width_bits
+            && self.text_len == other.text_len
+            && self.text_marker == other.text_marker
+            && self.revealed_graphemes == other.revealed_graphemes
+            && self.attachments == other.attachments
+            && self.report_len == other.report_len
+            && self.details_len == other.details_len
+            && self.streaming == other.streaming
+    }
+}
+
+fn text_marker(text: &str) -> u64 {
+    let bytes = text.as_bytes();
+    let mut marker = bytes.len() as u64;
+    for byte in bytes.iter().take(16).chain(bytes.iter().rev().take(16)) {
+        marker = marker
+            .wrapping_mul(1_099_511_628_211)
+            .wrapping_add(u64::from(*byte) + 1);
+    }
+    marker
 }
 
 impl Default for Workbench {
@@ -364,6 +416,7 @@ impl Default for Workbench {
             bash_blocked_patterns_draft: None,
             dismissed_error: None,
             markdown: MarkdownRenderer::default(),
+            message_layouts: HashMap::new(),
         }
     }
 }
@@ -405,6 +458,10 @@ impl Workbench {
                         .extend(projects.iter().map(|project| project.id));
                 }
                 self.state.dispatch(Action::ProjectsLoaded(projects));
+            }
+            Action::ClearConversation => {
+                self.message_layouts.clear();
+                self.state.dispatch(Action::ClearConversation);
             }
             action => self.state.dispatch(action),
         }
@@ -764,7 +821,7 @@ impl Workbench {
         let elapsed = now.duration_since(self.last_frame).as_secs_f32();
         self.last_frame = now;
         if self.state.tick_typewriter(elapsed) {
-            context.request_repaint();
+            context.request_repaint_after(std::time::Duration::from_millis(33));
         }
         install_theme(context);
         self.top_bar(context);
@@ -841,7 +898,6 @@ impl Workbench {
                     let (rect, _) = ui.allocate_exact_size(Vec2::splat(8.0), egui::Sense::hover());
                     let dot = if busy {
                         let phase = (ui.ctx().input(|input| input.time) * 2.4).sin() * 0.5 + 0.5;
-                        ui.ctx().request_repaint();
                         tint(color, (110.0 + 145.0 * phase) as u8)
                     } else {
                         color
@@ -1186,8 +1242,17 @@ impl Workbench {
                     } else {
                         &session.title
                     };
+                    let session_running = self.state.running_sessions.contains(&session.pi_path);
+                    if session_running {
+                        ui.painter().circle_filled(
+                            row_rect.left_center() + egui::vec2(6.0, 0.0),
+                            3.0,
+                            ACCENT_STRONG,
+                        );
+                    }
                     ui.painter().with_clip_rect(row_rect).text(
-                        row_rect.left_center() + egui::vec2(10.0, 0.0),
+                        row_rect.left_center()
+                            + egui::vec2(if session_running { 16.0 } else { 10.0 }, 0.0),
                         egui::Align2::LEFT_CENTER,
                         title,
                         serif_font(13.0),
@@ -1284,7 +1349,7 @@ impl Workbench {
                 ScrollArea::vertical()
                     .stick_to_bottom(true)
                     .auto_shrink([false; 2])
-                    .show(ui, |ui| {
+                    .show_viewport(ui, |ui, viewport| {
                         ui.set_width(ui.clip_rect().width());
                         if self.state.conversation.is_empty() {
                             ui.add_space(120.0);
@@ -1346,30 +1411,52 @@ impl Workbench {
                         // Strict vertical rhythm: tool cards pack tightly,
                         // prose gets air. Tool-to-tool stays at the 4pt item
                         // spacing; earlier every boundary cost 14pt + 8pt.
-                        let message_ids: Vec<String> = self
-                            .state
-                            .conversation
-                            .iter()
-                            .map(|message| message.id.clone())
-                            .collect();
+                        let message_width = ui.clip_rect().width().min(CHAT_CONTENT_WIDTH);
+                        let content_origin = ui.max_rect().top();
                         let mut previous_role: Option<ConversationRole> = None;
-                        for message_id in message_ids {
-                            let role = self
-                                .state
-                                .conversation
-                                .iter()
-                                .find(|message| message.id == message_id)
-                                .map(|message| message.role.clone());
-                            let gap = match (previous_role.as_ref(), role.as_ref()) {
+                        for message_index in 0..self.state.conversation.len() {
+                            let (message_id, role, cache_key) = {
+                                let message = &self.state.conversation[message_index];
+                                (
+                                    message.id.clone(),
+                                    message.role.clone(),
+                                    CachedMessageLayout::for_message(message, message_width),
+                                )
+                            };
+                            let gap = match (previous_role.as_ref(), &role) {
                                 (None, _) => 0.0,
-                                (Some(ConversationRole::Tool), Some(ConversationRole::Tool)) => 0.0,
-                                (Some(_), Some(ConversationRole::Tool)) => 4.0,
-                                (Some(ConversationRole::Tool), Some(_)) => 6.0,
+                                (Some(ConversationRole::Tool), ConversationRole::Tool) => 0.0,
+                                (Some(_), ConversationRole::Tool) => 4.0,
+                                (Some(ConversationRole::Tool), _) => 6.0,
                                 _ => 12.0,
                             };
                             ui.add_space(gap);
-                            self.message_card(ui, &message_id);
-                            previous_role = role;
+                            let cached = self
+                                .message_layouts
+                                .get(&message_id)
+                                .copied()
+                                .filter(|cached| cached.matches(cache_key));
+                            let top = ui.cursor().top();
+                            let relative_top = top - content_origin;
+                            let visible = cached.is_none_or(|cached| {
+                                let bottom = relative_top + cached.height;
+                                bottom >= viewport.min.y - viewport.height()
+                                    && relative_top <= viewport.max.y + viewport.height()
+                            });
+                            if visible || cached.is_none() {
+                                self.message_card(ui, message_index);
+                                let height = (ui.cursor().top() - top).max(0.0);
+                                self.message_layouts.insert(
+                                    message_id,
+                                    CachedMessageLayout {
+                                        height,
+                                        ..cache_key
+                                    },
+                                );
+                            } else if let Some(cached) = cached {
+                                ui.add_space(cached.height);
+                            }
+                            previous_role = Some(role);
                         }
                         if matches!(self.state.agent_status, AgentStatus::Streaming) {
                             self.thinking_indicator(ui);
@@ -1485,14 +1572,8 @@ impl Workbench {
         }
     }
 
-    fn message_card(&mut self, ui: &mut Ui, message_id: &str) {
-        let Some(message) = self
-            .state
-            .conversation
-            .iter()
-            .find(|message| message.id == message_id)
-            .cloned()
-        else {
+    fn message_card(&mut self, ui: &mut Ui, message_index: usize) {
+        let Some(message) = self.state.conversation.get(message_index).cloned() else {
             return;
         };
         let viewport_width = ui.clip_rect().width();
@@ -1662,7 +1743,6 @@ impl Workbench {
                     .color(MUTED_INK),
             );
         });
-        ui.ctx().request_repaint();
     }
 
     fn composer(&mut self, context: &egui::Context) {

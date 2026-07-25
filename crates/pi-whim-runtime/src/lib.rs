@@ -32,6 +32,10 @@ pub enum RuntimeError {
 pub struct RuntimeStart {
     pub project_path: String,
     pub sessions_path: String,
+    /// Session file Pi opens on launch. `None` starts a fresh session. Each
+    /// session gets its own Pi process so parallel sessions never abort each
+    /// other through Pi's single-session `switch_session` RPC.
+    pub session_path: Option<String>,
     pub extension_paths: Vec<String>,
     pub environment: HashMap<String, String>,
     pub agent_team_config: AgentTeamConfig,
@@ -214,6 +218,11 @@ impl AgentRuntime for PiRpcRuntime {
         launch
             .arguments
             .extend(["--session-dir".into(), config.sessions_path]);
+        if let Some(session_path) = &config.session_path {
+            launch
+                .arguments
+                .extend(["--session".into(), session_path.clone()]);
+        }
         for extension_path in config.extension_paths {
             launch
                 .arguments
@@ -312,7 +321,6 @@ impl AgentRuntime for PiRpcRuntime {
     }
 }
 
-#[derive(Clone)]
 pub struct FakeRuntime {
     sender: Sender<RuntimeEvent>,
     receiver: Receiver<RuntimeEvent>,
@@ -320,6 +328,23 @@ pub struct FakeRuntime {
     commands: Arc<Mutex<Vec<Value>>>,
     starts: Arc<Mutex<Vec<RuntimeStart>>>,
     responses: Arc<Mutex<HashMap<String, Value>>>,
+}
+
+impl Clone for FakeRuntime {
+    /// Clones share the recorded commands/starts/responses so a test observer
+    /// sees every pooled runtime, but each clone owns an independent event
+    /// channel so per-session event routing stays isolated.
+    fn clone(&self) -> Self {
+        let (sender, receiver) = unbounded();
+        Self {
+            sender,
+            receiver,
+            prompts: self.prompts.clone(),
+            commands: self.commands.clone(),
+            starts: self.starts.clone(),
+            responses: self.responses.clone(),
+        }
+    }
 }
 
 impl Default for FakeRuntime {

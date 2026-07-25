@@ -25,7 +25,9 @@ arboard = "3.6"
 base64 = "0.22"
 crossbeam-channel = "0.5"
 dirs = "6.0"
-eframe = { version = "0.31", default-features = true }
+# Keep the native UI on the wgpu/Metal path. With both backends enabled,
+# eframe selects wgpu by default while retaining glow as a portability fallback.
+eframe = { version = "0.31", default-features = true, features = ["wgpu"] }
 egui_commonmark = { version = "0.20", default-features = false }
 egui_extras = { version = "0.31", default-features = false }
 fluent-bundle = "0.16"

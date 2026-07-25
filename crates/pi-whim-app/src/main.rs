@@ -8,7 +8,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use eframe::egui;
@@ -38,6 +38,8 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([1360.0, 860.0])
             .with_min_inner_size([900.0, 620.0])
             .with_title("Pi-Whim"),
+        hardware_acceleration: eframe::HardwareAcceleration::Required,
+        renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
     eframe::run_native(
@@ -54,26 +56,42 @@ struct PiWhimApplication<R: AgentRuntime = PiRpcRuntime> {
     workbench: Workbench,
     store: Option<SqliteStore>,
     secrets: MacosKeychainStore,
-    runtime: R,
-    runtime_events: crossbeam_channel::Receiver<RuntimeEvent>,
-    assistant_message_id: Option<String>,
-    pending_extension_request: Option<Value>,
-    pending_interactions: Vec<Value>,
+    runtime_factory: Box<dyn Fn() -> R + Send>,
+    /// One Pi process per session, keyed by session file path (or a `draft://`
+    /// key until Pi reports the file). Parallel sessions never share a
+    /// process, so switching the visible session cannot abort a running one.
+    sessions: HashMap<String, SessionRuntime<R>>,
+    /// Pool key of the session shown in the conversation view.
+    active_session: Option<String>,
+    /// Extension confirmations and supervisor interactions are tagged with the
+    /// owning session so background agents can still prompt the user.
+    pending_extension_request: Option<(String, Value)>,
+    pending_interactions: Vec<(String, Value)>,
     capability_resolver: ModelCapabilityResolver,
-    running_project: Option<ProjectId>,
     sessions_root_override: Option<PathBuf>,
     agent_directory_override: Option<PathBuf>,
-    pending_prompt: Option<(String, Vec<Attachment>, SubmitMode)>,
     attachment_store: AttachmentStore,
     finder_paste_monitor: Option<FinderPasteMonitor>,
     finder_paste_monitor_install_pending: bool,
+    error: Option<String>,
+    notice: Option<String>,
+}
+
+struct SessionRuntime<R: AgentRuntime> {
+    runtime: R,
+    events: crossbeam_channel::Receiver<RuntimeEvent>,
+    project_id: ProjectId,
+    /// True while the agent is streaming or compacting.
+    running: bool,
+    assistant_message_id: Option<String>,
     conversation_compacted: bool,
     /// Item id of the in-progress compaction call card, so compaction_end can
     /// update the same conversation entry with the result instead of adding a
     /// second card.
     compaction_item_id: Option<String>,
-    error: Option<String>,
-    notice: Option<String>,
+    pending_prompt: Option<(String, Vec<Attachment>, SubmitMode)>,
+    /// Last time the session was activated; drives most-recently-used picks.
+    last_used_ms: i64,
 }
 
 impl Default for PiWhimApplication<PiRpcRuntime> {
@@ -129,27 +147,21 @@ impl Default for PiWhimApplication<PiRpcRuntime> {
             }
             workbench.apply(Action::ProviderProfilesLoaded(profiles));
         }
-        let runtime = PiRpcRuntime::default();
-        let runtime_events = runtime.events();
         Self {
             workbench,
             store,
             secrets: MacosKeychainStore::default(),
-            runtime,
-            runtime_events,
-            assistant_message_id: None,
+            runtime_factory: Box::new(PiRpcRuntime::default),
+            sessions: HashMap::new(),
+            active_session: None,
             pending_extension_request: None,
             pending_interactions: Vec::new(),
             capability_resolver,
-            running_project: None,
             sessions_root_override: None,
             agent_directory_override: None,
-            pending_prompt: None,
             attachment_store: AttachmentStore::open_default(),
             finder_paste_monitor: None,
             finder_paste_monitor_install_pending: true,
-            conversation_compacted: false,
-            compaction_item_id: None,
             error: None,
             notice: None,
         }
@@ -206,7 +218,17 @@ impl<R: AgentRuntime> eframe::App for PiWhimApplication<R> {
                 self.notice = None;
             }
         }
-        context.request_repaint_after(std::time::Duration::from_millis(16));
+        let session_running = self.sessions.values().any(|session| session.running);
+        let agent_busy = matches!(
+            self.workbench.state.agent_status,
+            AgentStatus::Starting | AgentStatus::Streaming | AgentStatus::Compacting
+        );
+        if session_running || agent_busy {
+            // Runtime events arrive on channels and need a periodic poll while
+            // a session is active.  Fifty milliseconds keeps streaming smooth
+            // without laying out the whole conversation at display refresh rate.
+            context.request_repaint_after(Duration::from_millis(50));
+        }
     }
 }
 
@@ -248,10 +270,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         match intent {
             UiIntent::AddProject => self.add_project(),
             UiIntent::RemoveProject(project_id) => {
-                if self.running_project == Some(project_id) {
-                    let _ = self.runtime.stop();
-                    self.running_project = None;
-                }
+                self.stop_project_runtimes(project_id);
                 if let Some(store) = self.store.as_ref()
                     && let Err(error) = store.delete_project(project_id)
                 {
@@ -297,8 +316,8 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             UiIntent::Compact => self.compact_session(),
             UiIntent::SetAutoCompaction(enabled) => self.set_auto_compaction(enabled),
             UiIntent::Stop => {
-                if let Err(error) = self.runtime.command(json!({"type":"abort"})) {
-                    self.error = Some(error.to_string());
+                if let Err(error) = self.active_command(json!({"type":"abort"})) {
+                    self.error = Some(error);
                 }
             }
             UiIntent::SetLanguage(language) => {
@@ -349,8 +368,19 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 confirmed,
             } => {
                 let command = json!({"type":"extension_ui_response", "id": request_id, "confirmed": confirmed});
-                if let Err(error) = self.runtime.respond_extension_ui(command) {
-                    self.error = Some(error.to_string());
+                let owner = self
+                    .pending_extension_request
+                    .as_ref()
+                    .map(|(key, _)| key.clone());
+                let result = owner
+                    .and_then(|key| self.sessions.get(&key))
+                    .map(|session| session.runtime.respond_extension_ui(command));
+                match result {
+                    Some(Err(error)) => self.error = Some(error.to_string()),
+                    Some(Ok(())) => {}
+                    None => {
+                        self.error = Some("The session that asked is no longer running.".into())
+                    }
                 }
             }
         }
@@ -680,17 +710,70 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             .cloned()
     }
 
-    fn start_project(&mut self, project_id: ProjectId) {
-        if self.running_project == Some(project_id) {
-            return;
-        }
-        self.launch_project(project_id);
+    fn active(&self) -> Option<&SessionRuntime<R>> {
+        self.active_session
+            .as_ref()
+            .and_then(|key| self.sessions.get(key))
     }
 
-    fn launch_project(&mut self, project_id: ProjectId) {
-        let Some(project) = self.find_project(project_id) else {
+    fn active_mut(&mut self) -> Option<&mut SessionRuntime<R>> {
+        let key = self.active_session.clone()?;
+        self.sessions.get_mut(&key)
+    }
+
+    fn active_command(&self, command: Value) -> Result<Value, String> {
+        self.active()
+            .ok_or_else(|| "No active session.".to_owned())?
+            .runtime
+            .command(command)
+            .map_err(|error| error.to_string())
+    }
+
+    fn active_send(&self, command: Value) -> Result<(), String> {
+        self.active()
+            .ok_or_else(|| "No active session.".to_owned())?
+            .runtime
+            .send(command)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Open a project: reactivate its most recently used live session when one
+    /// exists, otherwise resume the newest stored session, otherwise start a
+    /// fresh one. Previously running sessions keep their processes untouched.
+    fn start_project(&mut self, project_id: ProjectId) {
+        let mru_live = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.project_id == project_id)
+            .max_by_key(|(_, session)| session.last_used_ms)
+            .map(|(key, _)| key.clone());
+        if let Some(key) = mru_live {
+            self.activate_session(&key);
             return;
-        };
+        }
+        let stored = self
+            .workbench
+            .state
+            .sessions
+            .get(&project_id)
+            .and_then(|sessions| sessions.first())
+            .map(|session| session.pi_path.clone())
+            .filter(|path| Path::new(path).is_file());
+        match stored {
+            Some(path) => self.switch_session(project_id, path),
+            None => self.start_new_session(project_id),
+        }
+    }
+
+    /// Launch one Pi process bound to a session. `session_path = None` starts
+    /// a fresh session; the pool key falls back to the file Pi reports, or a
+    /// draft key until then.
+    fn launch_session(
+        &mut self,
+        project_id: ProjectId,
+        session_path: Option<&str>,
+    ) -> Option<String> {
+        let project = self.find_project(project_id)?;
         let sessions_path = match self
             .sessions_root_override
             .clone()
@@ -700,33 +783,36 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             Ok(root) => root.join(project.id.to_string()),
             Err(error) => {
                 self.error = Some(error.to_string());
-                return;
+                return None;
             }
         };
         if let Err(error) = fs::create_dir_all(&sessions_path) {
             self.error = Some(error.to_string());
-            return;
+            return None;
         }
         let mut environment = match self.prepare_pi_configuration() {
             Ok(environment) => environment,
             Err(error) => {
                 self.error = Some(error);
-                return;
+                return None;
             }
         };
-        self.workbench
-            .apply(Action::SetAgentStatus(AgentStatus::Starting));
-        self.running_project = None;
+        if self.active_session.is_none() {
+            self.workbench
+                .apply(Action::SetAgentStatus(AgentStatus::Starting));
+        }
         let mut extension_paths = Vec::new();
         match ensure_agent_team_extension(&sessions_path) {
             Ok(path) => extension_paths.push(path.to_string_lossy().into_owned()),
             Err(error) => {
-                self.workbench
-                    .apply(Action::SetAgentStatus(AgentStatus::Failed(
-                        error.to_string(),
-                    )));
+                if self.active_session.is_none() {
+                    self.workbench
+                        .apply(Action::SetAgentStatus(AgentStatus::Failed(
+                            error.to_string(),
+                        )));
+                }
                 self.error = Some(error.to_string());
-                return;
+                return None;
             }
         }
         environment.insert(
@@ -738,33 +824,127 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             serde_json::to_string(&self.workbench.state.bash_blocked_patterns)
                 .unwrap_or_else(|_| "[]".into()),
         );
-        match self.runtime.start(RuntimeStart {
+        let mut runtime = (self.runtime_factory)();
+        if let Err(error) = runtime.start(RuntimeStart {
             project_path: project.path,
             sessions_path: sessions_path.to_string_lossy().into_owned(),
+            session_path: session_path.map(str::to_owned),
             extension_paths,
             environment,
             agent_team_config: self.workbench.state.agent_team_config.clone(),
             search_engines: self.workbench.state.search_engine_profiles.clone(),
         }) {
-            Ok(()) => {
-                self.running_project = Some(project.id);
-                self.workbench
-                    .apply(Action::SetAgentStatus(AgentStatus::Ready));
-                self.discover_sessions(project.id, &sessions_path);
-                self.refresh_session_state(project.id);
-                self.refresh_runtime_controls();
-            }
-            Err(error) => {
+            if self.active_session.is_none() {
                 self.workbench
                     .apply(Action::SetAgentStatus(AgentStatus::Failed(
                         error.to_string(),
                     )));
-                self.error = Some(error.to_string());
+            }
+            self.error = Some(error.to_string());
+            return None;
+        }
+        let events = runtime.events();
+        let key = session_path.map(str::to_owned).unwrap_or_else(|| {
+            runtime
+                .command(json!({"type":"get_state"}))
+                .ok()
+                .and_then(|state| {
+                    state
+                        .get("sessionFile")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_else(|| format!("draft://{}", Uuid::new_v4()))
+        });
+        self.sessions.insert(
+            key.clone(),
+            SessionRuntime {
+                runtime,
+                events,
+                project_id,
+                running: false,
+                assistant_message_id: None,
+                conversation_compacted: false,
+                compaction_item_id: None,
+                pending_prompt: None,
+                last_used_ms: now_ms(),
+            },
+        );
+        self.discover_sessions(project_id, &sessions_path);
+        Some(key)
+    }
+
+    /// Bring a pooled session to the foreground: the conversation view binds to
+    /// its process while every other session keeps running in the background.
+    fn activate_session(&mut self, key: &str) {
+        let Some(session) = self.sessions.get_mut(key) else {
+            return;
+        };
+        session.last_used_ms = now_ms();
+        let project_id = session.project_id;
+        let running = session.running;
+        self.active_session = Some(key.to_owned());
+        self.workbench.apply(Action::SelectProject(project_id));
+        if !key.starts_with("draft://") {
+            self.workbench
+                .apply(Action::SelectSession(stable_session_id(key)));
+        }
+        self.workbench.apply(Action::ClearConversation);
+        self.workbench.apply(Action::SetAgentStatus(if running {
+            AgentStatus::Streaming
+        } else {
+            AgentStatus::Ready
+        }));
+        let _ = self.load_current_entries();
+        self.refresh_runtime_controls();
+    }
+
+    /// Re-key a pooled session once Pi reveals its real session file (fresh
+    /// sessions start under a `draft://` key; fork/clone move to a new file).
+    fn rekey_session(&mut self, from: &str, to: &str) {
+        if from == to || !self.sessions.contains_key(from) {
+            return;
+        }
+        if let Some(mut session) = self.sessions.remove(from) {
+            session.last_used_ms = now_ms();
+            let was_active = self.active_session.as_deref() == Some(from);
+            self.sessions.insert(to.to_owned(), session);
+            if was_active {
+                self.active_session = Some(to.to_owned());
+                self.workbench
+                    .apply(Action::SelectSession(stable_session_id(to)));
+            }
+        }
+    }
+
+    fn stop_project_runtimes(&mut self, project_id: ProjectId) {
+        let keys: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.project_id == project_id)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in keys {
+            if let Some(mut session) = self.sessions.remove(&key) {
+                let _ = session.runtime.stop();
+                self.workbench.apply(Action::SessionRunning {
+                    path: key.clone(),
+                    running: false,
+                });
+                if self.active_session.as_deref() == Some(key.as_str()) {
+                    self.active_session = None;
+                    self.workbench.apply(Action::ClearConversation);
+                    self.workbench
+                        .apply(Action::SetAgentStatus(AgentStatus::Offline));
+                }
             }
         }
     }
 
     fn refresh_runtime_controls(&mut self) {
+        if self.active().is_none() {
+            return;
+        }
         let provider_names = self
             .workbench
             .state
@@ -772,17 +952,15 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             .iter()
             .map(|profile| (provider_config_key(profile.id), profile.name.clone()))
             .collect::<HashMap<_, _>>();
-        let state = match self.runtime.command(json!({"type":"get_state"})) {
+        let state = match self.active_command(json!({"type":"get_state"})) {
             Ok(state) => state,
             Err(error) => {
                 self.workbench
-                    .apply(Action::SetAgentStatus(AgentStatus::Failed(
-                        error.to_string(),
-                    )));
+                    .apply(Action::SetAgentStatus(AgentStatus::Failed(error)));
                 return;
             }
         };
-        let models = match self.runtime.command(json!({"type":"get_available_models"})) {
+        let models = match self.active_command(json!({"type":"get_available_models"})) {
             Ok(response) => response
                 .get("models")
                 .cloned()
@@ -793,15 +971,12 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 .collect(),
             Err(error) => {
                 self.workbench
-                    .apply(Action::SetAgentStatus(AgentStatus::Failed(
-                        error.to_string(),
-                    )));
+                    .apply(Action::SetAgentStatus(AgentStatus::Failed(error)));
                 Vec::new()
             }
         };
         let mut thinking_levels = self
-            .runtime
-            .command(json!({"type":"get_available_thinking_levels"}))
+            .active_command(json!({"type":"get_available_thinking_levels"}))
             .ok()
             .and_then(|response| response.get("levels").cloned())
             .and_then(|levels| serde_json::from_value::<Vec<String>>(levels).ok())
@@ -850,11 +1025,11 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             steering_mode,
             follow_up_mode,
         });
-        if let Ok(metrics) = self.runtime.command(json!({"type":"get_session_stats"})) {
+        if let Ok(metrics) = self.active_command(json!({"type":"get_session_stats"})) {
             self.workbench
                 .apply(Action::SessionMetricsUpdated(session_metrics(&metrics)));
         }
-        if let Ok(response) = self.runtime.command(json!({"type":"get_commands"})) {
+        if let Ok(response) = self.active_command(json!({"type":"get_commands"})) {
             let commands = response
                 .get("commands")
                 .and_then(Value::as_array)
@@ -881,16 +1056,28 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         }
     }
 
-    fn set_model(&mut self, model: ModelOption) {
-        if let Err(error) = self.runtime.command(json!({
-            "type":"set_model",
-            "provider": model.provider,
-            "modelId": model.id,
-        })) {
-            self.error = Some(error.to_string());
-            return;
+    fn set_model_on(&mut self, key: &str, model: ModelOption) {
+        let result = self.sessions.get(key).map(|session| {
+            session.runtime.command(json!({
+                "type":"set_model",
+                "provider": model.provider,
+                "modelId": model.id,
+            }))
+        });
+        match result {
+            Some(Ok(_)) => {}
+            Some(Err(error)) => {
+                self.error = Some(error.to_string());
+                return;
+            }
+            None => {
+                self.error = Some("The session is no longer running.".into());
+                return;
+            }
         }
-        self.refresh_runtime_controls();
+        if self.active_session.as_deref() == Some(key) {
+            self.refresh_runtime_controls();
+        }
     }
 
     /// Defer a model switch until the next prompt so the prior model can compact
@@ -901,30 +1088,28 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     }
 
     /// Apply a deferred model switch: send set_model and refresh controls.
-    fn apply_pending_model(&mut self) {
+    fn apply_pending_model(&mut self, key: &str) {
         if let Some(model) = self.workbench.state.pending_model.clone() {
-            self.set_model(model);
+            self.set_model_on(key, model);
             self.workbench.apply(Action::SetPendingModel(None));
         }
     }
 
     fn set_thinking_level(&mut self, level: ThinkingLevel) {
-        if let Err(error) = self
-            .runtime
-            .command(json!({"type":"set_thinking_level", "level": level.as_str()}))
+        if let Err(error) =
+            self.active_command(json!({"type":"set_thinking_level", "level": level.as_str()}))
         {
-            self.error = Some(error.to_string());
+            self.error = Some(error);
             return;
         }
         self.refresh_runtime_controls();
     }
 
     fn set_auto_compaction(&mut self, enabled: bool) {
-        if let Err(error) = self
-            .runtime
-            .command(json!({"type":"set_auto_compaction", "enabled": enabled}))
+        if let Err(error) =
+            self.active_command(json!({"type":"set_auto_compaction", "enabled": enabled}))
         {
-            self.error = Some(error.to_string());
+            self.error = Some(error);
             return;
         }
         self.refresh_runtime_controls();
@@ -934,9 +1119,12 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         if !matches!(self.workbench.state.agent_status, AgentStatus::Ready) {
             return;
         }
-        if let Err(error) = self.runtime.send(json!({"type":"compact"})) {
-            self.error = Some(error.to_string());
+        if let Err(error) = self.active_send(json!({"type":"compact"})) {
+            self.error = Some(error);
             return;
+        }
+        if let Some(session) = self.active_mut() {
+            session.running = true;
         }
         self.workbench
             .apply(Action::SetAgentStatus(AgentStatus::Compacting));
@@ -946,23 +1134,30 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         let steering = queue_mode_name(steering);
         let follow_up = queue_mode_name(follow_up);
         let result = self
-            .runtime
-            .command(json!({"type":"set_steering_mode", "mode": steering}))
+            .active_command(json!({"type":"set_steering_mode", "mode": steering}))
             .and_then(|_| {
-                self.runtime
-                    .command(json!({"type":"set_follow_up_mode", "mode": follow_up}))
+                self.active_command(json!({"type":"set_follow_up_mode", "mode": follow_up}))
             });
         if let Err(error) = result {
-            self.error = Some(error.to_string());
+            self.error = Some(error);
             return;
         }
         self.refresh_runtime_controls();
     }
 
+    /// Re-read the active session's state from its own Pi process: index the
+    /// session file (re-keying the pool when fork/clone moved to a new file)
+    /// and reload the visible conversation.
     fn refresh_session_state(&mut self, project_id: ProjectId) {
-        match self.runtime.command(json!({"type":"get_state"})) {
+        let Some(key) = self.active_session.clone() else {
+            return;
+        };
+        match self.active_command(json!({"type":"get_state"})) {
             Ok(state) => {
                 if let Some(path) = state.get("sessionFile").and_then(Value::as_str) {
+                    if path != key {
+                        self.rekey_session(&key, path);
+                    }
                     self.index_session(
                         project_id,
                         path,
@@ -971,7 +1166,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 }
                 let _ = self.load_current_entries();
             }
-            Err(error) => self.error = Some(error.to_string()),
+            Err(error) => self.error = Some(error),
         }
     }
 
@@ -1044,54 +1239,43 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         }
     }
 
+    /// Start a fresh session in its own Pi process. The currently visible
+    /// session keeps running untouched in the background.
     fn start_new_session(&mut self, project_id: ProjectId) {
-        let changed_project = self.running_project != Some(project_id);
         self.workbench.apply(Action::SelectProject(project_id));
-        if changed_project {
-            self.start_project(project_id);
-            if self.running_project == Some(project_id) {
-                self.workbench.apply(Action::ClearConversation);
-            }
+        // An empty visible session of the same project is reused instead of
+        // spawning another blank one.
+        if self.active().is_some_and(|session| {
+            session.project_id == project_id
+                && !self
+                    .workbench
+                    .state
+                    .conversation
+                    .iter()
+                    .any(|message| message.role == ConversationRole::User)
+        }) {
             return;
         }
-        if !self
-            .workbench
-            .state
-            .conversation
-            .iter()
-            .any(|message| message.role == ConversationRole::User)
-        {
+        let Some(key) = self.launch_session(project_id, None) else {
             return;
-        }
-        if let Err(error) = self.runtime.command(json!({"type":"new_session"})) {
-            self.error = Some(error.to_string());
-            return;
-        }
-        self.workbench.apply(Action::ClearConversation);
+        };
+        self.activate_session(&key);
         // pi-mono defers writing the session JSONL until the first assistant
         // response (its newSession contract), so the sidebar's disk scan would
         // not see the new session. Persist a placeholder summary so it shows up
         // immediately; a later refresh replaces it once the file is written.
-        let placeholder_path = self
-            .runtime
-            .command(json!({"type":"get_state"}))
-            .ok()
-            .and_then(|state| {
-                state
-                    .get("sessionFile")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            });
-        if let (Some(store), Some(path)) = (self.store.as_ref(), placeholder_path) {
+        if key.starts_with("draft://") {
+            return;
+        }
+        if let Some(store) = self.store.as_ref() {
             let summary = SessionSummary {
-                id: stable_session_id(&path),
+                id: stable_session_id(&key),
                 project_id,
-                pi_path: path,
+                pi_path: key.clone(),
                 title: String::new(),
                 preview: String::new(),
                 updated_at_ms: now_ms(),
             };
-            let session_id = summary.id;
             let _ = store.save_session(&summary);
             if let Ok(sessions) = store.list_sessions(project_id) {
                 self.workbench.apply(Action::SessionsLoaded {
@@ -1099,43 +1283,31 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                     sessions,
                 });
             }
-            self.workbench.apply(Action::SelectSession(session_id));
+            self.workbench.apply(Action::SelectSession(summary.id));
         }
     }
 
+    /// Switch the visible session. The target gets its own Pi process (reused
+    /// when already pooled); the session being left keeps running, so parallel
+    /// L0 agents never abort each other.
     fn switch_session(&mut self, project_id: ProjectId, path: String) {
-        self.workbench.apply(Action::SelectProject(project_id));
-        if self.running_project != Some(project_id) {
-            self.start_project(project_id);
-            if self.running_project != Some(project_id) {
-                return;
-            }
-        }
-        if let Err(error) = self
-            .runtime
-            .command(json!({"type":"switch_session", "sessionPath": path}))
+        if !self.sessions.contains_key(&path)
+            && self.launch_session(project_id, Some(&path)).is_none()
         {
-            self.error = Some(error.to_string());
             return;
         }
-        self.workbench.apply(Action::ClearConversation);
-        let _ = self.load_current_entries();
-        // Pi restores the session's last recorded model during switch_session.
-        // Refresh the picker so it reflects that restored model immediately.
-        self.refresh_runtime_controls();
+        self.activate_session(&path);
     }
 
     fn rename_session(&mut self, path: String, title: String) {
-        if let Err(error) = self
-            .runtime
-            .command(json!({"type":"switch_session", "sessionPath": path}))
-        {
-            self.error = Some(error.to_string());
-            return;
-        }
-        if let Err(error) = self
-            .runtime
-            .command(json!({"type":"set_session_name", "name": title}))
+        // A live session renames through its own process so the name lands in
+        // the session file; renaming a background session never disturbs it.
+        // Without a live process the rename is store-only and may be
+        // overwritten by a later disk rescan.
+        if let Some(session) = self.sessions.get(&path)
+            && let Err(error) = session
+                .runtime
+                .command(json!({"type":"set_session_name", "name": title}))
         {
             self.error = Some(error.to_string());
             return;
@@ -1143,23 +1315,26 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         if let Some(project_id) = self.workbench.state.selected_project {
             self.index_session(project_id, &path, Some(&title));
         }
-        self.refresh_runtime_controls();
+        if self.active_session.as_deref() == Some(path.as_str()) {
+            self.refresh_runtime_controls();
+        }
     }
 
     fn set_current_session_name(&mut self, name: String) {
-        let Some(state) = self.runtime.command(json!({"type":"get_state"})).ok() else {
-            return;
-        };
-        let Some(path) = state.get("sessionFile").and_then(Value::as_str) else {
+        let Some(key) = self.active_session.clone() else {
             self.error = Some("No active session to name.".into());
             return;
         };
+        if key.starts_with("draft://") {
+            self.error = Some("No active session to name.".into());
+            return;
+        }
         let name = name.trim().to_owned();
         if name.is_empty() {
             self.error = Some("Usage: /name <name>".into());
             return;
         }
-        self.rename_session(path.to_owned(), name);
+        self.rename_session(key, name);
     }
 
     fn export_session(&mut self, requested_path: Option<String>) {
@@ -1168,21 +1343,20 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         if let Some(output_path) = output_path {
             command["outputPath"] = Value::String(output_path);
         }
-        let response = self.runtime.command(command);
+        let response = self.active_command(command);
         match response {
             Ok(value) => {
                 if let Some(path) = value.get("path").and_then(Value::as_str) {
                     self.error = Some(format!("Session exported to {path}"));
                 }
             }
-            Err(error) => self.error = Some(error.to_string()),
+            Err(error) => self.error = Some(error),
         }
     }
 
     fn share_session(&mut self) {
         let Some(path) = self
-            .runtime
-            .command(json!({"type":"export_html"}))
+            .active_command(json!({"type":"export_html"}))
             .ok()
             .and_then(|value| value.get("path").and_then(Value::as_str).map(str::to_owned))
         else {
@@ -1205,8 +1379,8 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     }
 
     fn clone_session(&mut self) {
-        if let Err(error) = self.runtime.command(json!({"type":"clone"})) {
-            self.error = Some(error.to_string());
+        if let Err(error) = self.active_command(json!({"type":"clone"})) {
+            self.error = Some(error);
             return;
         }
         if let Some(project_id) = self.workbench.state.selected_project {
@@ -1215,11 +1389,8 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     }
 
     fn fork_session(&mut self, entry_id: String) {
-        if let Err(error) = self
-            .runtime
-            .command(json!({"type":"fork", "entryId": entry_id}))
-        {
-            self.error = Some(error.to_string());
+        if let Err(error) = self.active_command(json!({"type":"fork", "entryId": entry_id})) {
+            self.error = Some(error);
             return;
         }
         if let Some(project_id) = self.workbench.state.selected_project {
@@ -1228,6 +1399,21 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     }
 
     fn delete_session(&mut self, path: String) {
+        // Stop the session's own process first so it cannot rewrite the file
+        // after the delete; the conversation moves to another live session.
+        if let Some(mut session) = self.sessions.remove(&path) {
+            let _ = session.runtime.stop();
+            self.workbench.apply(Action::SessionRunning {
+                path: path.clone(),
+                running: false,
+            });
+            if self.active_session.as_deref() == Some(path.as_str()) {
+                self.active_session = None;
+                self.workbench.apply(Action::ClearConversation);
+                self.workbench
+                    .apply(Action::SetAgentStatus(AgentStatus::Offline));
+            }
+        }
         let target = PathBuf::from(&path);
         let status = std::process::Command::new("osascript")
             .args([
@@ -1254,10 +1440,9 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
 
     fn load_current_entries(&mut self) -> Result<(), ()> {
         let entries = self
-            .runtime
-            .command(json!({"type":"get_entries"}))
+            .active_command(json!({"type":"get_entries"}))
             .map_err(|error| {
-                self.error = Some(error.to_string());
+                self.error = Some(error);
             })?;
         self.workbench.apply(Action::ClearConversation);
         for entry in entries
@@ -1397,48 +1582,85 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         // A deferred model switch waits until the prompt that continues the
         // conversation, so the prior model compacts the existing history first
         // (cache-friendly). Skip when there's nothing to compact or it just did.
-        if matches!(mode, SubmitMode::Prompt)
+        let defer_for_compaction = matches!(mode, SubmitMode::Prompt)
             && self.workbench.state.pending_model.is_some()
-            && !self.conversation_compacted
+            && !self
+                .active()
+                .map(|session| session.conversation_compacted)
+                .unwrap_or(true)
             && self
                 .workbench
                 .state
                 .conversation
                 .iter()
-                .any(|message| message.role != ConversationRole::User)
-        {
-            self.pending_prompt = Some((content, attachments, mode));
-            if let Err(error) = self.runtime.send(json!({"type":"compact"})) {
-                self.error = Some(error.to_string());
-                self.pending_prompt = None;
+                .any(|message| message.role != ConversationRole::User);
+        if defer_for_compaction {
+            let Some(key) = self.active_session.clone() else {
+                self.error = Some("No active session.".into());
                 return;
+            };
+            let result = self.active_send(json!({"type":"compact"}));
+            match result {
+                Ok(()) => {
+                    if let Some(session) = self.sessions.get_mut(&key) {
+                        session.pending_prompt = Some((content, attachments, mode));
+                        session.running = true;
+                    }
+                    self.workbench
+                        .apply(Action::SetAgentStatus(AgentStatus::Compacting));
+                }
+                Err(error) => self.error = Some(error),
             }
-            self.workbench
-                .apply(Action::SetAgentStatus(AgentStatus::Compacting));
             return;
         }
+        let Some(key) = self.active_session.clone() else {
+            self.error = Some("No active session.".into());
+            return;
+        };
         if self.workbench.state.pending_model.is_some() {
-            self.apply_pending_model();
+            self.apply_pending_model(&key);
         }
-        self.send_prompt(content, attachments, mode);
+        self.send_prompt(&key, content, attachments, mode);
     }
 
-    fn send_prompt(&mut self, content: String, attachments: Vec<Attachment>, mode: SubmitMode) {
-        let result = match mode {
-            SubmitMode::Prompt => self.runtime.send(json!({
-                "type": "prompt",
-                "message": prompt_with_attachment_paths(&content, &attachments),
-            })),
-            SubmitMode::Steer => self
-                .runtime
-                .send(json!({"type":"steer", "message": content})),
-            SubmitMode::FollowUp => self
-                .runtime
-                .send(json!({"type":"follow_up", "message": content})),
+    fn send_prompt(
+        &mut self,
+        key: &str,
+        content: String,
+        attachments: Vec<Attachment>,
+        mode: SubmitMode,
+    ) {
+        let result = {
+            let Some(session) = self.sessions.get(key) else {
+                self.error = Some("The session is no longer running.".into());
+                return;
+            };
+            match mode {
+                SubmitMode::Prompt => session.runtime.send(json!({
+                    "type": "prompt",
+                    "message": prompt_with_attachment_paths(&content, &attachments),
+                })),
+                SubmitMode::Steer => session
+                    .runtime
+                    .send(json!({"type":"steer", "message": content})),
+                SubmitMode::FollowUp => session
+                    .runtime
+                    .send(json!({"type":"follow_up", "message": content})),
+            }
         };
         if let Err(error) = result {
             self.error = Some(error.to_string());
-        } else {
+            return;
+        }
+        let is_active = self.active_session.as_deref() == Some(key);
+        if let Some(session) = self.sessions.get_mut(key) {
+            session.running = true;
+        }
+        self.workbench.apply(Action::SessionRunning {
+            path: key.to_owned(),
+            running: true,
+        });
+        if is_active {
             self.workbench
                 .apply(Action::SetAgentStatus(AgentStatus::Streaming));
             self.ensure_session_title();
@@ -1449,7 +1671,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         let Some(project_id) = self.workbench.state.selected_project else {
             return;
         };
-        let Ok(state) = self.runtime.command(json!({"type":"get_state"})) else {
+        let Ok(state) = self.active_command(json!({"type":"get_state"})) else {
             return;
         };
         if state.get("sessionName").and_then(Value::as_str).is_some() {
@@ -1468,8 +1690,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         let title: String = user_message.chars().take(52).collect();
         if !title.trim().is_empty()
             && self
-                .runtime
-                .command(json!({"type":"set_session_name", "name": title}))
+                .active_command(json!({"type":"set_session_name", "name": title}))
                 .is_ok()
             && let Some(path) = state.get("sessionFile").and_then(Value::as_str)
         {
@@ -1477,51 +1698,95 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         }
     }
 
+    /// Drain every session process. Events from the visible session update the
+    /// conversation view; background sessions only update bookkeeping (busy
+    /// dots, sidebar titles) so their progress survives until they are shown.
     fn consume_runtime_events(&mut self) {
-        let events: Vec<_> = self.runtime_events.try_iter().collect();
-        for event in events {
-            match event {
-                RuntimeEvent::Agent(value) => self.apply_agent_event(value),
-                RuntimeEvent::ExtensionUi(value) => self.pending_extension_request = Some(value),
-                RuntimeEvent::Interaction(value) => self.pending_interactions.push(value),
-                RuntimeEvent::Stderr(message) => {
-                    if !message.trim().is_empty() {
-                        self.error = Some(message);
-                    }
-                }
-                RuntimeEvent::Exited { generation, code } => {
-                    if generation == self.runtime.generation() {
-                        self.running_project = None;
-                        self.workbench
-                            .apply(Action::SetAgentStatus(AgentStatus::Failed(format!(
-                                "Pi exited: {code:?}"
-                            ))));
-                    }
-                }
-                RuntimeEvent::Error(error) => self.error = Some(error),
-                RuntimeEvent::RpcResponse(_) => {}
-            }
+        let mut drained: Vec<(String, RuntimeEvent)> = Vec::new();
+        for (key, session) in &self.sessions {
+            drained.extend(session.events.try_iter().map(|event| (key.clone(), event)));
+        }
+        for (key, event) in drained {
+            self.handle_runtime_event(&key, event);
         }
     }
 
-    fn apply_agent_event(&mut self, event: Value) {
+    fn handle_runtime_event(&mut self, key: &str, event: RuntimeEvent) {
+        let is_active = self.active_session.as_deref() == Some(key);
+        match event {
+            RuntimeEvent::Agent(value) => self.apply_agent_event(key, value),
+            RuntimeEvent::ExtensionUi(value) => {
+                self.pending_extension_request = Some((key.to_owned(), value));
+            }
+            RuntimeEvent::Interaction(value) => {
+                self.pending_interactions.push((key.to_owned(), value));
+            }
+            RuntimeEvent::Stderr(message) => {
+                if is_active && !message.trim().is_empty() {
+                    self.error = Some(message);
+                }
+            }
+            RuntimeEvent::Exited { generation, code } => {
+                let current = self
+                    .sessions
+                    .get(key)
+                    .is_some_and(|session| session.runtime.generation() == generation);
+                if !current {
+                    return;
+                }
+                self.sessions.remove(key);
+                self.workbench.apply(Action::SessionRunning {
+                    path: key.to_owned(),
+                    running: false,
+                });
+                if is_active {
+                    self.active_session = None;
+                    self.workbench
+                        .apply(Action::SetAgentStatus(AgentStatus::Failed(format!(
+                            "Pi exited: {code:?}"
+                        ))));
+                }
+            }
+            RuntimeEvent::Error(error) => {
+                if is_active {
+                    self.error = Some(error);
+                }
+            }
+            RuntimeEvent::RpcResponse(_) => {}
+        }
+    }
+
+    fn apply_agent_event(&mut self, key: &str, event: Value) {
+        let is_active = self.active_session.as_deref() == Some(key);
         match event.get("type").and_then(Value::as_str) {
             Some("message_start") | Some("message_update") => {
                 let message = event.get("message").cloned().unwrap_or(Value::Null);
                 if message.get("role").and_then(Value::as_str) == Some("assistant") {
+                    let Some(session) = self.sessions.get_mut(key) else {
+                        return;
+                    };
+                    session.running = true;
+                    self.workbench.apply(Action::SessionRunning {
+                        path: key.to_owned(),
+                        running: true,
+                    });
+                    if !is_active {
+                        return;
+                    }
                     // A new assistant reply means the conversation grew past the
                     // last compaction; a later model switch should compact again.
-                    self.conversation_compacted = false;
+                    session.conversation_compacted = false;
                     let id = message
                         .get("id")
                         .and_then(Value::as_str)
                         .map(str::to_owned)
                         .unwrap_or_else(|| {
-                            self.assistant_message_id
+                            session
+                                .assistant_message_id
                                 .clone()
                                 .unwrap_or_else(|| Uuid::new_v4().to_string())
                         });
-                    if let Some(previous_id) = self.assistant_message_id.replace(id.clone())
+                    if let Some(previous_id) = session.assistant_message_id.replace(id.clone())
                         && previous_id != id
                     {
                         self.workbench.apply(Action::RekeyConversation {
@@ -1557,14 +1822,22 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                     .and_then(Value::as_str)
                     == Some("assistant") =>
             {
-                if let Some(id) = self.assistant_message_id.take() {
+                let Some(session) = self.sessions.get_mut(key) else {
+                    return;
+                };
+                if is_active && let Some(id) = session.assistant_message_id.take() {
                     self.workbench.apply(Action::FinishMessage(id));
                 }
             }
             Some("tool_execution_start") | Some("tool_execution_end") => {
-                self.apply_tool_event(&event)
+                if is_active {
+                    self.apply_tool_event(&event)
+                }
             }
             Some("queue_update") => {
+                if !is_active {
+                    return;
+                }
                 let steering = event
                     .get("steering")
                     .and_then(Value::as_array)
@@ -1593,25 +1866,65 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 });
             }
             Some("agent_settled") => {
-                self.workbench
-                    .apply(Action::SetAgentStatus(AgentStatus::Ready));
-                if let Some(project_id) = self.workbench.state.selected_project {
-                    self.refresh_session_state(project_id);
+                let Some(session) = self.sessions.get_mut(key) else {
+                    return;
+                };
+                session.running = false;
+                let project_id = session.project_id;
+                let state = session.runtime.command(json!({"type":"get_state"})).ok();
+                self.workbench.apply(Action::SessionRunning {
+                    path: key.to_owned(),
+                    running: false,
+                });
+                if let Some(state) = state
+                    && let Some(path) = state.get("sessionFile").and_then(Value::as_str)
+                {
+                    self.index_session(
+                        project_id,
+                        path,
+                        state.get("sessionName").and_then(Value::as_str),
+                    );
+                    if path != key {
+                        self.rekey_session(key, path);
+                    }
                 }
-                self.refresh_runtime_controls();
+                if is_active {
+                    self.workbench
+                        .apply(Action::SetAgentStatus(AgentStatus::Ready));
+                    let _ = self.load_current_entries();
+                    self.refresh_runtime_controls();
+                }
             }
             Some("session_info_changed") => {
-                if let Some(project_id) = self.workbench.state.selected_project
-                    && let Ok(state) = self.runtime.command(json!({"type":"get_state"}))
+                let Some(session) = self.sessions.get(key) else {
+                    return;
+                };
+                let project_id = session.project_id;
+                if let Ok(state) = session.runtime.command(json!({"type":"get_state"}))
                     && let Some(path) = state.get("sessionFile").and_then(Value::as_str)
                 {
                     self.index_session(project_id, path, event.get("name").and_then(Value::as_str));
                 }
             }
-            Some("thinking_level_changed") => self.refresh_runtime_controls(),
+            Some("thinking_level_changed") => {
+                if is_active {
+                    self.refresh_runtime_controls();
+                }
+            }
             Some("compaction_start") => {
+                let Some(session) = self.sessions.get_mut(key) else {
+                    return;
+                };
+                session.running = true;
+                self.workbench.apply(Action::SessionRunning {
+                    path: key.to_owned(),
+                    running: true,
+                });
+                if !is_active {
+                    return;
+                }
                 let item_id = format!("compaction-{}", now_ms());
-                self.compaction_item_id = Some(item_id.clone());
+                session.compaction_item_id = Some(item_id.clone());
                 self.workbench
                     .apply(Action::UpsertConversation(ConversationItem {
                         id: item_id,
@@ -1632,7 +1945,28 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             }
             Some("compaction_end") => {
                 let error = event.get("errorMessage").and_then(Value::as_str);
-                self.conversation_compacted = error.is_none();
+                let Some(session) = self.sessions.get_mut(key) else {
+                    return;
+                };
+                session.running = false;
+                session.conversation_compacted = error.is_none();
+                let pending_prompt = session.pending_prompt.take();
+                let compaction_item_id = session.compaction_item_id.take();
+                self.workbench.apply(Action::SessionRunning {
+                    path: key.to_owned(),
+                    running: false,
+                });
+                if !is_active {
+                    // The deferred prompt continues even with the session in
+                    // the background; only the visible status updates skip.
+                    if let Some((content, attachments, mode)) = pending_prompt {
+                        if self.workbench.state.pending_model.is_some() {
+                            self.apply_pending_model(key);
+                        }
+                        self.send_prompt(key, content, attachments, mode);
+                    }
+                    return;
+                }
                 let benign = error.is_some_and(|e| e.contains("Nothing to compact"));
                 let status = match error {
                     Some(_) if benign => AgentStatus::Ready,
@@ -1640,7 +1974,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                     None => AgentStatus::Ready,
                 };
                 self.workbench.apply(Action::SetAgentStatus(status));
-                if let Some(item_id) = self.compaction_item_id.take() {
+                if let Some(item_id) = compaction_item_id {
                     let (text, is_error) = match error {
                         Some(_) if benign => {
                             ("Nothing to compact (session too small)".to_owned(), false)
@@ -1680,15 +2014,15 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 }
                 // After a switch-triggered compaction, apply the pending model
                 // and send the prompt that was held back.
-                if let Some((content, attachments, mode)) = self.pending_prompt.take() {
+                if let Some((content, attachments, mode)) = pending_prompt {
                     if self.workbench.state.pending_model.is_some() {
-                        self.apply_pending_model();
+                        self.apply_pending_model(key);
                     }
-                    self.send_prompt(content, attachments, mode);
+                    self.send_prompt(key, content, attachments, mode);
                 }
             }
             Some("entry_appended") => {
-                if let Some(entry) = event.get("entry") {
+                if is_active && let Some(entry) = event.get("entry") {
                     self.apply_session_entry(entry);
                 }
             }
@@ -1806,14 +2140,18 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             }));
     }
 
+    /// Settings like the bash policy are process launch flags, so changing
+    /// them restarts every session of the selected project (sessions resume
+    /// from disk; in-flight runs are aborted by the restart, as before).
     fn restart_selected_project(&mut self) {
         if let Some(project) = self.workbench.state.selected_project {
-            self.launch_project(project);
+            self.stop_project_runtimes(project);
+            self.start_project(project);
         }
     }
 
     fn extension_dialog(&mut self, context: &egui::Context) {
-        let Some(request) = self.pending_extension_request.clone() else {
+        let Some((_, request)) = self.pending_extension_request.clone() else {
             return;
         };
         if request.get("method").and_then(Value::as_str) != Some("confirm") {
@@ -1861,7 +2199,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     /// questions. Pi's extension confirmations keep using their RPC response,
     /// while supervisor interactions return through the team tool host.
     fn interaction_dialog(&mut self, context: &egui::Context) {
-        let Some(request) = self.pending_interactions.first().cloned() else {
+        let Some((session_key, request)) = self.pending_interactions.first().cloned() else {
             return;
         };
         let request_id = request["request_id"].as_str().unwrap_or_default();
@@ -1895,25 +2233,29 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                             _ => option,
                         };
                         if ui.button(label).clicked() {
-                            if let Err(error) = self
-                                .runtime
-                                .resolve_user_interaction(request_id.to_owned(), option.to_owned())
-                            {
-                                self.error = Some(error.to_string());
-                            }
+                            self.resolve_interaction(&session_key, request_id, option);
                             self.pending_interactions.remove(0);
                         }
                     }
                 });
             });
         if !open {
-            if let Err(error) = self
-                .runtime
-                .resolve_user_interaction(request_id.to_owned(), cancel_decision.into())
-            {
-                self.error = Some(error.to_string());
-            }
+            self.resolve_interaction(&session_key, request_id, cancel_decision);
             self.pending_interactions.remove(0);
+        }
+    }
+
+    /// Route an approval/question answer to the supervisor of the session that
+    /// asked, which may be running in the background.
+    fn resolve_interaction(&mut self, session_key: &str, request_id: &str, decision: &str) {
+        let Some(session) = self.sessions.get(session_key) else {
+            return;
+        };
+        if let Err(error) = session
+            .runtime
+            .resolve_user_interaction(request_id.to_owned(), decision.to_owned())
+        {
+            self.error = Some(error.to_string());
         }
     }
 }
@@ -2922,26 +3264,24 @@ mod tests {
         directory: &TempDir,
         runtime: FakeRuntime,
     ) -> PiWhimApplication<FakeRuntime> {
-        let runtime_events = runtime.events();
+        // Pooled runtimes are clones of the prototype so the observer sees
+        // every start and command across all session processes.
+        let factory_runtime = runtime;
         PiWhimApplication {
             workbench: Workbench::default(),
             store: Some(SqliteStore::open(directory.path().join("test.sqlite")).unwrap()),
             secrets: MacosKeychainStore::default(),
-            runtime,
-            runtime_events,
-            assistant_message_id: None,
+            runtime_factory: Box::new(move || factory_runtime.clone()),
+            sessions: HashMap::new(),
+            active_session: None,
             pending_extension_request: None,
             pending_interactions: Vec::new(),
             capability_resolver: ModelCapabilityResolver::new(false),
-            running_project: None,
             sessions_root_override: Some(directory.path().join("sessions")),
             agent_directory_override: Some(directory.path().join("agent")),
-            pending_prompt: None,
             attachment_store: AttachmentStore::open(directory.path().join("attachments")).unwrap(),
             finder_paste_monitor: None,
             finder_paste_monitor_install_pending: false,
-            conversation_compacted: false,
-            compaction_item_id: None,
             error: None,
             notice: None,
         }
@@ -2955,6 +3295,17 @@ mod tests {
             pinned: false,
             last_opened_ms: 1,
         }
+    }
+
+    /// Give the app one active session so commands that target the visible
+    /// session have a process to talk to.
+    fn start_test_session(app: &mut PiWhimApplication<FakeRuntime>, directory: &TempDir) {
+        let project = project("test", directory.path());
+        app.store.as_ref().unwrap().save_project(&project).unwrap();
+        app.workbench
+            .apply(Action::ProjectsLoaded(vec![project.clone()]));
+        app.start_new_session(project.id);
+        assert!(app.active_session.is_some());
     }
 
     #[test]
@@ -3177,7 +3528,7 @@ mod tests {
     }
 
     #[test]
-    fn project_targeted_sessions_reuse_cross_project_startup_session() {
+    fn each_new_session_gets_its_own_process_and_reuses_only_empty_sessions() {
         let directory = tempfile::tempdir().unwrap();
         let runtime = FakeRuntime::default();
         let observer = runtime.clone();
@@ -3193,11 +3544,10 @@ mod tests {
 
         app.start_new_session(first.id);
         assert_eq!(observer.starts().len(), 1);
-        assert!(
-            !observer.commands().iter().any(|command| {
-                command.get("type").and_then(Value::as_str) == Some("new_session")
-            })
-        );
+
+        // A still-empty visible session is reused instead of spawning blanks.
+        app.start_new_session(first.id);
+        assert_eq!(observer.starts().len(), 1);
 
         app.workbench
             .apply(Action::UpsertConversation(ConversationItem {
@@ -3215,29 +3565,63 @@ mod tests {
                 attachments: Vec::new(),
             }));
         app.start_new_session(first.id);
-        assert_eq!(
-            observer
-                .commands()
-                .iter()
-                .filter(|command| {
-                    command.get("type").and_then(Value::as_str) == Some("new_session")
-                })
-                .count(),
-            1
-        );
+        assert_eq!(observer.starts().len(), 2);
 
         app.start_new_session(second.id);
-        assert_eq!(observer.starts().len(), 2);
-        assert_eq!(
-            observer
-                .commands()
-                .iter()
-                .filter(|command| {
-                    command.get("type").and_then(Value::as_str) == Some("new_session")
-                })
-                .count(),
-            1
+        assert_eq!(observer.starts().len(), 3);
+
+        // Sessions never share a process, so nothing ever sends Pi's
+        // aborting new_session/switch_session RPCs, and every earlier
+        // session stays alive in the pool.
+        assert!(!observer.commands().iter().any(|command| {
+            matches!(
+                command.get("type").and_then(Value::as_str),
+                Some("new_session") | Some("switch_session")
+            )
+        }));
+        assert_eq!(app.sessions.len(), 3);
+    }
+
+    #[test]
+    fn switching_sessions_keeps_running_sessions_alive() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = FakeRuntime::default();
+        let observer = runtime.clone();
+        let mut app = test_application(&directory, runtime);
+        start_test_session(&mut app, &directory);
+        let project_id = app.workbench.state.selected_project.unwrap();
+        let running_key = app.active_session.clone().unwrap();
+
+        // Session A starts streaming.
+        app.submit_prompt("long task".into(), Vec::new(), SubmitMode::Prompt);
+        assert!(
+            app.sessions
+                .get(&running_key)
+                .is_some_and(|session| session.running)
         );
+
+        // Switching away must not abort A: no abort/new_session/switch_session
+        // RPCs, and A's process stays pooled with its running flag set.
+        app.switch_session(project_id, "/sessions/b.jsonl".into());
+        assert_eq!(app.active_session.as_deref(), Some("/sessions/b.jsonl"));
+        assert_eq!(app.sessions.len(), 2);
+        assert!(
+            app.sessions
+                .get(&running_key)
+                .is_some_and(|session| session.running)
+        );
+        assert!(!observer.commands().iter().any(|command| {
+            matches!(
+                command.get("type").and_then(Value::as_str),
+                Some("abort") | Some("switch_session") | Some("new_session")
+            )
+        }));
+
+        // Switching back reuses A's own process instead of starting a third.
+        app.switch_session(project_id, running_key.clone());
+        assert_eq!(app.active_session.as_deref(), Some(running_key.as_str()));
+        assert_eq!(app.sessions.len(), 2);
+        assert_eq!(observer.starts().len(), 2);
     }
 
     #[test]
@@ -3261,13 +3645,19 @@ mod tests {
         );
         let observer = runtime.clone();
         let mut app = test_application(&directory, runtime);
+        start_test_session(&mut app, &directory);
+        let baseline = observer.commands().len();
 
-        app.set_model(ModelOption {
-            provider: "provider-key".into(),
-            provider_name: "Configured provider".into(),
-            id: "model-a".into(),
-            name: "Model A".into(),
-        });
+        let key = app.active_session.clone().unwrap();
+        app.set_model_on(
+            &key,
+            ModelOption {
+                provider: "provider-key".into(),
+                provider_name: "Configured provider".into(),
+                id: "model-a".into(),
+                name: "Model A".into(),
+            },
+        );
 
         assert_eq!(app.workbench.state.thinking_level, ThinkingLevel::Off);
         assert_eq!(
@@ -3275,7 +3665,7 @@ mod tests {
             vec![ThinkingLevel::Off, ThinkingLevel::Low, ThinkingLevel::High]
         );
         let recorded_commands = observer.commands();
-        let command_types = recorded_commands
+        let command_types = recorded_commands[baseline..]
             .iter()
             .filter_map(|command| command.get("type").and_then(Value::as_str))
             .collect::<Vec<_>>();
@@ -3326,8 +3716,7 @@ mod tests {
         let runtime = FakeRuntime::default();
         let observer = runtime.clone();
         let mut app = test_application(&directory, runtime);
-        let project = project("test", directory.path());
-        app.workbench.state.selected_project = Some(project.id);
+        start_test_session(&mut app, &directory);
         app.workbench
             .apply(Action::SetAgentStatus(AgentStatus::Ready));
         let attachment_path = directory.path().join("notes.txt");
@@ -3367,20 +3756,19 @@ mod tests {
         runtime.set_response("get_state", json!({"autoCompactionEnabled": false}));
         let observer = runtime.clone();
         let mut app = test_application(&directory, runtime);
+        start_test_session(&mut app, &directory);
 
         app.set_auto_compaction(false);
 
         assert!(!app.workbench.state.auto_compaction_enabled);
-        assert_eq!(
-            observer.commands()[0].get("type").and_then(Value::as_str),
-            Some("set_auto_compaction")
-        );
-        assert_eq!(
-            observer.commands()[0]
-                .get("enabled")
-                .and_then(Value::as_bool),
-            Some(false)
-        );
+        let command = observer
+            .commands()
+            .into_iter()
+            .find(|command| {
+                command.get("type").and_then(Value::as_str) == Some("set_auto_compaction")
+            })
+            .expect("set_auto_compaction command");
+        assert_eq!(command.get("enabled").and_then(Value::as_bool), Some(false));
     }
 
     #[test]
@@ -3401,11 +3789,20 @@ mod tests {
         runtime.set_response("get_available_thinking_levels", json!({"levels":["off"]}));
         let observer = runtime.clone();
         let mut app = test_application(&directory, runtime);
-        let project_id = Uuid::new_v4();
-        app.running_project = Some(project_id);
+        let project = project("test", directory.path());
+        let project_id = project.id;
+        app.store.as_ref().unwrap().save_project(&project).unwrap();
+        app.workbench.apply(Action::ProjectsLoaded(vec![project]));
+        let session_path = "/sessions/agent-model-b.jsonl";
 
-        app.switch_session(project_id, "/sessions/agent-model-b.jsonl".into());
+        app.switch_session(project_id, session_path.into());
 
+        // The session opens in its own process; Pi restores its recorded
+        // model there and the picker reflects it immediately.
+        assert_eq!(
+            observer.starts()[0].session_path.as_deref(),
+            Some(session_path)
+        );
         assert_eq!(
             app.workbench
                 .state
@@ -3422,7 +3819,6 @@ mod tests {
         assert_eq!(
             command_types,
             vec![
-                "switch_session",
                 "get_entries",
                 "get_state",
                 "get_available_models",

@@ -16,7 +16,8 @@ mod web_search;
 use std::{
     collections::{HashMap, VecDeque},
     io::{BufRead, BufReader, Read, Write},
-    net::{TcpListener, TcpStream},
+    net::{Shutdown, TcpListener, TcpStream},
+    panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
     sync::{
         Arc, Condvar, Mutex,
@@ -317,6 +318,7 @@ fn start_server(
 
 fn handle_connection(mut stream: TcpStream, host: &HostContext) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
     let cloned = match stream.try_clone() {
         Ok(stream) => stream,
         Err(_) => return,
@@ -332,15 +334,36 @@ fn handle_connection(mut stream: TcpStream, host: &HostContext) {
         Ok(_) => match serde_json::from_str::<ToolRequest>(&request_line) {
             Ok(request) => {
                 let cancelled = Arc::new(AtomicBool::new(false));
-                watch_disconnect(&stream, cancelled.clone());
-                dispatch_request_cancellable(host, request, Some(&cancelled))
+                let disconnect_watch = watch_disconnect(&stream, cancelled.clone());
+                let request_id = request.request_id.clone();
+                let response = guarded_dispatch(request_id, || {
+                    dispatch_request_cancellable(host, request, Some(&cancelled))
+                });
+                disconnect_watch.stop(&stream);
+                response
             }
             Err(error) => ToolResponse::error("unknown", "invalid_request", error.to_string()),
         },
     };
-    if let Ok(mut encoded) = serde_json::to_vec(&response) {
-        encoded.push(b'\n');
-        let _ = stream.write_all(&encoded);
+    match serde_json::to_vec(&response) {
+        Ok(mut encoded) => {
+            encoded.push(b'\n');
+            if let Err(error) = stream.write_all(&encoded) {
+                eprintln!("agent-team response write failed: {error}");
+            }
+        }
+        Err(error) => eprintln!("agent-team response serialization failed: {error}"),
+    }
+    let _ = stream.shutdown(Shutdown::Both);
+}
+
+fn guarded_dispatch<F>(request_id: String, dispatch: F) -> ToolResponse
+where
+    F: FnOnce() -> ToolResponse,
+{
+    match catch_unwind(AssertUnwindSafe(dispatch)) {
+        Ok(response) => response,
+        Err(_) => ToolResponse::error(request_id, "internal", "agent tool failed unexpectedly"),
     }
 }
 
@@ -477,14 +500,34 @@ fn is_policy_tool(tool: &str) -> bool {
     )
 }
 
-fn watch_disconnect(stream: &TcpStream, cancelled: Arc<AtomicBool>) {
+struct DisconnectWatch {
+    stop: Arc<AtomicBool>,
+    handle: JoinHandle<()>,
+}
+
+impl DisconnectWatch {
+    fn stop(self, stream: &TcpStream) {
+        self.stop.store(true, Ordering::Relaxed);
+        // Wake a monitor currently blocked in `read` without closing the
+        // write half that still has to deliver the response.
+        let _ = stream.shutdown(Shutdown::Read);
+        let _ = self.handle.join();
+    }
+}
+
+fn watch_disconnect(stream: &TcpStream, cancelled: Arc<AtomicBool>) -> DisconnectWatch {
     let Ok(mut monitor) = stream.try_clone() else {
-        return;
+        return DisconnectWatch {
+            stop: Arc::new(AtomicBool::new(true)),
+            handle: thread::spawn(|| {}),
+        };
     };
     let _ = monitor.set_read_timeout(Some(Duration::from_millis(250)));
-    thread::spawn(move || {
+    let stop = Arc::new(AtomicBool::new(false));
+    let monitor_stop = stop.clone();
+    let handle = thread::spawn(move || {
         let mut byte = [0u8; 1];
-        loop {
+        while !monitor_stop.load(Ordering::Relaxed) {
             match monitor.read(&mut byte) {
                 Ok(0) => {
                     cancelled.store(true, Ordering::Relaxed);
@@ -503,6 +546,7 @@ fn watch_disconnect(stream: &TcpStream, cancelled: Arc<AtomicBool>) {
             }
         }
     });
+    DisconnectWatch { stop, handle }
 }
 
 fn prompt_context(host: &HostContext, actor_id: AgentId, value: &Value) -> HostResult {
@@ -2673,6 +2717,34 @@ mod tests {
         .unwrap();
         let capability = supervisor.root_capability.clone();
         (supervisor, capability)
+    }
+
+    #[test]
+    fn panicking_tool_dispatch_returns_a_bounded_error() {
+        let response = guarded_dispatch("panic-request".into(), || {
+            panic!("simulated tool panic");
+        });
+        assert!(response.is_error);
+        assert_eq!(response.request_id, "panic-request");
+        assert_eq!(response.error_code.as_deref(), Some("internal"));
+        assert_eq!(
+            response.content["message"],
+            "agent tool failed unexpectedly"
+        );
+    }
+
+    #[test]
+    fn disconnect_monitor_is_joined_without_waiting_for_the_client() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let watch = watch_disconnect(&server, cancelled);
+
+        let started = Instant::now();
+        watch.stop(&server);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(client);
     }
 
     #[test]
