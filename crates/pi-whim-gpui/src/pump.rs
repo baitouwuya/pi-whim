@@ -13,6 +13,12 @@
 //! The returned [`gpui::Task`] must be **stored**, not detached. Dropping a task
 //! cancels it, which is exactly the lifetime wanted: when the view that owns the
 //! pump goes away, the loop stops with it.
+//!
+//! What it delivers to is the host, not the shell. Events become state changes
+//! through the session pool — which key a token belongs to now, whether the
+//! process that sent it is still the current generation — and the pool is the
+//! host's. A shell that collected them for the host to fetch would be a queue in
+//! the middle of a path that has no need of one.
 
 use gpui::{AsyncWindowContext, Context, Task, WeakEntity, Window};
 use pi_whim_engine::mailbox::{Delivery, RuntimeEvent, SessionToken};
