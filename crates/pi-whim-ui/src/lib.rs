@@ -18,9 +18,9 @@ use eframe::egui::{
     SidePanel, Stroke, TextEdit, TopBottomPanel, Ui, Vec2,
 };
 use pi_whim_core::{
-    Action, AgentStatus, AgentTeamConfig, AppState, BashPolicy, ConversationItem, ConversationRole,
-    Language, MAX_AGENT_DEPTH, MAX_AGENTS_PER_LEVEL, ModelOption, ProjectId, ProviderId,
-    ProviderModel, ProviderProfile, ProviderProtocol, QueueMode, SearchEngineProfile,
+    Action, AgentTeamConfig, AppState, BashPolicy, ConversationItem, ConversationRole, Language,
+    MAX_AGENT_DEPTH, MAX_AGENTS_PER_LEVEL, ModelOption, ProjectId, ProviderId, ProviderModel,
+    ProviderProfile, ProviderProtocol, QueueMode, SearchEngineProfile, SessionStatus,
     ThinkingLevel, provider_name_key,
 };
 
@@ -883,10 +883,10 @@ impl Workbench {
     fn status_pill(&mut self, ui: &mut Ui) {
         let (color, label) = status_visual(&self.state);
         let busy = matches!(
-            self.state.agent_status,
-            AgentStatus::Starting | AgentStatus::Streaming | AgentStatus::Compacting
+            self.state.session_status,
+            SessionStatus::Starting | SessionStatus::Streaming | SessionStatus::Compacting
         );
-        let failed = matches!(self.state.agent_status, AgentStatus::Failed(_));
+        let failed = matches!(self.state.session_status, SessionStatus::Failed(_));
         Frame::default()
             .fill(tint(color, 20))
             .stroke(Stroke::new(1.0_f32, tint(color, 110)))
@@ -914,8 +914,8 @@ impl Workbench {
     /// Prominent request-failure banner under the top bar. The previous design
     /// only surfaced errors as a tiny "ERROR" label, easy to miss entirely.
     fn error_banner(&mut self, context: &egui::Context) {
-        let error = match &self.state.agent_status {
-            AgentStatus::Failed(error) => error.clone(),
+        let error = match &self.state.session_status {
+            SessionStatus::Failed(error) => error.clone(),
             _ => {
                 self.dismissed_error = None;
                 return;
@@ -966,7 +966,7 @@ impl Workbench {
     /// Context compaction hint: a slim accent banner shown while Pi summarizes
     /// older messages, so the pause never looks like a hang.
     fn compacting_banner(&mut self, context: &egui::Context) {
-        if !matches!(self.state.agent_status, AgentStatus::Compacting) {
+        if !matches!(self.state.session_status, SessionStatus::Compacting) {
             return;
         }
         TopBottomPanel::top("compacting-banner")
@@ -1458,7 +1458,7 @@ impl Workbench {
                             }
                             previous_role = Some(role);
                         }
-                        if matches!(self.state.agent_status, AgentStatus::Streaming) {
+                        if matches!(self.state.session_status, SessionStatus::Streaming) {
                             self.thinking_indicator(ui);
                         }
                     });
@@ -1540,7 +1540,7 @@ impl Workbench {
                         }
                     });
                 });
-        } else if let AgentStatus::Failed(error) = &self.state.agent_status {
+        } else if let SessionStatus::Failed(error) = &self.state.session_status {
             ui.label(
                 RichText::new(format!(
                     "{}: {error}",
@@ -1833,9 +1833,9 @@ impl Workbench {
                                                 Layout::right_to_left(Align::Center),
                                                 |ui| {
                                                     if matches!(
-                                                        self.state.agent_status,
-                                                        AgentStatus::Streaming
-                                                            | AgentStatus::Compacting
+                                                        self.state.session_status,
+                                                        SessionStatus::Streaming
+                                                            | SessionStatus::Compacting
                                                     ) && ui
                                                         .add_sized(
                                                             [72.0, 30.0],
@@ -2628,13 +2628,13 @@ fn serif_font(size: f32) -> FontId {
 }
 
 fn status_visual(state: &AppState) -> (Color32, &'static str) {
-    match state.agent_status {
-        AgentStatus::Offline => (MUTED_INK, "OFFLINE"),
-        AgentStatus::Starting => (BLUE, "STARTING"),
-        AgentStatus::Ready => (SUCCESS, "READY"),
-        AgentStatus::Streaming => (BLUE, "WORKING"),
-        AgentStatus::Compacting => (WARNING, "COMPACTING"),
-        AgentStatus::Failed(_) => (ERROR_RED, "ERROR"),
+    match state.session_status {
+        SessionStatus::Offline => (MUTED_INK, "OFFLINE"),
+        SessionStatus::Starting => (BLUE, "STARTING"),
+        SessionStatus::Ready => (SUCCESS, "READY"),
+        SessionStatus::Streaming => (BLUE, "WORKING"),
+        SessionStatus::Compacting => (WARNING, "COMPACTING"),
+        SessionStatus::Failed(_) => (ERROR_RED, "ERROR"),
     }
 }
 

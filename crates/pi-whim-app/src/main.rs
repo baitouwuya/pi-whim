@@ -13,9 +13,9 @@ use std::{
 
 use eframe::egui;
 use pi_whim_core::{
-    Action, AgentStatus, Attachment, AttachmentKind, BashPolicy, ConversationItem,
-    ConversationRole, ModelOption, Project, ProjectId, ProviderId, ProviderModel, ProviderProfile,
-    ProviderProtocol, QueueMode, SearchEngineProfile, SessionMetrics, SessionSummary,
+    Action, Attachment, AttachmentKind, BashPolicy, ConversationItem, ConversationRole,
+    ModelOption, Project, ProjectId, ProviderId, ProviderModel, ProviderProfile, ProviderProtocol,
+    QueueMode, SearchEngineProfile, SessionMetrics, SessionStatus, SessionSummary,
     SlashCommandInfo, ThinkingLevel, normalize_provider_display_name, provider_name_key,
     stable_session_id,
 };
@@ -220,8 +220,8 @@ impl<R: AgentRuntime> eframe::App for PiWhimApplication<R> {
         }
         let session_running = self.sessions.values().any(|session| session.running);
         let agent_busy = matches!(
-            self.workbench.state.agent_status,
-            AgentStatus::Starting | AgentStatus::Streaming | AgentStatus::Compacting
+            self.workbench.state.session_status,
+            SessionStatus::Starting | SessionStatus::Streaming | SessionStatus::Compacting
         );
         if session_running || agent_busy {
             // Runtime events arrive on channels and need a periodic poll while
@@ -799,7 +799,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         };
         if self.active_session.is_none() {
             self.workbench
-                .apply(Action::SetAgentStatus(AgentStatus::Starting));
+                .apply(Action::SetSessionStatus(SessionStatus::Starting));
         }
         let mut extension_paths = Vec::new();
         match ensure_agent_team_extension(&sessions_path) {
@@ -807,7 +807,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             Err(error) => {
                 if self.active_session.is_none() {
                     self.workbench
-                        .apply(Action::SetAgentStatus(AgentStatus::Failed(
+                        .apply(Action::SetSessionStatus(SessionStatus::Failed(
                             error.to_string(),
                         )));
                 }
@@ -836,7 +836,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         }) {
             if self.active_session.is_none() {
                 self.workbench
-                    .apply(Action::SetAgentStatus(AgentStatus::Failed(
+                    .apply(Action::SetSessionStatus(SessionStatus::Failed(
                         error.to_string(),
                     )));
             }
@@ -890,10 +890,10 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 .apply(Action::SelectSession(stable_session_id(key)));
         }
         self.workbench.apply(Action::ClearConversation);
-        self.workbench.apply(Action::SetAgentStatus(if running {
-            AgentStatus::Streaming
+        self.workbench.apply(Action::SetSessionStatus(if running {
+            SessionStatus::Streaming
         } else {
-            AgentStatus::Ready
+            SessionStatus::Ready
         }));
         let _ = self.load_current_entries();
         self.refresh_runtime_controls();
@@ -935,7 +935,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                     self.active_session = None;
                     self.workbench.apply(Action::ClearConversation);
                     self.workbench
-                        .apply(Action::SetAgentStatus(AgentStatus::Offline));
+                        .apply(Action::SetSessionStatus(SessionStatus::Offline));
                 }
             }
         }
@@ -956,7 +956,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             Ok(state) => state,
             Err(error) => {
                 self.workbench
-                    .apply(Action::SetAgentStatus(AgentStatus::Failed(error)));
+                    .apply(Action::SetSessionStatus(SessionStatus::Failed(error)));
                 return;
             }
         };
@@ -971,7 +971,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 .collect(),
             Err(error) => {
                 self.workbench
-                    .apply(Action::SetAgentStatus(AgentStatus::Failed(error)));
+                    .apply(Action::SetSessionStatus(SessionStatus::Failed(error)));
                 Vec::new()
             }
         };
@@ -1116,7 +1116,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     }
 
     fn compact_session(&mut self) {
-        if !matches!(self.workbench.state.agent_status, AgentStatus::Ready) {
+        if !matches!(self.workbench.state.session_status, SessionStatus::Ready) {
             return;
         }
         if let Err(error) = self.active_send(json!({"type":"compact"})) {
@@ -1127,7 +1127,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             session.running = true;
         }
         self.workbench
-            .apply(Action::SetAgentStatus(AgentStatus::Compacting));
+            .apply(Action::SetSessionStatus(SessionStatus::Compacting));
     }
 
     fn set_queue_modes(&mut self, steering: QueueMode, follow_up: QueueMode) {
@@ -1411,7 +1411,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 self.active_session = None;
                 self.workbench.apply(Action::ClearConversation);
                 self.workbench
-                    .apply(Action::SetAgentStatus(AgentStatus::Offline));
+                    .apply(Action::SetSessionStatus(SessionStatus::Offline));
             }
         }
         let target = PathBuf::from(&path);
@@ -1558,8 +1558,8 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             return;
         }
         if !matches!(
-            self.workbench.state.agent_status,
-            AgentStatus::Ready | AgentStatus::Streaming | AgentStatus::Compacting
+            self.workbench.state.session_status,
+            SessionStatus::Ready | SessionStatus::Streaming | SessionStatus::Compacting
         ) {
             self.error = Some("Pi is not ready for the selected project yet.".into());
             return;
@@ -1607,7 +1607,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                         session.running = true;
                     }
                     self.workbench
-                        .apply(Action::SetAgentStatus(AgentStatus::Compacting));
+                        .apply(Action::SetSessionStatus(SessionStatus::Compacting));
                 }
                 Err(error) => self.error = Some(error),
             }
@@ -1662,7 +1662,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         });
         if is_active {
             self.workbench
-                .apply(Action::SetAgentStatus(AgentStatus::Streaming));
+                .apply(Action::SetSessionStatus(SessionStatus::Streaming));
             self.ensure_session_title();
         }
     }
@@ -1742,7 +1742,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 if is_active {
                     self.active_session = None;
                     self.workbench
-                        .apply(Action::SetAgentStatus(AgentStatus::Failed(format!(
+                        .apply(Action::SetSessionStatus(SessionStatus::Failed(format!(
                             "Pi exited: {code:?}"
                         ))));
                 }
@@ -1890,7 +1890,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 }
                 if is_active {
                     self.workbench
-                        .apply(Action::SetAgentStatus(AgentStatus::Ready));
+                        .apply(Action::SetSessionStatus(SessionStatus::Ready));
                     let _ = self.load_current_entries();
                     self.refresh_runtime_controls();
                 }
@@ -1941,7 +1941,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                         attachments: Vec::new(),
                     }));
                 self.workbench
-                    .apply(Action::SetAgentStatus(AgentStatus::Compacting));
+                    .apply(Action::SetSessionStatus(SessionStatus::Compacting));
             }
             Some("compaction_end") => {
                 let error = event.get("errorMessage").and_then(Value::as_str);
@@ -1969,11 +1969,11 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 }
                 let benign = error.is_some_and(|e| e.contains("Nothing to compact"));
                 let status = match error {
-                    Some(_) if benign => AgentStatus::Ready,
-                    Some(e) => AgentStatus::Failed(e.to_owned()),
-                    None => AgentStatus::Ready,
+                    Some(_) if benign => SessionStatus::Ready,
+                    Some(e) => SessionStatus::Failed(e.to_owned()),
+                    None => SessionStatus::Ready,
                 };
-                self.workbench.apply(Action::SetAgentStatus(status));
+                self.workbench.apply(Action::SetSessionStatus(status));
                 if let Some(item_id) = compaction_item_id {
                     let (text, is_error) = match error {
                         Some(_) if benign => {
@@ -3718,7 +3718,7 @@ mod tests {
         let mut app = test_application(&directory, runtime);
         start_test_session(&mut app, &directory);
         app.workbench
-            .apply(Action::SetAgentStatus(AgentStatus::Ready));
+            .apply(Action::SetSessionStatus(SessionStatus::Ready));
         let attachment_path = directory.path().join("notes.txt");
         fs::write(&attachment_path, "notes").unwrap();
         let attachment = attachment_from_path(&attachment_path, false).unwrap();

@@ -1,4 +1,4 @@
-use pi_whim_core::{AgentStatus, AppState, ModelOption, ThinkingLevel};
+use pi_whim_core::{AppState, ModelOption, SessionStatus, ThinkingLevel};
 
 use crate::icons::Icon;
 
@@ -278,8 +278,8 @@ fn primary_options(state: &AppState, chinese: bool) -> Vec<SlashCommandOption> {
     }
 
     if matches!(
-        state.agent_status,
-        AgentStatus::Streaming | AgentStatus::Compacting
+        state.session_status,
+        SessionStatus::Streaming | SessionStatus::Compacting
     ) {
         options.push(builtin(
             SlashCommand::Stop,

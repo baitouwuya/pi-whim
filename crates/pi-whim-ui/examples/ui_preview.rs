@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use eframe::egui;
 use pi_whim_core::{
-    Action, AgentStatus, ConversationItem, ConversationRole, Language, ModelOption, Project,
-    ProjectId, QueueMode, SessionMetrics, SessionSummary, ThinkingLevel,
+    Action, ConversationItem, ConversationRole, Language, ModelOption, Project, ProjectId,
+    QueueMode, SessionMetrics, SessionStatus, SessionSummary, ThinkingLevel,
 };
 use pi_whim_ui::{Workbench, install_fonts};
 
@@ -190,18 +190,18 @@ fn mock_workbench(status: &str) -> Workbench {
             cost_microusd: 1_240_000,
         }));
 
-    let agent_status = match status {
-        "streaming" => AgentStatus::Streaming,
-        "compacting" => AgentStatus::Compacting,
-        "failed" => AgentStatus::Failed(
+    let session_status = match status {
+        "streaming" => SessionStatus::Streaming,
+        "compacting" => SessionStatus::Compacting,
+        "failed" => SessionStatus::Failed(
             "POST https://api.openai.com/v1/responses: 429 Too Many Requests — rate limited, retry in 32s"
                 .into(),
         ),
-        _ => AgentStatus::Ready,
+        _ => SessionStatus::Ready,
     };
     workbench
         .state
-        .dispatch(Action::SetAgentStatus(agent_status));
+        .dispatch(Action::SetSessionStatus(session_status));
 
     if status == "bubble" {
         for item in [

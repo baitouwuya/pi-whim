@@ -514,7 +514,7 @@ pub struct AppState {
     pub bash_policy: BashPolicy,
     pub bash_blocked_patterns: Vec<String>,
     pub agent_team_config: AgentTeamConfig,
-    pub agent_status: AgentStatus,
+    pub session_status: SessionStatus,
     pub pending_steering: Vec<String>,
     pub pending_follow_up: Vec<String>,
     pub current_model: Option<ModelOption>,
@@ -534,8 +534,14 @@ pub struct AppState {
     pub search_engine_profiles: Vec<SearchEngineProfile>,
 }
 
+/// Where the visible session's Pi process stands.
+///
+/// Distinct from `pi_whim_agent_team::AgentStatus`, which tracks the lifecycle
+/// of a single spawned sub-agent. This one describes a whole session, so a
+/// session can be `Ready` while several of its sub-agents are still running.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub enum AgentStatus {
+pub enum SessionStatus {
+    /// No Pi process for this session yet.
     #[default]
     Offline,
     Starting,
@@ -581,7 +587,7 @@ pub enum Action {
     RuntimeCommandsUpdated(Vec<SlashCommandInfo>),
     SetPendingModel(Option<ModelOption>),
     SessionMetricsUpdated(SessionMetrics),
-    SetAgentStatus(AgentStatus),
+    SetSessionStatus(SessionStatus),
     UpsertConversation(ConversationItem),
     RekeyConversation {
         from: String,
@@ -694,7 +700,7 @@ impl AppState {
             }
             Action::SetPendingModel(model) => self.pending_model = model,
             Action::SessionMetricsUpdated(metrics) => self.session_metrics = Some(metrics),
-            Action::SetAgentStatus(status) => self.agent_status = status,
+            Action::SetSessionStatus(status) => self.session_status = status,
             Action::UpsertConversation(item) => {
                 if let Some(existing) = self
                     .conversation
