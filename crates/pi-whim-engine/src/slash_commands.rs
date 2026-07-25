@@ -1,9 +1,47 @@
+//! The slash-command palette: what typing `/` in the composer can offer.
+//!
+//! Every option here is derived from state — which models the agent reported,
+//! which thinking levels it offers, which user messages a fork could start from —
+//! so this is a pure query over `AppState`, not a widget.
+//!
+//! It lived in the egui crate, coupled to it by exactly one thing: each option
+//! named an `egui::icons::Icon`. That one type was enough to keep 500 lines of
+//! translation out of reach of a second view, so the icon becomes a purpose
+//! ([`CommandIcon`]) that each view maps to its own glyph.
+
 use pi_whim_core::{AppState, ModelOption, SessionStatus, ThinkingLevel};
 
-use crate::icons::Icon;
+/// What an option is *for*, so each view can pick its own glyph.
+///
+/// Deliberately smaller than either view's icon set: this names the handful of
+/// meanings the palette needs, and nothing about how they are drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandIcon {
+    /// A model or provider choice.
+    Model,
+    /// Reasoning effort.
+    Thinking,
+    /// Anything that duplicates or exports.
+    Copy,
+    /// A message, session, or anything conversational.
+    Message,
+    /// Context compaction.
+    Compact,
+    /// An attachment from disk.
+    File,
+    /// Preferences and shortcuts.
+    Settings,
+    /// Interrupting the turn in flight.
+    Stop,
+}
 
-#[derive(Clone, Debug)]
-pub(crate) enum SlashCommand {
+/// One thing the palette can do.
+///
+/// `PartialEq` is here so a host's request queue stays comparable in tests —
+/// asserting that picking a row queued the right command beats reading it back
+/// out through a match.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SlashCommand {
     NewSession,
     AddAttachment,
     ChooseModel,
@@ -26,17 +64,17 @@ pub(crate) enum SlashCommand {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct SlashCommandOption {
+pub struct SlashCommandOption {
     pub command: SlashCommand,
     pub trigger: String,
     pub title: String,
     pub detail: String,
-    pub icon: Icon,
+    pub icon: CommandIcon,
     keywords: Vec<String>,
 }
 
 impl SlashCommandOption {
-    fn matches(&self, query: &str) -> bool {
+    pub fn matches(&self, query: &str) -> bool {
         let query = query.trim().to_lowercase();
         query.is_empty()
             || self.trigger.to_lowercase().contains(&query)
@@ -50,7 +88,7 @@ impl SlashCommandOption {
 }
 
 /// Returns the commands relevant to a composer that begins with `/`.
-pub(crate) fn options(state: &AppState, composer: &str) -> Option<Vec<SlashCommandOption>> {
+pub fn options(state: &AppState, composer: &str) -> Option<Vec<SlashCommandOption>> {
     let query = composer.strip_prefix('/')?;
     if query.contains(['\n', '\r']) {
         return None;
@@ -70,7 +108,7 @@ pub(crate) fn options(state: &AppState, composer: &str) -> Option<Vec<SlashComma
             "/name",
             text(chinese, "设置会话名称", "Set session name"),
             name,
-            Icon::Message,
+            CommandIcon::Message,
         )]);
     }
     if let Some(path) = command_argument(query, "export") {
@@ -79,7 +117,7 @@ pub(crate) fn options(state: &AppState, composer: &str) -> Option<Vec<SlashComma
             "/export",
             text(chinese, "导出会话", "Export session"),
             path,
-            Icon::Copy,
+            CommandIcon::Copy,
         )]);
     }
     if let Some(fork_query) = command_argument(query, "fork") {
@@ -123,7 +161,7 @@ fn primary_options(state: &AppState, chinese: bool) -> Vec<SlashCommandOption> {
             "Select model",
             "选择供应商和模型",
             "Choose a provider and model",
-            Icon::Cube,
+            CommandIcon::Model,
             chinese,
         ),
         builtin(
@@ -133,7 +171,7 @@ fn primary_options(state: &AppState, chinese: bool) -> Vec<SlashCommandOption> {
             "Export session",
             "导出为 HTML；也可输入目标路径",
             "Export as HTML or provide a path",
-            Icon::Copy,
+            CommandIcon::Copy,
             chinese,
         ),
         builtin(
@@ -143,7 +181,7 @@ fn primary_options(state: &AppState, chinese: bool) -> Vec<SlashCommandOption> {
             "Share session",
             "创建私密 GitHub Gist 分享链接",
             "Create a secret GitHub Gist share link",
-            Icon::Copy,
+            CommandIcon::Copy,
             chinese,
         ),
         builtin(
@@ -153,7 +191,7 @@ fn primary_options(state: &AppState, chinese: bool) -> Vec<SlashCommandOption> {
             "Copy last reply",
             "复制最后一条 agent 汇报",
             "Copy the last agent message",
-            Icon::Copy,
+            CommandIcon::Copy,
             chinese,
         ),
         builtin(
@@ -163,7 +201,7 @@ fn primary_options(state: &AppState, chinese: bool) -> Vec<SlashCommandOption> {
             "Name session",
             "设置当前会话名称",
             "Set the current session name",
-            Icon::Message,
+            CommandIcon::Message,
             chinese,
         ),
         builtin(
@@ -173,7 +211,7 @@ fn primary_options(state: &AppState, chinese: bool) -> Vec<SlashCommandOption> {
             "Session info",
             "显示当前会话统计",
             "Show current session statistics",
-            Icon::Message,
+            CommandIcon::Message,
             chinese,
         ),
         builtin(
@@ -183,7 +221,7 @@ fn primary_options(state: &AppState, chinese: bool) -> Vec<SlashCommandOption> {
             "Changelog",
             "查看 Pi 更新日志",
             "View Pi changelog entries",
-            Icon::Message,
+            CommandIcon::Message,
             chinese,
         ),
         builtin(
@@ -193,7 +231,7 @@ fn primary_options(state: &AppState, chinese: bool) -> Vec<SlashCommandOption> {
             "Hotkeys",
             "显示键盘快捷键",
             "Show keyboard shortcuts",
-            Icon::Settings,
+            CommandIcon::Settings,
             chinese,
         ),
         builtin(
@@ -203,7 +241,7 @@ fn primary_options(state: &AppState, chinese: bool) -> Vec<SlashCommandOption> {
             "Fork session",
             "从一条用户消息创建分支",
             "Fork from a previous user message",
-            Icon::Message,
+            CommandIcon::Message,
             chinese,
         ),
         builtin(
@@ -213,7 +251,7 @@ fn primary_options(state: &AppState, chinese: bool) -> Vec<SlashCommandOption> {
             "Clone session",
             "复制当前会话位置",
             "Duplicate the current session position",
-            Icon::Copy,
+            CommandIcon::Copy,
             chinese,
         ),
         builtin(
@@ -223,7 +261,7 @@ fn primary_options(state: &AppState, chinese: bool) -> Vec<SlashCommandOption> {
             "New session",
             "在当前项目开始新会话",
             "Start a fresh session in this project",
-            Icon::Message,
+            CommandIcon::Message,
             chinese,
         ),
         builtin(
@@ -233,7 +271,7 @@ fn primary_options(state: &AppState, chinese: bool) -> Vec<SlashCommandOption> {
             "Compact context",
             "立即压缩当前会话历史",
             "Compact the current session context",
-            Icon::Compress,
+            CommandIcon::Compact,
             chinese,
         ),
         builtin(
@@ -247,7 +285,7 @@ fn primary_options(state: &AppState, chinese: bool) -> Vec<SlashCommandOption> {
                 state.thinking_level.as_str()
             ),
             &format!("Current: {}", state.thinking_level.as_str()),
-            Icon::Brain,
+            CommandIcon::Thinking,
             chinese,
         ),
         builtin(
@@ -257,7 +295,7 @@ fn primary_options(state: &AppState, chinese: bool) -> Vec<SlashCommandOption> {
             "Add attachment",
             "从本机选择文件或文件夹作为附件",
             "Attach files or folders from this Mac",
-            Icon::File,
+            CommandIcon::File,
             chinese,
         ),
     ];
@@ -272,7 +310,7 @@ fn primary_options(state: &AppState, chinese: bool) -> Vec<SlashCommandOption> {
             } else {
                 format!("{} · {}", command.source, command.description)
             },
-            Icon::Message,
+            CommandIcon::Message,
             &[&command.source],
         ));
     }
@@ -288,7 +326,7 @@ fn primary_options(state: &AppState, chinese: bool) -> Vec<SlashCommandOption> {
             "Stop",
             "停止当前响应",
             "Stop the current response",
-            Icon::Close,
+            CommandIcon::Stop,
             chinese,
         ));
     }
@@ -303,7 +341,7 @@ fn builtin(
     english_title: &str,
     chinese_detail: &str,
     english_detail: &str,
-    icon: Icon,
+    icon: CommandIcon,
     chinese: bool,
 ) -> SlashCommandOption {
     option(
@@ -337,7 +375,7 @@ fn model_options(state: &AppState, query: &str, chinese: bool) -> Vec<SlashComma
                 } else {
                     format!("{} · {}", model.provider_name, model.id)
                 },
-                Icon::Cube,
+                CommandIcon::Model,
                 &["model", "模型", if chinese { "选择" } else { "select" }],
             )
         })
@@ -361,7 +399,7 @@ fn thinking_options(state: &AppState, query: &str, chinese: bool) -> Vec<SlashCo
                 } else {
                     text(chinese, "切换思考深度", "Use this thinking level")
                 },
-                Icon::Brain,
+                CommandIcon::Thinking,
                 &["thinking", "reasoning", "思考", "深度"],
             )
         })
@@ -382,7 +420,7 @@ fn fork_options(state: &AppState, query: &str, chinese: bool) -> Vec<SlashComman
                 "/fork",
                 preview,
                 text(chinese, "从这条用户消息分叉", "Fork from this user message"),
-                Icon::Message,
+                CommandIcon::Message,
                 &["fork", "分叉"],
             )
         })
@@ -394,7 +432,7 @@ fn direct_option(
     trigger: &str,
     title: String,
     detail: &str,
-    icon: Icon,
+    icon: CommandIcon,
 ) -> SlashCommandOption {
     option(
         command,
@@ -411,7 +449,7 @@ fn option(
     trigger: impl Into<String>,
     title: impl Into<String>,
     detail: impl Into<String>,
-    icon: Icon,
+    icon: CommandIcon,
     keywords: &[&str],
 ) -> SlashCommandOption {
     SlashCommandOption {

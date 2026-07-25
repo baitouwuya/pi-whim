@@ -4,7 +4,6 @@ mod chat;
 mod icons;
 mod markdown;
 mod settings;
-mod slash_commands;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -558,9 +557,9 @@ impl Workbench {
     fn activate_slash_command(
         &mut self,
         context: &egui::Context,
-        command: slash_commands::SlashCommand,
+        command: pi_whim_engine::slash_commands::SlashCommand,
     ) {
-        use slash_commands::SlashCommand;
+        use pi_whim_engine::slash_commands::SlashCommand;
 
         match command {
             SlashCommand::NewSession => {
@@ -677,7 +676,9 @@ impl Workbench {
     }
 
     fn slash_toolbar(&mut self, context: &egui::Context) -> bool {
-        let Some(options) = slash_commands::options(self.state(), self.composer.text()) else {
+        let Some(options) =
+            pi_whim_engine::slash_commands::options(self.state(), self.composer.text())
+        else {
             self.slash_query = None;
             self.slash_dismissed_query = None;
             return false;
@@ -786,7 +787,7 @@ impl Workbench {
                                     ui.horizontal(|ui| {
                                         icons::display(
                                             ui,
-                                            option.icon,
+                                            icons::for_command(option.icon),
                                             Vec2::splat(20.0),
                                             MUTED_INK,
                                         );

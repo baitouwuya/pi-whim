@@ -38,6 +38,9 @@ pub enum ComposerEvent {
     Stop,
     /// Drop an attachment from the draft.
     RemoveAttachment(String),
+    /// The typed text changed. The palette re-derives its options from this, so
+    /// it opens, filters, and closes purely as a function of what is typed.
+    TextChanged(String),
 }
 
 /// The prompt input, its attachments, and the send controls.
@@ -66,7 +69,11 @@ impl Composer {
             window,
             |composer, _, event, window, cx| match event {
                 InputEvent::PressEnter { .. } => composer.submit(window, cx),
-                InputEvent::Change => cx.notify(),
+                InputEvent::Change => {
+                    let text = composer.text(cx);
+                    cx.emit(ComposerEvent::TextChanged(text));
+                    cx.notify();
+                }
                 _ => {}
             },
         )
@@ -105,6 +112,25 @@ impl Composer {
 
     pub fn attachments(&self) -> &[Attachment] {
         self.draft.attachments()
+    }
+
+    /// What is typed right now.
+    ///
+    /// The input owns the text, so this reads through to it rather than to the
+    /// draft, which is only synced on submit.
+    pub fn text(&self, cx: &App) -> String {
+        self.input.read(cx).value().to_string()
+    }
+
+    /// Replace what is typed.
+    ///
+    /// Used by the palette for the commands that take an argument: picking
+    /// "choose model" leaves `/model ` in the field for the reader to finish.
+    pub fn set_text(&mut self, value: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.input.update(cx, |input, cx| {
+            input.set_value(value, window, cx);
+        });
+        cx.notify();
     }
 
     /// The focus handle, for the paste interception the app installs.

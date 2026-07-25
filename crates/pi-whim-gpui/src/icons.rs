@@ -10,6 +10,7 @@
 
 use gpui_component::IconName;
 use pi_whim_core::{ConversationRole, SessionStatus};
+use pi_whim_engine::slash_commands::CommandIcon;
 
 /// Toggle to the other theme. Shows where the toggle goes, not where it is.
 pub fn theme_toggle(is_dark: bool) -> IconName {
@@ -85,6 +86,25 @@ pub fn session() -> IconName {
     IconName::File
 }
 
+/// The glyph for a slash-command's purpose.
+///
+/// `engine::slash_commands` names what an option is *for* and leaves the drawing
+/// to each view, since the palette is shared with the egui build.
+pub fn command(icon: CommandIcon) -> IconName {
+    match icon {
+        // Same stand-in as an assistant message: the egui build drew a cube here
+        // and a brain there, and neither is in the bundled set.
+        CommandIcon::Model => IconName::Bot,
+        CommandIcon::Thinking => IconName::Cpu,
+        CommandIcon::Copy => IconName::Copy,
+        CommandIcon::Message => IconName::Inbox,
+        CommandIcon::Compact => IconName::Minimize,
+        CommandIcon::File => IconName::Folder,
+        CommandIcon::Settings => IconName::Settings,
+        CommandIcon::Stop => IconName::Close,
+    }
+}
+
 /// The icon for a conversation entry's role.
 pub fn role(role: &ConversationRole) -> Option<IconName> {
     match role {
@@ -124,6 +144,42 @@ mod tests {
     /// how these assertions identify a glyph.
     fn path(icon: IconName) -> String {
         icon.path().to_string()
+    }
+
+    #[test]
+    fn every_command_purpose_maps_to_a_glyph() {
+        // Exhaustive by construction; this pins that a purpose added to engine
+        // cannot silently fall through to a default icon.
+        for purpose in [
+            CommandIcon::Model,
+            CommandIcon::Thinking,
+            CommandIcon::Copy,
+            CommandIcon::Message,
+            CommandIcon::Compact,
+            CommandIcon::File,
+            CommandIcon::Settings,
+            CommandIcon::Stop,
+        ] {
+            assert!(!path(command(purpose)).is_empty());
+        }
+    }
+
+    #[test]
+    fn distinct_command_purposes_get_distinct_glyphs() {
+        // The icon is the only thing distinguishing palette rows at a glance, so
+        // two purposes sharing one would make the list harder to scan.
+        assert_ne!(
+            path(command(CommandIcon::Model)),
+            path(command(CommandIcon::Thinking))
+        );
+        assert_ne!(
+            path(command(CommandIcon::Copy)),
+            path(command(CommandIcon::Message))
+        );
+        assert_ne!(
+            path(command(CommandIcon::Compact)),
+            path(command(CommandIcon::Stop))
+        );
     }
 
     #[test]

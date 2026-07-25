@@ -7,21 +7,22 @@
 use std::collections::BTreeSet;
 
 use gpui::{
-    AppContext, Context, Entity, IntoElement, ParentElement, Render, Styled, Window, div,
-    prelude::FluentBuilder, px,
+    AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render, Styled,
+    Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::theme::{Theme as ComponentTheme, ThemeMode as ComponentMode};
 use pi_whim_core::{
     Action, AppState, ConversationItem, ConversationRole, ModelOption, ProjectId, QueueMode,
     SessionStatus, ThinkingLevel, stable_session_id,
 };
+use pi_whim_engine::slash_commands::SlashCommand;
 use pi_whim_engine::state::{EngineState, ViewEffect};
 use pi_whim_theme::{ThemeMode, ThemePreference, Tokens, text};
 
 use crate::{
     chat::{
         self, Composer, ComposerEvent, Controls, ControlsEvent, Conversation, ConversationEvent,
-        Sidebar, SidebarEvent,
+        Palette, PaletteEvent, Sidebar, SidebarEvent,
     },
     chrome::{Banner, TopBar},
     elements::GraphPaper,
@@ -35,7 +36,7 @@ use crate::{
 /// crate deliberately does not depend on, so the views record the request and the
 /// app drains it. This is the same pull model the egui build used for `UiIntent`,
 /// kept only for the actions that genuinely cross the boundary.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Request {
     /// Ask for a folder, and add it as a project.
     AddProject,
@@ -49,6 +50,9 @@ pub enum Request {
         steering: QueueMode,
         follow_up: QueueMode,
     },
+    /// Run a slash command. Every one of these needs the store, the clipboard, or
+    /// an RPC, so the shell does not try to interpret them.
+    RunCommand(SlashCommand),
 }
 
 /// The application shell.
@@ -60,6 +64,7 @@ pub struct Workspace {
     conversation: Entity<Conversation>,
     composer: Entity<Composer>,
     controls: Entity<Controls>,
+    palette: Entity<Palette>,
     /// Projects whose sessions are listed. View-local: which projects a reader
     /// has open says nothing about the session.
     expanded_projects: BTreeSet<ProjectId>,
@@ -110,6 +115,12 @@ impl Workspace {
         })
         .detach();
 
+        let palette = cx.new(|_| Palette::new(tokens));
+        cx.subscribe_in(&palette, window, |workspace, _, event, window, cx| {
+            workspace.handle_palette_event(event.clone(), window, cx);
+        })
+        .detach();
+
         Self {
             preference,
             tokens,
@@ -118,6 +129,7 @@ impl Workspace {
             conversation,
             composer,
             controls,
+            palette,
             expanded_projects: BTreeSet::new(),
             requests: Vec::new(),
         }
@@ -207,7 +219,47 @@ impl Workspace {
                     composer.remove_attachment(&path, cx);
                 });
             }
+            ComposerEvent::TextChanged(text) => {
+                // The palette is a function of what is typed: no open/close state
+                // to leave stale, so a `/` opens it and a backspace closes it.
+                let state = self.engine.get().clone();
+                self.palette.update(cx, |palette, cx| {
+                    palette.sync(&state, &text, cx);
+                });
+            }
         }
+    }
+
+    /// Act on what the palette reported.
+    ///
+    /// Most commands reach the backend, so they queue as requests. The exception
+    /// is the pair the shell can answer itself.
+    fn handle_palette_event(
+        &mut self,
+        event: PaletteEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            PaletteEvent::SetComposerText(text) => {
+                self.composer.update(cx, |composer, cx| {
+                    composer.set_text(&text, window, cx);
+                });
+                // Setting the value does not emit a change, so re-derive the
+                // options here or the palette would keep showing the old list.
+                let state = self.engine.get().clone();
+                self.palette.update(cx, |palette, cx| {
+                    palette.sync(&state, &text, cx);
+                });
+            }
+            PaletteEvent::Run(command) => {
+                self.composer.update(cx, |composer, cx| {
+                    composer.set_text("", window, cx);
+                });
+                self.requests.push(Request::RunCommand(command));
+            }
+        }
+        cx.notify();
     }
 
     /// Act on what the runtime controls reported.
@@ -387,6 +439,19 @@ impl Render for Workspace {
             // over it translucently, so it belongs here rather than inside any
             // one pane. This box is the containing block it positions against.
             .relative()
+            // Captured rather than merely observed: this runs before the focused
+            // input handles the key, which is what lets an arrow move the palette
+            // selection instead of the caret, and Enter run the highlighted
+            // command instead of submitting the prompt. The composer keeps focus
+            // throughout, so typing still filters.
+            .capture_key_down(cx.listener(|workspace, event, _, cx| {
+                let consumed = workspace
+                    .palette
+                    .update(cx, |palette, cx| palette.handle_key(event, cx));
+                if consumed {
+                    cx.stop_propagation();
+                }
+            }))
             .bg(tokens.bg_canvas.hsla())
             .child(GraphPaper::new(tokens))
             .child(
@@ -429,7 +494,19 @@ impl Render for Workspace {
                                     .flex_col()
                                     .min_w(px(0.0))
                                     .child(self.conversation.clone())
-                                    .child(self.composer.clone()),
+                                    .child(
+                                        // The palette is absolutely positioned
+                                        // against this box so it floats over the
+                                        // conversation rather than pushing the
+                                        // input down as it grows.
+                                        div()
+                                            .relative()
+                                            .flex()
+                                            .flex_col()
+                                            .items_center()
+                                            .child(self.palette.clone())
+                                            .child(self.composer.clone()),
+                                    ),
                             ),
                     ),
             )

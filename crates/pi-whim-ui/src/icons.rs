@@ -1,5 +1,7 @@
 use std::f32::consts::TAU;
 
+use pi_whim_engine::slash_commands::CommandIcon;
+
 use eframe::egui::{
     Button, Color32, CornerRadius, Painter, Rect, Response, Stroke, StrokeKind, Ui, Vec2, pos2,
     vec2,
@@ -395,4 +397,21 @@ fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
 
 fn ui_background(painter: &Painter) -> Color32 {
     painter.ctx().style().visuals.extreme_bg_color
+}
+
+/// The glyph this build draws for a palette entry's purpose.
+///
+/// The palette names a meaning rather than an icon, since it is shared with the
+/// gpui views; this is where that meaning becomes one of the hand-drawn paths.
+pub fn for_command(icon: CommandIcon) -> Icon {
+    match icon {
+        CommandIcon::Model => Icon::Cube,
+        CommandIcon::Thinking => Icon::Brain,
+        CommandIcon::Copy => Icon::Copy,
+        CommandIcon::Message => Icon::Message,
+        CommandIcon::Compact => Icon::Compress,
+        CommandIcon::File => Icon::File,
+        CommandIcon::Settings => Icon::Settings,
+        CommandIcon::Stop => Icon::Close,
+    }
 }
