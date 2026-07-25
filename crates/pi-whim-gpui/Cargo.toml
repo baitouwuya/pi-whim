@@ -9,6 +9,7 @@ anyhow.workspace = true
 gpui.workspace = true
 gpui-component.workspace = true
 pi-whim-core = { path = "../pi-whim-core" }
+pi-whim-engine = { path = "../pi-whim-engine" }
 pi-whim-theme = { path = "../pi-whim-theme" }
 
 [dev-dependencies]
