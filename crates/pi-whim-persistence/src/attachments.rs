@@ -94,6 +94,34 @@ impl AttachmentStore {
         self.create_generated_file(PASTED_IMAGE_NAME, &png, None)
     }
 
+    /// Store an image that is already encoded.
+    ///
+    /// A platform clipboard hands over PNG or JPEG bytes rather than pixels, and
+    /// decoding those only to re-encode would cost quality on a JPEG and gain
+    /// nothing on a PNG. `extension` names the encoding so the file on disk is
+    /// something Pi can open by name.
+    pub fn create_pasted_encoded_image(
+        &mut self,
+        extension: &str,
+        bytes: &[u8],
+    ) -> Result<Attachment, String> {
+        self.check_ready()?;
+        if bytes.is_empty() {
+            return Err("Clipboard image is empty.".into());
+        }
+        // Rejected rather than sanitized: an extension is not reader-supplied
+        // text, it comes from the platform's own format list, so anything else
+        // means the caller passed the wrong thing.
+        if !extension
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
+        {
+            return Err(format!("Unsupported image type: {extension}"));
+        }
+        let name = format!("pasted-image.{extension}");
+        self.create_generated_file(&name, bytes, None)
+    }
+
     fn create_generated_file(
         &mut self,
         name: &str,
@@ -227,6 +255,45 @@ mod tests {
         store.remove_generated(&attachment.path).unwrap();
         assert!(!Path::new(&attachment.path).exists());
         assert!(external.exists());
+    }
+
+    #[test]
+    fn an_encoded_image_is_stored_under_its_own_extension() {
+        // Pi opens the file by name, so a JPEG must not land as `.png`.
+        let temporary = tempfile::tempdir().unwrap();
+        let mut store = AttachmentStore::open(temporary.path().join("attachments")).unwrap();
+
+        let attachment = store
+            .create_pasted_encoded_image("jpg", &[0xff, 0xd8, 0xff])
+            .unwrap();
+
+        assert!(attachment.path.ends_with("pasted-image.jpg"));
+        assert_eq!(fs::read(&attachment.path).unwrap(), vec![0xff, 0xd8, 0xff]);
+        // Owned, so cleanup can remove it later.
+        assert!(attachment.generated_by_app);
+    }
+
+    #[test]
+    fn an_unusable_encoded_image_is_refused_without_writing_anything() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("attachments");
+        let mut store = AttachmentStore::open(root.clone()).unwrap();
+
+        assert!(store.create_pasted_encoded_image("png", &[]).is_err());
+        // A path segment in the extension would put the file outside the store.
+        assert!(
+            store
+                .create_pasted_encoded_image("../escape", &[1])
+                .is_err()
+        );
+
+        // Only the manifest, so nothing was written for either attempt.
+        let written: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name != MANIFEST_NAME)
+            .collect();
+        assert!(written.is_empty());
     }
 
     #[test]

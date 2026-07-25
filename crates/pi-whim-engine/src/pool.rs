@@ -26,6 +26,29 @@ pub fn is_draft(key: &str) -> bool {
     key.starts_with(DRAFT_PREFIX)
 }
 
+/// A prompt held back until something else finishes.
+pub type PendingPrompt = (String, Vec<Attachment>, SubmitMode);
+
+/// What a session accumulates over one turn.
+///
+/// Split out from [`SessionRuntime`] so event translation can borrow it
+/// mutably without also borrowing the process: `translate` needs to update the
+/// streaming message id while reading the conversation, and holding the whole
+/// session would put the runtime in that borrow for no reason.
+#[derive(Debug, Default, PartialEq)]
+pub struct Turn {
+    /// True while the agent is streaming or compacting.
+    pub running: bool,
+    /// The entry a stream is appending to. Pi renames it once the model has
+    /// answered, so this is a placeholder until then.
+    pub assistant_message_id: Option<String>,
+    pub conversation_compacted: bool,
+    /// Conversation entry for the in-progress compaction card, so the result
+    /// updates that card instead of adding a second one.
+    pub compaction_item_id: Option<String>,
+    pub pending_prompt: Option<PendingPrompt>,
+}
+
 /// One Pi process and the state its current turn accumulates.
 pub struct SessionRuntime<R: AgentRuntime> {
     pub runtime: R,
@@ -41,14 +64,7 @@ pub struct SessionRuntime<R: AgentRuntime> {
     /// one, and so two sessions cannot be given the same token by mistake.
     pub token: SessionToken,
     pub project_id: ProjectId,
-    /// True while the agent is streaming or compacting.
-    pub running: bool,
-    pub assistant_message_id: Option<String>,
-    pub conversation_compacted: bool,
-    /// Conversation entry for the in-progress compaction card, so the result
-    /// updates that card instead of adding a second one.
-    pub compaction_item_id: Option<String>,
-    pub pending_prompt: Option<(String, Vec<Attachment>, SubmitMode)>,
+    pub turn: Turn,
     /// When the session was last made visible; drives most-recently-used picks.
     pub last_used_ms: i64,
 }
@@ -65,13 +81,14 @@ impl<R: AgentRuntime> SessionRuntime<R> {
             events: Some(events),
             token: SessionToken::next(),
             project_id,
-            running: false,
-            assistant_message_id: None,
-            conversation_compacted: false,
-            compaction_item_id: None,
-            pending_prompt: None,
+            turn: Turn::default(),
             last_used_ms: now_ms,
         }
+    }
+
+    /// Whether this session is mid-turn.
+    pub fn is_running(&self) -> bool {
+        self.turn.running
     }
 }
 
@@ -232,7 +249,7 @@ impl<R: AgentRuntime> SessionPool<R> {
 
     /// Whether any pooled session is mid-turn.
     pub fn any_running(&self) -> bool {
-        self.sessions.values().any(|session| session.running)
+        self.sessions.values().any(SessionRuntime::is_running)
     }
 
     /// The key `token` currently names.
@@ -409,7 +426,7 @@ mod tests {
         assert!(!pool.any_running());
 
         // A background session working still counts.
-        pool.get_mut("b").unwrap().running = true;
+        pool.get_mut("b").unwrap().turn.running = true;
         pool.activate("a", 2);
 
         assert!(pool.any_running());

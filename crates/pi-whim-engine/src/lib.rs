@@ -7,6 +7,7 @@
 
 pub mod composer;
 pub mod controls;
+pub mod dialogs;
 pub mod events;
 pub mod launch;
 pub mod mailbox;
@@ -15,5 +16,8 @@ pub mod pool;
 pub mod protocol;
 pub mod providers;
 pub mod session;
+pub mod settings;
+pub mod slash_commands;
 pub mod state;
+pub mod thinking;
 pub mod typewriter;

@@ -1,0 +1,9 @@
+[package]
+name = "pi-whim-theme"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Deliberately dependency-free: tokens are plain floats and constants so they
+# can be tested against pi.dev's published values without a window.
+[dependencies]

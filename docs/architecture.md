@@ -3,7 +3,7 @@
 Pi-Whim has one runtime boundary: the UI talks only to `AgentRuntime`. The first
 implementation launches Pi in `--mode rpc` and exchanges strict LF-delimited JSONL.
 This prevents process handling, Pi wire types, and future tool transport concerns
-from leaking into the egui layer.
+from leaking into the view layer.
 
 The SQLite database is an index, not the source of conversation truth. Pi owns JSONL
 sessions under the Pi-Whim application support directory. The index stores enough

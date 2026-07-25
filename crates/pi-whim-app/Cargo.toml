@@ -10,25 +10,23 @@ path = "src/main.rs"
 
 [dependencies]
 crossbeam-channel.workspace = true
-arboard.workspace = true
 dirs.workspace = true
-eframe.workspace = true
+gpui.workspace = true
+gpui-component.workspace = true
+gpui-component-assets.workspace = true
+gpui_platform.workspace = true
 pi-whim-catalog = { path = "../pi-whim-catalog" }
 pi-whim-core = { path = "../pi-whim-core" }
 pi-whim-engine = { path = "../pi-whim-engine" }
+pi-whim-gpui = { path = "../pi-whim-gpui" }
 pi-whim-persistence = { path = "../pi-whim-persistence" }
 pi-whim-runtime = { path = "../pi-whim-runtime" }
-pi-whim-ui = { path = "../pi-whim-ui" }
+pi-whim-theme = { path = "../pi-whim-theme" }
 rfd.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 ureq.workspace = true
 uuid.workspace = true
-
-[target.'cfg(target_os = "macos")'.dependencies]
-block2 = "0.6"
-objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["NSEvent", "block2"] }
 
 [dev-dependencies]
 tempfile = "3.15"

@@ -22,8 +22,11 @@ the application looks for the Pi build under `vendor/pi-mono`.
 - `pi-whim-pi-rpc`: strict LF JSONL transport for Pi RPC mode.
 - `pi-whim-runtime`: UI-facing `AgentRuntime` abstraction and Pi adapter.
 - `pi-whim-tool-protocol`: versioned JSONL protocol used by the local agent tool host.
-- `pi-whim-ui`: egui workbench and Fluent resources.
-- `pi-whim-app`: native executable composition root.
+- `pi-whim-catalog`: model capability lookup, online and bundled.
+- `pi-whim-engine`: session pool, Pi protocol translation, and state ownership.
+- `pi-whim-theme`: design tokens for both themes.
+- `pi-whim-gpui`: gpui views.
+- `pi-whim-app`: native executable, window, and wiring.
 
 Pi is kept as a Git submodule in `vendor/pi-mono`. The initial checkout uses upstream
 unchanged; a project-owned fork can later replace its `origin` while `upstream` stays

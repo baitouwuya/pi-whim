@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use unicode_segmentation::UnicodeSegmentation;
 use uuid::Uuid;
 
+pub mod strings;
+
 pub use model_capabilities::{
     CapabilityMatch, CatalogModelCapability, ModelCapability, ModelCapabilitySource, ThinkingLevel,
     ThinkingLevelMap, normalize_provider_display_name, normalize_provider_name, provider_name_key,
@@ -46,14 +48,6 @@ impl AgentPermissionLevel {
             Self::ReadOnly => 0,
             Self::Controlled => 1,
             Self::Full => 2,
-        }
-    }
-
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::ReadOnly => "Read only",
-            Self::Controlled => "Controlled",
-            Self::Full => "Full",
         }
     }
 }
@@ -288,14 +282,6 @@ pub enum SearchEngineKind {
     Searxng,
 }
 
-impl SearchEngineKind {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Searxng => "SearXNG",
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchEngineProfile {
     pub id: SearchEngineId,
@@ -383,12 +369,6 @@ pub struct SlashCommandInfo {
     pub name: String,
     pub description: String,
     pub source: String,
-}
-
-impl ModelOption {
-    pub fn label(&self) -> String {
-        self.name.clone()
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -529,7 +509,12 @@ pub enum SessionStatus {
     Failed(String),
 }
 
-#[derive(Clone, Debug)]
+/// A change to [`AppState`], and the only way to make one.
+///
+/// `PartialEq` is here for the tests that assert what a translation produced:
+/// comparing the actions is how wire-protocol handling is checked without
+/// standing up a reducer and reading state back out of it.
+#[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     ProjectsLoaded(Vec<Project>),
     SessionsLoaded {
@@ -654,7 +639,9 @@ impl AppState {
                 steering_mode,
                 follow_up_mode,
             } => {
-                available_models.sort_by_key(|model| model.label());
+                // Sorted by the shown name, then deduplicated by identity: Pi can
+                // report the same model twice when two profiles reach it.
+                available_models.sort_by(|left, right| left.name.cmp(&right.name));
                 available_models
                     .dedup_by(|left, right| left.provider == right.provider && left.id == right.id);
                 self.current_model = current_model;
@@ -784,7 +771,6 @@ mod tests {
     // Progressive reveal moved to pi_whim_engine::typewriter::Typewriter, and
     // attachment de-duplication to pi_whim_engine::composer::Composer; both
     // cover those behaviors directly.
-    // which covers it directly.
 
     #[test]
     fn provider_protocol_maps_to_pi_models_json_api() {
