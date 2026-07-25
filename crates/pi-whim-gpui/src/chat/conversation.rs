@@ -113,6 +113,11 @@ impl Conversation {
         }
     }
 
+    /// Whether a tool entry's diagnostic detail is showing.
+    pub fn is_expanded(&self, id: &str) -> bool {
+        self.expanded.contains(id)
+    }
+
     /// Show or hide a tool entry's diagnostic detail.
     pub fn toggle_details(&mut self, id: &str, cx: &mut Context<Self>) {
         if !self.expanded.remove(id) {

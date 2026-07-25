@@ -14,7 +14,7 @@ use gpui_component::theme::{Theme as ComponentTheme, ThemeMode as ComponentMode}
 use pi_whim_core::{
     Action, AgentTeamConfig, AppState, Attachment, BashPolicy, ConversationItem, ConversationRole,
     Language, ModelOption, ProjectId, ProviderId, ProviderProfile, ProviderProtocol, QueueMode,
-    SearchEngineProfile, SessionStatus, SubmitMode, ThinkingLevel, stable_session_id,
+    SearchEngineProfile, SessionStatus, SubmitMode, ThinkingLevel,
 };
 use pi_whim_engine::dialogs::{Answer, Prompt};
 use pi_whim_engine::mailbox::Delivery;
@@ -50,6 +50,11 @@ pub enum Request {
     AddProject,
     /// Start a fresh session in a project.
     NewSession(ProjectId),
+    /// Show a project and make sure it has a running session.
+    ///
+    /// Separate from [`Request::NewSession`] because opening reuses whatever is
+    /// already there — only an empty project gets a new process.
+    OpenProject(ProjectId),
     /// Switch which model answers. The host defers this until the next prompt so
     /// the prior model compacts the history first.
     SetModel(ModelOption),
@@ -377,27 +382,23 @@ impl Workspace {
             // reachable until the shell is connected, so they are recorded as
             // requests rather than silently doing nothing.
             SidebarEvent::AddProject => self.requests.push(Request::AddProject),
-            SidebarEvent::NewSession(id) => {
-                self.engine.apply(Action::SelectProject(id));
-                self.requests.push(Request::NewSession(id));
-            }
+            SidebarEvent::NewSession(id) => self.requests.push(Request::NewSession(id)),
             SidebarEvent::ToggleProject(id) | SidebarEvent::OpenProject(id) => {
-                // Selecting a project also toggles whether its sessions show,
-                // so one click on a header does the obvious thing.
+                // Whether the rows are listed is view-local, so it is decided
+                // here; which project is selected is not, so it is asked for.
+                // Both from one click, because a header that expanded without
+                // selecting would leave the conversation on another project.
                 toggle_expanded(&mut self.expanded_projects, id);
-                self.engine.apply(Action::SelectProject(id));
+                self.requests.push(Request::OpenProject(id));
             }
             SidebarEvent::OpenSession {
                 project_id,
                 pi_path,
             } => {
-                self.engine.apply(Action::SelectProject(project_id));
-                self.engine
-                    .apply(Action::SelectSession(stable_session_id(&pi_path)));
-                // Selecting is the shell's; binding to the process is not. The
-                // pool decides which session is visible and the transcript has to
-                // be re-read, so without this the sidebar would move while the
-                // conversation kept showing the previous session.
+                // Selection is not applied here either: the pool decides which
+                // session is visible and the transcript has to be re-read, so a
+                // local select would move the sidebar while the conversation kept
+                // showing the previous session.
                 self.requests.push(Request::ActivateSession {
                     project_id,
                     path: pi_path,
@@ -790,6 +791,31 @@ impl Workspace {
         self.engine.get()
     }
 
+    /// Show `state` instead of what is on screen now.
+    ///
+    /// The whole snapshot rather than a diff: `sync_views` already hands each
+    /// view its slice wholesale, so there is nothing to save by sending less.
+    /// This is how the shell learns about anything it did not do itself — an
+    /// agent's reply, a session it asked to be activated — without keeping a
+    /// second reducer that could disagree with the one that owns the state.
+    pub fn set_state(&mut self, state: AppState, window: &mut Window, cx: &mut Context<Self>) {
+        // What the conversation caches per message — reveal progress, which tool
+        // cards are open — is keyed by message id, so it has to go when the
+        // messages it describes do. A changed session counts as much as an
+        // emptied conversation: switching clears and reloads in one step, so the
+        // empty moment in between never arrives as its own snapshot.
+        let previous = self.engine.get();
+        let switched = previous.selected_session != state.selected_session;
+        let cleared = state.conversation.is_empty() && !previous.conversation.is_empty();
+        if switched || cleared {
+            self.conversation
+                .update(cx, |conversation, cx| conversation.clear(cx));
+        }
+        self.engine = EngineState::from_state(state);
+        self.sync_views(window, cx);
+        cx.notify();
+    }
+
     /// Apply `action` through the reducer.
     ///
     /// View-local follow-ups arrive as a [`ViewEffect`]; the shell currently
@@ -1065,6 +1091,7 @@ impl Render for Workspace {
 
 #[cfg(test)]
 mod tests {
+    use pi_whim_core::stable_session_id;
     use pi_whim_engine::mailbox::{RuntimeEvent, SessionToken};
 
     use super::*;
@@ -1332,11 +1359,11 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn opening_a_session_selects_it_and_asks_to_bind_the_process(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        // Without the request the sidebar selection would move while the
-        // conversation kept showing the session that was open before.
+    async fn opening_a_session_asks_rather_than_selecting_it(cx: &mut gpui::TestAppContext) {
+        // Selecting locally would move the sidebar while the conversation kept
+        // showing the session that was open before: the transcript has to be
+        // re-read and the pool decides which process is bound, neither of which
+        // the shell can do.
         let shell = shell(cx);
         let project_id = uuid::Uuid::new_v4();
 
@@ -1351,7 +1378,7 @@ mod tests {
                     cx,
                 );
 
-                assert_eq!(workspace.state().selected_project, Some(project_id));
+                assert_eq!(workspace.state().selected_project, None);
                 assert_eq!(
                     workspace.take_requests(),
                     vec![Request::ActivateSession {
@@ -1359,6 +1386,101 @@ mod tests {
                         path: "/tmp/s.jsonl".to_owned(),
                     }]
                 );
+            })
+            .expect("the window is open");
+    }
+
+    #[gpui::test]
+    async fn opening_a_project_lists_its_rows_and_asks_for_the_session(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Expanding is view-local and happens at once; selecting is not, so it is
+        // a request. A header that only expanded would leave the conversation on
+        // whichever project was open before.
+        let shell = shell(cx);
+        let project_id = uuid::Uuid::new_v4();
+
+        shell
+            .update(cx, |workspace, window, cx| {
+                workspace.handle_sidebar_event(SidebarEvent::OpenProject(project_id), window, cx);
+
+                assert!(workspace.expanded_projects.contains(&project_id));
+                assert_eq!(
+                    workspace.take_requests(),
+                    vec![Request::OpenProject(project_id)]
+                );
+            })
+            .expect("the window is open");
+    }
+
+    #[gpui::test]
+    async fn a_snapshot_replaces_what_is_shown(cx: &mut gpui::TestAppContext) {
+        // The host owns the reducer, so this is how the shell learns about
+        // anything it did not do itself.
+        let shell = shell(cx);
+        let project_id = uuid::Uuid::new_v4();
+
+        shell
+            .update(cx, |workspace, window, cx| {
+                let state = AppState {
+                    selected_project: Some(project_id),
+                    session_status: SessionStatus::Streaming,
+                    ..AppState::default()
+                };
+                workspace.set_state(state, window, cx);
+
+                assert_eq!(workspace.state().selected_project, Some(project_id));
+                assert_eq!(workspace.state().session_status, SessionStatus::Streaming);
+            })
+            .expect("the window is open");
+    }
+
+    #[gpui::test]
+    async fn switching_sessions_drops_the_conversations_caches(cx: &mut gpui::TestAppContext) {
+        // Reveal progress and which tool cards are open are keyed by message id,
+        // so carrying them across a switch would show the new session's first
+        // messages already revealed — or worse, expanded from the old session's
+        // ids colliding.
+        let shell = shell(cx);
+        let message = |id: &str| ConversationItem {
+            id: id.into(),
+            role: ConversationRole::Assistant,
+            full_text: "hello".into(),
+            streaming: false,
+            tool_name: None,
+            tool_report: None,
+            tool_details: None,
+            is_error: false,
+            model: None,
+            attachments: Vec::new(),
+        };
+
+        shell
+            .update(cx, |workspace, window, cx| {
+                workspace.set_state(
+                    AppState {
+                        selected_session: Some(stable_session_id("/tmp/first.jsonl")),
+                        conversation: vec![message("m1")],
+                        ..AppState::default()
+                    },
+                    window,
+                    cx,
+                );
+                workspace.conversation.update(cx, |conversation, cx| {
+                    conversation.toggle_details("m1", cx);
+                });
+
+                workspace.set_state(
+                    AppState {
+                        selected_session: Some(stable_session_id("/tmp/second.jsonl")),
+                        conversation: vec![message("m1")],
+                        ..AppState::default()
+                    },
+                    window,
+                    cx,
+                );
+
+                assert!(!workspace.conversation.read(cx).is_expanded("m1"));
             })
             .expect("the window is open");
     }
