@@ -507,9 +507,6 @@ pub struct AppState {
     /// while another one is on screen; the sidebar marks these with a dot.
     pub running_sessions: std::collections::HashSet<String>,
     pub conversation: Vec<ConversationItem>,
-    pub composer: String,
-    pub composer_attachments: Vec<Attachment>,
-    pub search: String,
     pub language: Language,
     pub bash_policy: BashPolicy,
     pub bash_blocked_patterns: Vec<String>,
@@ -564,11 +561,6 @@ pub enum Action {
         path: String,
         running: bool,
     },
-    SetComposer(String),
-    AddComposerAttachment(Attachment),
-    RemoveComposerAttachment(String),
-    ClearComposerAttachments,
-    SetSearch(String),
     SetLanguage(Language),
     SetBashPolicy(BashPolicy),
     SetBashBlockedPatterns(Vec<String>),
@@ -635,22 +627,6 @@ impl AppState {
                     self.running_sessions.remove(&path);
                 }
             }
-            Action::SetComposer(value) => self.composer = value,
-            Action::AddComposerAttachment(attachment) => {
-                if !self
-                    .composer_attachments
-                    .iter()
-                    .any(|existing| existing.path == attachment.path)
-                {
-                    self.composer_attachments.push(attachment);
-                }
-            }
-            Action::RemoveComposerAttachment(path) => {
-                self.composer_attachments
-                    .retain(|attachment| attachment.path != path);
-            }
-            Action::ClearComposerAttachments => self.composer_attachments.clear(),
-            Action::SetSearch(value) => self.search = value,
             Action::SetLanguage(language) => self.language = language,
             Action::SetBashPolicy(policy) => self.bash_policy = policy,
             Action::SetBashBlockedPatterns(patterns) => {
@@ -829,29 +805,8 @@ mod tests {
         assert_eq!(item.text_for_display(), "hello");
     }
 
-    fn attachment(path: &str) -> Attachment {
-        Attachment {
-            name: "example.txt".into(),
-            path: path.into(),
-            kind: AttachmentKind::File,
-            generated_by_app: false,
-        }
-    }
-
-    #[test]
-    fn composer_attachments_are_deduplicated_and_removable_by_path() {
-        let mut state = AppState::default();
-        state.dispatch(Action::AddComposerAttachment(attachment(
-            "/tmp/example.txt",
-        )));
-        state.dispatch(Action::AddComposerAttachment(attachment(
-            "/tmp/example.txt",
-        )));
-        assert_eq!(state.composer_attachments.len(), 1);
-
-        state.dispatch(Action::RemoveComposerAttachment("/tmp/example.txt".into()));
-        assert!(state.composer_attachments.is_empty());
-    }
+    // Attachment de-duplication moved to pi_whim_engine::composer::Composer,
+    // which covers it directly.
 
     #[test]
     fn provider_protocol_maps_to_pi_models_json_api() {

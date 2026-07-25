@@ -1486,7 +1486,8 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             match attachment_from_path(&path, false) {
                 Ok(attachment) => self
                     .workbench
-                    .apply(Action::AddComposerAttachment(attachment)),
+                    .composer_draft_mut()
+                    .add_attachment(attachment),
                 Err(error) => self.error = Some(error),
             }
         }
@@ -1505,7 +1506,8 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             {
                 Ok(attachment) => self
                     .workbench
-                    .apply(Action::AddComposerAttachment(attachment)),
+                    .composer_draft_mut()
+                    .add_attachment(attachment),
                 Err(error) => self.error = Some(error),
             },
         }
@@ -1514,13 +1516,12 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     fn remove_composer_attachment(&mut self, path: &str) {
         let attachment = self
             .workbench
-            .state
-            .composer_attachments
+            .composer_draft()
+            .attachments()
             .iter()
             .find(|attachment| attachment.path == path)
             .cloned();
-        self.workbench
-            .apply(Action::RemoveComposerAttachment(path.to_owned()));
+        self.workbench.composer_draft_mut().remove_attachment(path);
         if attachment.is_some_and(|attachment| attachment.generated_by_app)
             && let Err(error) = self.attachment_store.remove_generated(path)
         {
@@ -1550,7 +1551,8 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             match self.attachment_store.create_pasted_text(text) {
                 Ok(attachment) => {
                     self.workbench
-                        .apply(Action::AddComposerAttachment(attachment));
+                        .composer_draft_mut()
+                        .add_attachment(attachment);
                     return true;
                 }
                 Err(error) => self.error = Some(error),

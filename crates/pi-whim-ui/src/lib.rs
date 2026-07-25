@@ -23,6 +23,7 @@ use pi_whim_core::{
     ProviderProfile, ProviderProtocol, QueueMode, SearchEngineProfile, SessionStatus,
     ThinkingLevel, provider_name_key,
 };
+use pi_whim_engine::composer::Composer;
 
 use markdown::MarkdownRenderer;
 
@@ -318,6 +319,8 @@ impl ProviderDraft {
 
 pub struct Workbench {
     pub state: AppState,
+    /// The prompt being drafted. View-local, so it is not in `state`.
+    composer: Composer,
     intents: Vec<UiIntent>,
     page: WorkbenchPage,
     provider_draft: ProviderDraft,
@@ -399,6 +402,7 @@ impl Default for Workbench {
         };
         Self {
             state,
+            composer: Composer::new(),
             intents: Vec::new(),
             page: WorkbenchPage::Chat,
             provider_draft: ProviderDraft::default(),
@@ -428,6 +432,15 @@ impl Workbench {
 
     pub fn composer_has_focus(&self, context: &egui::Context) -> bool {
         context.memory(|memory| memory.has_focus(composer_input_id()))
+    }
+
+    /// The prompt draft, for the app to stage attachments into.
+    pub fn composer_draft(&self) -> &Composer {
+        &self.composer
+    }
+
+    pub fn composer_draft_mut(&mut self) -> &mut Composer {
+        &mut self.composer
     }
 
     /// Used by the ui_preview example to screenshot the settings page.
@@ -523,11 +536,10 @@ impl Workbench {
     }
 
     fn submit_composer(&mut self) -> bool {
-        if self.state.composer.trim().is_empty() && self.state.composer_attachments.is_empty() {
+        if self.composer.is_empty() {
             return false;
         }
-        let content = std::mem::take(&mut self.state.composer);
-        let attachments = std::mem::take(&mut self.state.composer_attachments);
+        let (content, attachments) = self.composer.take();
         self.intents.push(UiIntent::SubmitPrompt {
             content,
             attachments,
@@ -548,25 +560,25 @@ impl Workbench {
                 if let Some(project_id) = self.state.selected_project {
                     self.intents.push(UiIntent::StartNewSession(project_id));
                 }
-                self.state.composer.clear();
+                self.composer.clear_text();
             }
             SlashCommand::AddAttachment => {
                 self.intents.push(UiIntent::AddFileAttachments);
-                self.state.composer.clear();
+                self.composer.clear_text();
             }
-            SlashCommand::ChooseModel => self.state.composer = "/model ".into(),
-            SlashCommand::ChooseThinkingLevel => self.state.composer = "/thinking ".into(),
+            SlashCommand::ChooseModel => self.composer.set_text("/model "),
+            SlashCommand::ChooseThinkingLevel => self.composer.set_text("/thinking "),
             SlashCommand::SetModel(model) => {
                 self.intents.push(UiIntent::SetModel(model));
-                self.state.composer.clear();
+                self.composer.clear_text();
             }
             SlashCommand::SetThinkingLevel(level) => {
                 self.intents.push(UiIntent::SetThinkingLevel(level));
-                self.state.composer.clear();
+                self.composer.clear_text();
             }
             SlashCommand::Compact => {
                 self.intents.push(UiIntent::Compact);
-                self.state.composer.clear();
+                self.composer.clear_text();
             }
             SlashCommand::CopyLastMessage => {
                 if let Some(message) = self.state.conversation.iter().rev().find(|message| {
@@ -576,24 +588,24 @@ impl Workbench {
                 }) {
                     context.copy_text(message.full_text.clone());
                     self.copied_message = Some((message.id.clone(), Instant::now()));
-                    self.state.composer.clear();
+                    self.composer.clear_text();
                 }
             }
             SlashCommand::NameSession(name) => {
                 if let Some(name) = name {
                     self.intents.push(UiIntent::SetSessionName(name));
-                    self.state.composer.clear();
+                    self.composer.clear_text();
                 } else {
-                    self.state.composer = "/name ".into();
+                    self.composer.set_text("/name ");
                 }
             }
             SlashCommand::Export(path) => {
                 self.intents.push(UiIntent::ExportSession(path));
-                self.state.composer.clear();
+                self.composer.clear_text();
             }
             SlashCommand::Share => {
                 self.intents.push(UiIntent::ShareSession);
-                self.state.composer.clear();
+                self.composer.clear_text();
             }
             SlashCommand::ShowSessionInfo => {
                 let metrics = self.state.session_metrics.clone().unwrap_or_default();
@@ -606,35 +618,35 @@ impl Workbench {
                     metrics.total_tokens,
                     metrics.cost_microusd as f64 / 1_000_000.0
                 ));
-                self.state.composer.clear();
+                self.composer.clear_text();
             }
             SlashCommand::ShowHotkeys => {
                 self.push_command_output(
                     "Keyboard shortcuts\n\nEnter: send\nShift+Enter: new line\n/: quick actions\nUp/Down: select action\nTab or Enter: confirm action\nEsc: close action menu or reveal streamed text".into(),
                 );
-                self.state.composer.clear();
+                self.composer.clear_text();
             }
             SlashCommand::ShowChangelog => {
                 self.push_command_output(
                     "Pi changelog: https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/CHANGELOG.md".into(),
                 );
-                self.state.composer.clear();
+                self.composer.clear_text();
             }
-            SlashCommand::ChooseFork => self.state.composer = "/fork ".into(),
+            SlashCommand::ChooseFork => self.composer.set_text("/fork "),
             SlashCommand::Fork(entry_id) => {
                 self.intents.push(UiIntent::ForkSession(entry_id));
-                self.state.composer.clear();
+                self.composer.clear_text();
             }
             SlashCommand::Clone => {
                 self.intents.push(UiIntent::CloneSession);
-                self.state.composer.clear();
+                self.composer.clear_text();
             }
             SlashCommand::SubmitDynamic(command) => {
-                self.state.composer = format!("/{command} ");
+                self.composer.set_text(format!("/{command} "));
             }
             SlashCommand::Stop => {
                 self.intents.push(UiIntent::Stop);
-                self.state.composer.clear();
+                self.composer.clear_text();
             }
         }
         self.slash_selection = 0;
@@ -661,12 +673,12 @@ impl Workbench {
     }
 
     fn slash_toolbar(&mut self, context: &egui::Context) -> bool {
-        let Some(options) = slash_commands::options(&self.state, &self.state.composer) else {
+        let Some(options) = slash_commands::options(&self.state, self.composer.text()) else {
             self.slash_query = None;
             self.slash_dismissed_query = None;
             return false;
         };
-        let query = self.state.composer.clone();
+        let query = self.composer.text().to_string();
         if self.slash_query.as_deref() != Some(&query) {
             self.slash_selection = 0;
             self.slash_query = Some(query.clone());
@@ -1099,7 +1111,7 @@ impl Workbench {
                 ui.add_space(10.0);
                 let search_hint = tr(&self.state, "search").to_owned();
                 ui.add(
-                    TextEdit::singleline(&mut self.state.search)
+                    TextEdit::singleline(self.composer.search_mut())
                         .hint_text(search_hint)
                         .desired_width(f32::INFINITY),
                 );
@@ -1130,11 +1142,11 @@ impl Workbench {
         else {
             return;
         };
-        if !self.state.search.is_empty()
+        if !self.composer.search().is_empty()
             && !project
                 .name
                 .to_lowercase()
-                .contains(&self.state.search.to_lowercase())
+                .contains(&self.composer.search().to_lowercase())
         {
             return;
         }
@@ -1791,7 +1803,7 @@ impl Workbench {
                                         // Consume toolbar navigation before TextEdit can turn Tab into focus traversal.
                                         let slash_open = self.slash_toolbar(context);
                                         let input = ui.add(
-                                            TextEdit::multiline(&mut self.state.composer)
+                                            TextEdit::multiline(self.composer.text_mut())
                                                 .id(composer_id)
                                                 .hint_text(composer_hint)
                                                 .frame(false)
@@ -1900,7 +1912,7 @@ impl Workbench {
     /// Attachment and queue chips rendered inside the composer card, so pending
     /// context is visible where the user is typing.
     fn composer_chips(&mut self, ui: &mut Ui) {
-        let has_attachments = !self.state.composer_attachments.is_empty();
+        let has_attachments = !self.composer.attachments().is_empty();
         let steering = self.state.pending_steering.len();
         let follow_ups = self.state.pending_follow_up.len();
         if !has_attachments && steering == 0 && follow_ups == 0 {
@@ -1908,7 +1920,7 @@ impl Workbench {
         }
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = Vec2::new(6.0, 4.0);
-            let attachments = self.state.composer_attachments.clone();
+            let attachments = self.composer.attachments().to_vec();
             for attachment in attachments {
                 composer_attachment_card(ui, &attachment, &mut self.intents);
             }

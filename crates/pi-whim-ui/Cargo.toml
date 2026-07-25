@@ -10,6 +10,7 @@ egui_commonmark.workspace = true
 egui_extras.workspace = true
 fluent-bundle.workspace = true
 pi-whim-core = { path = "../pi-whim-core" }
+pi-whim-engine = { path = "../pi-whim-engine" }
 pulldown-cmark.workspace = true
 unic-langid.workspace = true
 uuid.workspace = true

@@ -220,7 +220,7 @@ fn mock_workbench(status: &str) -> Workbench {
         }
     }
     if status == "slash" {
-        workbench.state.dispatch(Action::SetComposer("/".into()));
+        workbench.composer_draft_mut().set_text("/");
     }
     workbench.state.dispatch(Action::QueueUpdated {
         steering: vec!["also check the runtime crate".into()],

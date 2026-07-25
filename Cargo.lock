@@ -2817,6 +2817,7 @@ dependencies = [
  "fluent-bundle",
  "image",
  "pi-whim-core",
+ "pi-whim-engine",
  "pulldown-cmark",
  "unic-langid",
  "uuid",
