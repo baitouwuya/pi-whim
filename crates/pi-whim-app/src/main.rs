@@ -9,10 +9,10 @@ use std::{
 
 use eframe::egui;
 use pi_whim_core::{
-    Action, Attachment, ConversationItem, ConversationRole, ModelOption, Project, ProjectId,
-    ProviderId, ProviderProfile, ProviderProtocol, QueueMode, SearchEngineProfile, SessionStatus,
-    SessionSummary, SubmitMode, ThinkingLevel, normalize_provider_display_name, provider_name_key,
-    stable_session_id,
+    Action, AppState, Attachment, ConversationItem, ConversationRole, ModelOption, Project,
+    ProjectId, ProviderId, ProviderProfile, ProviderProtocol, QueueMode, SearchEngineProfile,
+    SessionStatus, SessionSummary, SubmitMode, ThinkingLevel, normalize_provider_display_name,
+    provider_name_key, stable_session_id,
 };
 use pi_whim_persistence::{
     AppPreferences, AttachmentStore, MacosKeychainStore, PreferencesRepository, ProjectRepository,
@@ -195,7 +195,7 @@ impl<R: AgentRuntime> eframe::App for PiWhimApplication<R> {
         self.notice_window(context);
         let session_running = self.sessions.any_running();
         let agent_busy = matches!(
-            self.workbench.state().session_status,
+            self.state().session_status,
             SessionStatus::Starting | SessionStatus::Streaming | SessionStatus::Compacting
         );
         if session_running || agent_busy {
@@ -208,6 +208,20 @@ impl<R: AgentRuntime> eframe::App for PiWhimApplication<R> {
 }
 
 impl<R: AgentRuntime> PiWhimApplication<R> {
+    /// Read the domain state.
+    ///
+    /// Named here rather than reaching through the view, so orchestration does
+    /// not care which one is mounted: the state is about to move out of the view
+    /// and these callers should not have to move with it.
+    fn state(&self) -> &AppState {
+        self.workbench.state()
+    }
+
+    /// Change the domain state through the reducer.
+    fn apply(&mut self, action: Action) {
+        self.workbench.apply(action);
+    }
+
     fn consume_finder_paste(&mut self, context: &egui::Context) {
         let attachments = self
             .finder_paste_monitor
@@ -269,7 +283,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             UiIntent::ExportSession(path) => self.export_session(path),
             UiIntent::ShareSession => self.share_session(),
             UiIntent::AddFileAttachments => {
-                if self.workbench.state().selected_project.is_some() {
+                if self.state().selected_project.is_some() {
                     self.add_file_attachments();
                 } else {
                     self.notices
@@ -277,7 +291,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 }
             }
             UiIntent::AddFolderAttachment => {
-                if self.workbench.state().selected_project.is_some() {
+                if self.state().selected_project.is_some() {
                     self.add_folder_attachment();
                 } else {
                     self.notices
@@ -298,22 +312,21 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 }
             }
             UiIntent::SetLanguage(language) => {
-                self.workbench.apply(Action::SetLanguage(language));
+                self.apply(Action::SetLanguage(language));
                 self.save_preferences();
             }
             UiIntent::SetBashPolicy(policy) => {
-                self.workbench.apply(Action::SetBashPolicy(policy));
+                self.apply(Action::SetBashPolicy(policy));
                 self.save_preferences();
                 self.restart_selected_project();
             }
             UiIntent::SetBashBlockedPatterns(patterns) => {
-                self.workbench
-                    .apply(Action::SetBashBlockedPatterns(patterns));
+                self.apply(Action::SetBashBlockedPatterns(patterns));
                 self.save_preferences();
                 self.restart_selected_project();
             }
             UiIntent::SetAgentTeamConfig(config) => {
-                self.workbench.apply(Action::SetAgentTeamConfig(config));
+                self.apply(Action::SetAgentTeamConfig(config));
                 self.save_preferences();
                 self.restart_selected_project();
             }
@@ -372,34 +385,44 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     }
 
     fn reload_projects(&mut self) {
-        if let Some(store) = self.store.as_ref() {
-            match store.list_projects() {
-                Ok(projects) => {
-                    let project_ids = projects
-                        .iter()
-                        .map(|project| project.id)
-                        .collect::<Vec<_>>();
-                    self.workbench.apply(Action::ProjectsLoaded(projects));
-                    for project_id in project_ids {
-                        if let Ok(sessions) = store.list_sessions(project_id) {
-                            self.workbench.apply(Action::SessionsLoaded {
-                                project_id,
-                                sessions,
-                            });
-                        }
-                    }
-                }
-                Err(error) => self.notices.error(error.to_string()),
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        let projects = match store.list_projects() {
+            Ok(projects) => projects,
+            Err(error) => {
+                self.notices.error(error.to_string());
+                return;
             }
+        };
+        // Every read happens before the first apply: reading and applying both
+        // want `self`, and the store is the one part of it that cannot be
+        // borrowed alongside the reducer.
+        let sessions = projects
+            .iter()
+            .filter_map(|project| {
+                store
+                    .list_sessions(project.id)
+                    .ok()
+                    .map(|sessions| (project.id, sessions))
+            })
+            .collect::<Vec<_>>();
+
+        self.apply(Action::ProjectsLoaded(projects));
+        for (project_id, sessions) in sessions {
+            self.apply(Action::SessionsLoaded {
+                project_id,
+                sessions,
+            });
         }
     }
 
     fn save_preferences(&mut self) {
         let preferences = AppPreferences {
-            language: self.workbench.state().language,
-            bash_policy: self.workbench.state().bash_policy,
-            bash_blocked_patterns: self.workbench.state().bash_blocked_patterns.clone(),
-            agent_team_config: self.workbench.state().agent_team_config.clone(),
+            language: self.state().language,
+            bash_policy: self.state().bash_policy,
+            bash_blocked_patterns: self.state().bash_blocked_patterns.clone(),
+            agent_team_config: self.state().agent_team_config.clone(),
         };
         if let Some(store) = self.store.as_ref()
             && let Err(error) = store.save_preferences(preferences)
@@ -446,8 +469,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                     self.capability_resolver.enrich_profile(profile);
                 }
                 let ids: Vec<ProviderId> = profiles.iter().map(|profile| profile.id).collect();
-                self.workbench
-                    .apply(Action::ProviderProfilesLoaded(profiles));
+                self.apply(Action::ProviderProfilesLoaded(profiles));
                 self.refresh_provider_key_status(ids);
             }
             Err(error) => self.notices.error(error.to_string()),
@@ -568,8 +590,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             self.notices.error(error.to_string());
             return;
         }
-        self.workbench
-            .apply(Action::SearchEngineProfilesLoaded(profiles));
+        self.apply(Action::SearchEngineProfilesLoaded(profiles));
         self.restart_selected_project();
     }
 
@@ -620,8 +641,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     }
 
     fn find_project(&self, id: ProjectId) -> Option<Project> {
-        self.workbench
-            .state()
+        self.state()
             .projects
             .iter()
             .find(|project| project.id == id)
@@ -725,18 +745,16 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             }
         };
         if self.sessions.active_key().is_none() {
-            self.workbench
-                .apply(Action::SetSessionStatus(SessionStatus::Starting));
+            self.apply(Action::SetSessionStatus(SessionStatus::Starting));
         }
         let mut extension_paths = Vec::new();
         match ensure_agent_team_extension(&sessions_path) {
             Ok(path) => extension_paths.push(path.to_string_lossy().into_owned()),
             Err(error) => {
                 if self.sessions.active_key().is_none() {
-                    self.workbench
-                        .apply(Action::SetSessionStatus(SessionStatus::Failed(
-                            error.to_string(),
-                        )));
+                    self.apply(Action::SetSessionStatus(SessionStatus::Failed(
+                        error.to_string(),
+                    )));
                 }
                 self.notices.error(error.to_string());
                 return None;
@@ -744,11 +762,11 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         }
         environment.insert(
             "PI_WHIM_BASH_POLICY".into(),
-            bash_policy_name(&self.workbench.state().bash_policy).into(),
+            bash_policy_name(&self.state().bash_policy).into(),
         );
         environment.insert(
             "PI_WHIM_BASH_BLOCKED_PATTERNS".into(),
-            serde_json::to_string(&self.workbench.state().bash_blocked_patterns)
+            serde_json::to_string(&self.state().bash_blocked_patterns)
                 .unwrap_or_else(|_| "[]".into()),
         );
         let mut runtime = (self.runtime_factory)();
@@ -758,14 +776,13 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             session_path: session_path.map(str::to_owned),
             extension_paths,
             environment,
-            agent_team_config: self.workbench.state().agent_team_config.clone(),
-            search_engines: self.workbench.state().search_engine_profiles.clone(),
+            agent_team_config: self.state().agent_team_config.clone(),
+            search_engines: self.state().search_engine_profiles.clone(),
         }) {
             if self.sessions.active_key().is_none() {
-                self.workbench
-                    .apply(Action::SetSessionStatus(SessionStatus::Failed(
-                        error.to_string(),
-                    )));
+                self.apply(Action::SetSessionStatus(SessionStatus::Failed(
+                    error.to_string(),
+                )));
             }
             self.notices.error(error.to_string());
             return None;
@@ -799,13 +816,12 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         };
         let project_id = session.project_id;
         let running = session.is_running();
-        self.workbench.apply(Action::SelectProject(project_id));
+        self.apply(Action::SelectProject(project_id));
         if !is_draft(key) {
-            self.workbench
-                .apply(Action::SelectSession(stable_session_id(key)));
+            self.apply(Action::SelectSession(stable_session_id(key)));
         }
-        self.workbench.apply(Action::ClearConversation);
-        self.workbench.apply(Action::SetSessionStatus(if running {
+        self.apply(Action::ClearConversation);
+        self.apply(Action::SetSessionStatus(if running {
             SessionStatus::Streaming
         } else {
             SessionStatus::Ready
@@ -820,8 +836,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         if let Some(outcome) = self.sessions.rekey(from, to, now_ms())
             && outcome.was_active
         {
-            self.workbench
-                .apply(Action::SelectSession(stable_session_id(to)));
+            self.apply(Action::SelectSession(stable_session_id(to)));
         }
     }
 
@@ -836,16 +851,15 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
 
         for key in self.sessions.remove_project(project_id) {
             self.prompts.forget_session(&key);
-            self.workbench.apply(Action::SessionRunning {
+            self.apply(Action::SessionRunning {
                 path: key,
                 running: false,
             });
         }
 
         if was_visible {
-            self.workbench.apply(Action::ClearConversation);
-            self.workbench
-                .apply(Action::SetSessionStatus(SessionStatus::Offline));
+            self.apply(Action::ClearConversation);
+            self.apply(Action::SetSessionStatus(SessionStatus::Offline));
         }
     }
 
@@ -861,7 +875,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         else {
             return;
         };
-        let providers = controls::provider_names(&self.workbench.state().provider_profiles);
+        let providers = controls::provider_names(&self.state().provider_profiles);
         let sender = self.control_updates.0.clone();
         let key = self.sessions.active_key().map(str::to_owned);
         std::thread::spawn(move || {
@@ -879,7 +893,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         while let Ok((key, actions)) = self.control_updates.1.recv_timeout(Duration::from_secs(5)) {
             if key.as_deref() == self.sessions.active_key() {
                 for action in actions {
-                    self.workbench.apply(action);
+                    self.apply(action);
                 }
             }
             if self.control_updates.1.is_empty() {
@@ -900,7 +914,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 continue;
             }
             for action in actions {
-                self.workbench.apply(action);
+                self.apply(action);
             }
         }
     }
@@ -933,14 +947,14 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     /// the conversation first (cache-friendly). The UI shows the pending model
     /// immediately while Pi keeps using the old one until the prompt lands.
     fn queue_model_switch(&mut self, model: ModelOption) {
-        self.workbench.apply(Action::SetPendingModel(Some(model)));
+        self.apply(Action::SetPendingModel(Some(model)));
     }
 
     /// Apply a deferred model switch: send set_model and refresh controls.
     fn apply_pending_model(&mut self, key: &str) {
-        if let Some(model) = self.workbench.state().pending_model.clone() {
+        if let Some(model) = self.state().pending_model.clone() {
             self.set_model_on(key, model);
-            self.workbench.apply(Action::SetPendingModel(None));
+            self.apply(Action::SetPendingModel(None));
         }
     }
 
@@ -965,7 +979,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     }
 
     fn compact_session(&mut self) {
-        if !matches!(self.workbench.state().session_status, SessionStatus::Ready) {
+        if !matches!(self.state().session_status, SessionStatus::Ready) {
             return;
         }
         if let Err(error) = self.active_send(json!({"type":"compact"})) {
@@ -975,8 +989,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         if let Some(session) = self.active_mut() {
             session.turn.running = true;
         }
-        self.workbench
-            .apply(Action::SetSessionStatus(SessionStatus::Compacting));
+        self.apply(Action::SetSessionStatus(SessionStatus::Compacting));
     }
 
     fn set_queue_modes(&mut self, steering: QueueMode, follow_up: QueueMode) {
@@ -1024,7 +1037,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             if let Some(store) = self.store.as_ref() {
                 let _ = store.delete_session(stable_session_id(pi_path));
                 if let Ok(sessions) = store.list_sessions(project_id) {
-                    self.workbench.apply(Action::SessionsLoaded {
+                    self.apply(Action::SessionsLoaded {
                         project_id,
                         sessions,
                     });
@@ -1041,7 +1054,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 return;
             }
             if let Ok(sessions) = store.list_sessions(project_id) {
-                self.workbench.apply(Action::SessionsLoaded {
+                self.apply(Action::SessionsLoaded {
                     project_id,
                     sessions,
                 });
@@ -1081,7 +1094,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             }
         }
         if let Ok(sessions) = store.list_sessions(project_id) {
-            self.workbench.apply(Action::SessionsLoaded {
+            self.apply(Action::SessionsLoaded {
                 project_id,
                 sessions,
             });
@@ -1091,7 +1104,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     /// Start a fresh session in its own Pi process. The currently visible
     /// session keeps running untouched in the background.
     fn start_new_session(&mut self, project_id: ProjectId) {
-        self.workbench.apply(Action::SelectProject(project_id));
+        self.apply(Action::SelectProject(project_id));
         // An empty visible session of the same project is reused instead of
         // spawning another blank one.
         if self.active().is_some_and(|session| {
@@ -1127,12 +1140,12 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             };
             let _ = store.save_session(&summary);
             if let Ok(sessions) = store.list_sessions(project_id) {
-                self.workbench.apply(Action::SessionsLoaded {
+                self.apply(Action::SessionsLoaded {
                     project_id,
                     sessions,
                 });
             }
-            self.workbench.apply(Action::SelectSession(summary.id));
+            self.apply(Action::SelectSession(summary.id));
         }
     }
 
@@ -1160,7 +1173,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             self.notices.error(error.to_string());
             return;
         }
-        if let Some(project_id) = self.workbench.state().selected_project {
+        if let Some(project_id) = self.state().selected_project {
             self.index_session(project_id, &path, Some(&title));
         }
         if self.sessions.active_key() == Some(path.as_str()) {
@@ -1235,7 +1248,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             self.notices.error(error);
             return;
         }
-        if let Some(project_id) = self.workbench.state().selected_project {
+        if let Some(project_id) = self.state().selected_project {
             self.refresh_session_state(project_id);
         }
     }
@@ -1245,7 +1258,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             self.notices.error(error);
             return;
         }
-        if let Some(project_id) = self.workbench.state().selected_project {
+        if let Some(project_id) = self.state().selected_project {
             self.refresh_session_state(project_id);
         }
     }
@@ -1256,14 +1269,13 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         let was_visible = self.sessions.active_key() == Some(path.as_str());
         if let Some(mut session) = self.sessions.remove(&path) {
             let _ = session.runtime.stop();
-            self.workbench.apply(Action::SessionRunning {
+            self.apply(Action::SessionRunning {
                 path: path.clone(),
                 running: false,
             });
             if was_visible {
-                self.workbench.apply(Action::ClearConversation);
-                self.workbench
-                    .apply(Action::SetSessionStatus(SessionStatus::Offline));
+                self.apply(Action::ClearConversation);
+                self.apply(Action::SetSessionStatus(SessionStatus::Offline));
             }
         }
         let target = PathBuf::from(&path);
@@ -1285,7 +1297,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         {
             self.notices.error(error.to_string());
         }
-        if let Some(project_id) = self.workbench.state().selected_project {
+        if let Some(project_id) = self.state().selected_project {
             self.discover_sessions(project_id, target.parent().unwrap_or(Path::new("")));
         }
     }
@@ -1296,7 +1308,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             .map_err(|error| {
                 self.notices.error(error);
             })?;
-        self.workbench.apply(Action::ClearConversation);
+        self.apply(Action::ClearConversation);
         for action in entries
             .get("entries")
             .and_then(Value::as_array)
@@ -1304,7 +1316,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             .flatten()
             .filter_map(events::session_entry_action)
         {
-            self.workbench.apply(action);
+            self.apply(action);
         }
         Ok(())
     }
@@ -1408,13 +1420,13 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     }
 
     fn submit_prompt(&mut self, content: String, attachments: Vec<Attachment>, mode: SubmitMode) {
-        if self.workbench.state().selected_project.is_none() {
+        if self.state().selected_project.is_none() {
             self.notices
                 .error("Select a project before sending a message.");
             return;
         }
         if !matches!(
-            self.workbench.state().session_status,
+            self.state().session_status,
             SessionStatus::Ready | SessionStatus::Streaming | SessionStatus::Compacting
         ) {
             self.notices
@@ -1433,12 +1445,12 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             model: None,
             attachments: attachments.clone(),
         };
-        self.workbench.apply(Action::UpsertConversation(item));
+        self.apply(Action::UpsertConversation(item));
         // A deferred model switch waits until the prompt that continues the
         // conversation, so the prior model compacts the existing history first
         // (cache-friendly). Skip when there's nothing to compact or it just did.
         let defer_for_compaction = matches!(mode, SubmitMode::Prompt)
-            && self.workbench.state().pending_model.is_some()
+            && self.state().pending_model.is_some()
             && !self
                 .active()
                 .map(|session| session.turn.conversation_compacted)
@@ -1461,8 +1473,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                         session.turn.pending_prompt = Some((content, attachments, mode));
                         session.turn.running = true;
                     }
-                    self.workbench
-                        .apply(Action::SetSessionStatus(SessionStatus::Compacting));
+                    self.apply(Action::SetSessionStatus(SessionStatus::Compacting));
                 }
                 Err(error) => self.notices.error(error),
             }
@@ -1472,7 +1483,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             self.notices.error("No active session.");
             return;
         };
-        if self.workbench.state().pending_model.is_some() {
+        if self.state().pending_model.is_some() {
             self.apply_pending_model(&key);
         }
         self.send_prompt(&key, content, attachments, mode);
@@ -1511,19 +1522,18 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         if let Some(session) = self.sessions.get_mut(key) {
             session.turn.running = true;
         }
-        self.workbench.apply(Action::SessionRunning {
+        self.apply(Action::SessionRunning {
             path: key.to_owned(),
             running: true,
         });
         if is_active {
-            self.workbench
-                .apply(Action::SetSessionStatus(SessionStatus::Streaming));
+            self.apply(Action::SetSessionStatus(SessionStatus::Streaming));
             self.ensure_session_title();
         }
     }
 
     fn ensure_session_title(&mut self) {
-        let Some(project_id) = self.workbench.state().selected_project else {
+        let Some(project_id) = self.state().selected_project else {
             return;
         };
         let Ok(state) = self.active_command(json!({"type":"get_state"})) else {
@@ -1596,15 +1606,14 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 // Nothing is left to answer, and a dialog still up would ask the
                 // reader to unblock a process that has gone.
                 self.prompts.forget_session(key);
-                self.workbench.apply(Action::SessionRunning {
+                self.apply(Action::SessionRunning {
                     path: key.to_owned(),
                     running: false,
                 });
                 if is_active {
-                    self.workbench
-                        .apply(Action::SetSessionStatus(SessionStatus::Failed(format!(
-                            "Pi exited: {code:?}"
-                        ))));
+                    self.apply(Action::SetSessionStatus(SessionStatus::Failed(format!(
+                        "Pi exited: {code:?}"
+                    ))));
                 }
             }
             RuntimeEvent::Error(error) => {
@@ -1623,13 +1632,14 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     fn apply_agent_event(&mut self, key: &str, event: Value) {
         let is_active = self.sessions.active_key() == Some(key);
         let now = now_ms();
-        let Some(session) = self.sessions.get_mut(key) else {
-            return;
-        };
         // The conversation is cloned because `translate` reads it while holding
         // the turn mutably. Only tool events look at it, and only to find one
         // entry, so a borrow split would cost more in plumbing than this does.
-        let conversation = self.workbench.state().conversation.clone();
+        // Read before the pool is borrowed: state and pool are both `self`.
+        let conversation = self.state().conversation.clone();
+        let Some(session) = self.sessions.get_mut(key) else {
+            return;
+        };
         let outcome = events::translate(
             &event,
             events::Context {
@@ -1641,7 +1651,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             &mut session.turn,
         );
         for action in outcome.actions {
-            self.workbench.apply(action);
+            self.apply(action);
         }
         for effect in outcome.effects {
             self.perform_effect(key, effect);
@@ -1678,7 +1688,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 // A switch-triggered compaction held this prompt back so the
                 // prior model compacted the history first; now the new model
                 // takes over and the turn continues.
-                if self.workbench.state().pending_model.is_some() {
+                if self.state().pending_model.is_some() {
                     self.apply_pending_model(key);
                 }
                 self.send_prompt(key, content, attachments, mode);
@@ -1705,7 +1715,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     /// them restarts every session of the selected project (sessions resume
     /// from disk; in-flight runs are aborted by the restart, as before).
     fn restart_selected_project(&mut self) {
-        if let Some(project) = self.workbench.state().selected_project {
+        if let Some(project) = self.state().selected_project {
             self.stop_project_runtimes(project);
             self.start_project(project);
         }
