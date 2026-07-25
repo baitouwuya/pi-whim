@@ -1,0 +1,11 @@
+[package]
+name = "pi-whim-catalog"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+crossbeam-channel.workspace = true
+pi-whim-core = { path = "../pi-whim-core" }
+serde_json.workspace = true
+ureq.workspace = true

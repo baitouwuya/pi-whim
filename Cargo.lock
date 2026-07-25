@@ -2710,6 +2710,7 @@ dependencies = [
  "eframe",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
+ "pi-whim-catalog",
  "pi-whim-core",
  "pi-whim-persistence",
  "pi-whim-runtime",
@@ -2720,6 +2721,16 @@ dependencies = [
  "tempfile",
  "ureq",
  "uuid",
+]
+
+[[package]]
+name = "pi-whim-catalog"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "pi-whim-core",
+ "serde_json",
+ "ureq",
 ]
 
 [[package]]

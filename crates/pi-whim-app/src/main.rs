@@ -1,5 +1,4 @@
 mod macos_paste;
-mod model_capabilities;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -27,7 +26,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use macos_paste::{ClipboardAttachment, FinderPasteMonitor};
-use model_capabilities::ModelCapabilityResolver;
+use pi_whim_catalog::ModelCapabilityResolver;
 
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
@@ -3192,7 +3191,10 @@ mod tests {
             active_session: None,
             pending_extension_request: None,
             pending_interactions: Vec::new(),
-            capability_resolver: ModelCapabilityResolver::new(false),
+            capability_resolver: ModelCapabilityResolver::new(
+                &pi_whim_catalog::SharedCatalog::default(),
+                false,
+            ),
             sessions_root_override: Some(directory.path().join("sessions")),
             agent_directory_override: Some(directory.path().join("agent")),
             attachment_store: AttachmentStore::open(directory.path().join("attachments")).unwrap(),

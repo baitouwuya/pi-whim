@@ -1,6 +1,18 @@
+//! Model capability lookup, online and bundled.
+//!
+//! Pi-Whim needs to know what a model supports — reasoning, images, thinking
+//! levels — to render the right controls and pass the right flags to Pi. Two
+//! sources answer that: a catalog fetched from models.dev, and the table
+//! compiled into `pi-whim-core` at build time from the vendored Pi checkout.
+//!
+//! The online catalog is a few megabytes, so it is fetched once on a background
+//! thread and shared. Callers hold a [`ModelCapabilityResolver`]; lookups fall
+//! back to the bundled table while the fetch is in flight or if it fails, so
+//! this is never on a critical path.
+
 use std::{
     collections::BTreeSet,
-    sync::{Arc, OnceLock, RwLock},
+    sync::{Arc, RwLock},
     time::Duration,
 };
 
@@ -23,7 +35,14 @@ enum OnlineCatalogState {
     Unavailable,
 }
 
-static ONLINE_CATALOG: OnceLock<Arc<RwLock<OnlineCatalogState>>> = OnceLock::new();
+/// A fetched catalog, shared by every resolver cloned from the same handle.
+///
+/// Held explicitly rather than in a process-global static, so tests and any
+/// future second workspace get their own catalog instead of racing over one.
+#[derive(Clone, Default)]
+pub struct SharedCatalog {
+    state: Arc<RwLock<OnlineCatalogState>>,
+}
 
 pub struct ModelCapabilityResolver {
     state: Arc<RwLock<OnlineCatalogState>>,
@@ -32,15 +51,15 @@ pub struct ModelCapabilityResolver {
 
 impl Default for ModelCapabilityResolver {
     fn default() -> Self {
-        Self::new(true)
+        Self::new(&SharedCatalog::default(), true)
     }
 }
 
 impl ModelCapabilityResolver {
-    pub(crate) fn new(fetch_online: bool) -> Self {
-        let state = ONLINE_CATALOG
-            .get_or_init(|| Arc::new(RwLock::new(OnlineCatalogState::Empty)))
-            .clone();
+    /// Build a resolver over `catalog`, fetching the online catalog into it if
+    /// `fetch_online` is set and no other resolver has already started.
+    pub fn new(catalog: &SharedCatalog, fetch_online: bool) -> Self {
+        let state = catalog.state.clone();
         let (sender, completed) = bounded(1);
         if fetch_online {
             let should_fetch = state
@@ -368,7 +387,7 @@ mod tests {
     #[test]
     fn generic_gateway_uses_model_publisher_when_the_id_is_unambiguous() {
         let mut model = ProviderModel::new("deepseek-v4-pro");
-        ModelCapabilityResolver::new(false).enrich_models(
+        ModelCapabilityResolver::new(&SharedCatalog::default(), false).enrich_models(
             "OpenAI-compatible",
             "https://proxy.example/v1",
             std::slice::from_mut(&mut model),

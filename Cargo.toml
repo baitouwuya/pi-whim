@@ -2,6 +2,7 @@
 members = [
   "crates/pi-whim-app",
   "crates/pi-whim-agent-team",
+  "crates/pi-whim-catalog",
   "crates/pi-whim-core",
   "crates/pi-whim-persistence",
   "crates/pi-whim-pi-rpc",
