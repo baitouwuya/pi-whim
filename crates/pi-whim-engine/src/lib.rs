@@ -6,6 +6,7 @@
 //! against a fake runtime.
 
 pub mod composer;
+pub mod controls;
 pub mod pool;
 pub mod protocol;
 pub mod providers;

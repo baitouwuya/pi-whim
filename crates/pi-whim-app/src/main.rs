@@ -11,8 +11,8 @@ use eframe::egui;
 use pi_whim_core::{
     Action, Attachment, ConversationItem, ConversationRole, ModelOption, Project, ProjectId,
     ProviderId, ProviderProfile, ProviderProtocol, QueueMode, SearchEngineProfile, SessionStatus,
-    SessionSummary, SlashCommandInfo, SubmitMode, ThinkingLevel, normalize_provider_display_name,
-    provider_name_key, stable_session_id,
+    SessionSummary, SubmitMode, ThinkingLevel, normalize_provider_display_name, provider_name_key,
+    stable_session_id,
 };
 use pi_whim_persistence::{
     AppPreferences, AttachmentStore, MacosKeychainStore, PreferencesRepository, ProjectRepository,
@@ -26,14 +26,15 @@ use uuid::Uuid;
 
 use macos_paste::{ClipboardAttachment, FinderPasteMonitor};
 use pi_whim_catalog::ModelCapabilityResolver;
+use pi_whim_engine::controls;
 use pi_whim_engine::pool::{SessionPool, SessionRuntime, is_draft};
 use pi_whim_engine::protocol::{
-    assistant_text, model_option, queue_mode, queue_mode_name, session_metrics, tool_call_report,
-    tool_event_details, tool_result_report, tool_result_summary,
+    assistant_text, queue_mode_name, tool_call_report, tool_event_details, tool_result_report,
+    tool_result_summary,
 };
 use pi_whim_engine::providers::{
     configured_provider_environment, discover_models, normalize_base_url, pi_models_json,
-    provider_config_key, provider_keychain_account, test_searxng_engine, valid_search_engine_url,
+    provider_keychain_account, test_searxng_engine, valid_search_engine_url,
 };
 use pi_whim_engine::session::{
     attachment_from_path, bash_policy_name, canonical_path, ensure_agent_team_extension,
@@ -78,6 +79,13 @@ struct PiWhimApplication<R: AgentRuntime = PiRpcRuntime> {
     finder_paste_monitor_install_pending: bool,
     error: Option<String>,
     notice: Option<String>,
+    /// Control-state refreshes in flight, tagged with the session they were
+    /// asked about.
+    #[allow(clippy::type_complexity)]
+    control_updates: (
+        crossbeam_channel::Sender<(Option<String>, Vec<Action>)>,
+        crossbeam_channel::Receiver<(Option<String>, Vec<Action>)>,
+    ),
 }
 
 impl Default for PiWhimApplication<PiRpcRuntime> {
@@ -149,6 +157,7 @@ impl Default for PiWhimApplication<PiRpcRuntime> {
             finder_paste_monitor_install_pending: true,
             error: None,
             notice: None,
+            control_updates: crossbeam_channel::unbounded(),
         }
     }
 }
@@ -172,6 +181,7 @@ impl<R: AgentRuntime> eframe::App for PiWhimApplication<R> {
         }
         self.consume_finder_paste(context);
         self.consume_runtime_events();
+        self.consume_control_updates();
         self.consume_capability_catalog();
         self.workbench.show(context);
         for intent in self.workbench.take_intents() {
@@ -909,118 +919,59 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         }
     }
 
+    /// Ask the agent for its control state on a worker thread.
+    ///
+    /// Five RPCs at up to 20 seconds each; issuing them inline froze the window
+    /// whenever Pi was slow to answer. Results arrive as actions and are applied
+    /// by `consume_control_updates`.
     fn refresh_runtime_controls(&mut self) {
-        if self.active().is_none() {
+        let Some(commander) = self
+            .active()
+            .and_then(|session| session.runtime.commander())
+        else {
             return;
-        }
-        let provider_names = self
-            .workbench
-            .state()
-            .provider_profiles
-            .iter()
-            .map(|profile| (provider_config_key(profile.id), profile.name.clone()))
-            .collect::<HashMap<_, _>>();
-        let state = match self.active_command(json!({"type":"get_state"})) {
-            Ok(state) => state,
-            Err(error) => {
-                self.workbench
-                    .apply(Action::SetSessionStatus(SessionStatus::Failed(error)));
-                return;
-            }
         };
-        let models = match self.active_command(json!({"type":"get_available_models"})) {
-            Ok(response) => response
-                .get("models")
-                .cloned()
-                .and_then(|models| serde_json::from_value::<Vec<Value>>(models).ok())
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|model| model_option(&model, &provider_names))
-                .collect(),
-            Err(error) => {
-                self.workbench
-                    .apply(Action::SetSessionStatus(SessionStatus::Failed(error)));
-                Vec::new()
-            }
-        };
-        let mut thinking_levels = self
-            .active_command(json!({"type":"get_available_thinking_levels"}))
-            .ok()
-            .and_then(|response| response.get("levels").cloned())
-            .and_then(|levels| serde_json::from_value::<Vec<String>>(levels).ok())
-            .map(|levels| {
-                levels
-                    .iter()
-                    .filter_map(|level| ThinkingLevel::try_from(level.as_str()).ok())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        if thinking_levels.is_empty() {
-            thinking_levels.push(ThinkingLevel::Off);
-        }
-        let requested_thinking_level = state
-            .get("thinkingLevel")
-            .and_then(Value::as_str)
-            .and_then(|level| ThinkingLevel::try_from(level).ok())
-            .unwrap_or_default();
-        let thinking_level = if thinking_levels.contains(&requested_thinking_level) {
-            requested_thinking_level
-        } else {
-            thinking_levels.first().copied().unwrap_or_default()
-        };
-        let steering_mode = state
-            .get("steeringMode")
-            .and_then(Value::as_str)
-            .map(queue_mode)
-            .unwrap_or_default();
-        let follow_up_mode = state
-            .get("followUpMode")
-            .and_then(Value::as_str)
-            .map(queue_mode)
-            .unwrap_or_default();
-        let auto_compaction_enabled = state
-            .get("autoCompactionEnabled")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
-        self.workbench.apply(Action::RuntimeControlsUpdated {
-            current_model: state
-                .get("model")
-                .and_then(|model| model_option(model, &provider_names)),
-            available_models: models,
-            thinking_level,
-            available_thinking_levels: thinking_levels,
-            auto_compaction_enabled,
-            steering_mode,
-            follow_up_mode,
+        let providers = controls::provider_names(&self.workbench.state().provider_profiles);
+        let sender = self.control_updates.0.clone();
+        let key = self.sessions.active_key().map(str::to_owned);
+        std::thread::spawn(move || {
+            let actions = controls::fetch(&commander, &providers);
+            let _ = sender.send((key, actions));
         });
-        if let Ok(metrics) = self.active_command(json!({"type":"get_session_stats"})) {
-            self.workbench
-                .apply(Action::SessionMetricsUpdated(session_metrics(&metrics)));
+    }
+
+    /// Block until an in-flight control refresh lands, for tests.
+    ///
+    /// Production code applies these from the frame loop; a test has no frame
+    /// loop, so it waits for the worker instead of racing it.
+    #[cfg(test)]
+    fn settle_control_updates(&mut self) {
+        while let Ok((key, actions)) = self.control_updates.1.recv_timeout(Duration::from_secs(5)) {
+            if key.as_deref() == self.sessions.active_key() {
+                for action in actions {
+                    self.workbench.apply(action);
+                }
+            }
+            if self.control_updates.1.is_empty() {
+                break;
+            }
         }
-        if let Ok(response) = self.active_command(json!({"type":"get_commands"})) {
-            let commands = response
-                .get("commands")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|command| {
-                    Some(SlashCommandInfo {
-                        name: command.get("name")?.as_str()?.to_owned(),
-                        description: command
-                            .get("description")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_owned(),
-                        source: command
-                            .get("source")
-                            .and_then(Value::as_str)
-                            .unwrap_or("command")
-                            .to_owned(),
-                    })
-                })
-                .collect();
-            self.workbench
-                .apply(Action::RuntimeCommandsUpdated(commands));
+    }
+
+    /// Apply whatever the control refresh reported.
+    ///
+    /// Updates for a session that is no longer visible are dropped: the user
+    /// has moved on, and applying them would overwrite the current session's
+    /// controls with another's.
+    fn consume_control_updates(&mut self) {
+        let updates: Vec<_> = self.control_updates.1.try_iter().collect();
+        for (key, actions) in updates {
+            if key.as_deref() != self.sessions.active_key() {
+                continue;
+            }
+            for action in actions {
+                self.workbench.apply(action);
+            }
         }
     }
 
@@ -2260,6 +2211,7 @@ mod tests {
             finder_paste_monitor_install_pending: false,
             error: None,
             notice: None,
+            control_updates: crossbeam_channel::unbounded(),
         }
     }
 
@@ -2401,6 +2353,9 @@ mod tests {
         let observer = runtime.clone();
         let mut app = test_application(&directory, runtime);
         start_test_session(&mut app, &directory);
+        // Starting a session kicks off a control refresh of its own; let it
+        // finish so the baseline covers only what the model switch issues.
+        app.settle_control_updates();
         let baseline = observer.commands().len();
 
         let key = app.sessions.active_key().unwrap().to_owned();
@@ -2413,6 +2368,7 @@ mod tests {
                 name: "Model A".into(),
             },
         );
+        app.settle_control_updates();
 
         assert_eq!(app.workbench.state().thinking_level, ThinkingLevel::Off);
         assert_eq!(
@@ -2514,6 +2470,7 @@ mod tests {
         start_test_session(&mut app, &directory);
 
         app.set_auto_compaction(false);
+        app.settle_control_updates();
 
         assert!(!app.workbench.state().auto_compaction_enabled);
         let command = observer
@@ -2551,6 +2508,7 @@ mod tests {
         let session_path = "/sessions/agent-model-b.jsonl";
 
         app.switch_session(project_id, session_path.into());
+        app.settle_control_updates();
 
         // The session opens in its own process; Pi restores its recorded
         // model there and the picker reflects it immediately.
