@@ -50,14 +50,6 @@ impl AgentPermissionLevel {
             Self::Full => 2,
         }
     }
-
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::ReadOnly => "Read only",
-            Self::Controlled => "Controlled",
-            Self::Full => "Full",
-        }
-    }
 }
 
 /// A provider/model pair that may be handed to a child process. Provider is the
@@ -290,14 +282,6 @@ pub enum SearchEngineKind {
     Searxng,
 }
 
-impl SearchEngineKind {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Searxng => "SearXNG",
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchEngineProfile {
     pub id: SearchEngineId,
@@ -385,12 +369,6 @@ pub struct SlashCommandInfo {
     pub name: String,
     pub description: String,
     pub source: String,
-}
-
-impl ModelOption {
-    pub fn label(&self) -> String {
-        self.name.clone()
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -661,7 +639,9 @@ impl AppState {
                 steering_mode,
                 follow_up_mode,
             } => {
-                available_models.sort_by_key(|model| model.label());
+                // Sorted by the shown name, then deduplicated by identity: Pi can
+                // report the same model twice when two profiles reach it.
+                available_models.sort_by(|left, right| left.name.cmp(&right.name));
                 available_models
                     .dedup_by(|left, right| left.provider == right.provider && left.id == right.id);
                 self.current_model = current_model;
