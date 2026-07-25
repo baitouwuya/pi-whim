@@ -8,6 +8,7 @@ members = [
   "crates/pi-whim-persistence",
   "crates/pi-whim-pi-rpc",
   "crates/pi-whim-runtime",
+  "crates/pi-whim-theme",
   "crates/pi-whim-tool-protocol",
   "crates/pi-whim-ui",
   "xtask",
