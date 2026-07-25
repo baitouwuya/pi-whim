@@ -12,14 +12,17 @@ use gpui::{
 };
 use gpui_component::theme::{Theme as ComponentTheme, ThemeMode as ComponentMode};
 use pi_whim_core::{
-    Action, AppState, ConversationItem, ConversationRole, ProjectId, SessionStatus,
-    stable_session_id,
+    Action, AppState, ConversationItem, ConversationRole, ModelOption, ProjectId, QueueMode,
+    SessionStatus, ThinkingLevel, stable_session_id,
 };
 use pi_whim_engine::state::{EngineState, ViewEffect};
 use pi_whim_theme::{ThemeMode, ThemePreference, Tokens, text};
 
 use crate::{
-    chat::{self, Composer, ComposerEvent, Conversation, ConversationEvent, Sidebar, SidebarEvent},
+    chat::{
+        self, Composer, ComposerEvent, Controls, ControlsEvent, Conversation, ConversationEvent,
+        Sidebar, SidebarEvent,
+    },
     chrome::{Banner, TopBar},
     elements::GraphPaper,
     theme::IntoHsla,
@@ -38,6 +41,14 @@ pub enum Request {
     AddProject,
     /// Start a fresh session in a project.
     NewSession(ProjectId),
+    /// Switch which model answers. The host defers this until the next prompt so
+    /// the prior model compacts the history first.
+    SetModel(ModelOption),
+    SetThinkingLevel(ThinkingLevel),
+    SetQueueModes {
+        steering: QueueMode,
+        follow_up: QueueMode,
+    },
 }
 
 /// The application shell.
@@ -48,6 +59,7 @@ pub struct Workspace {
     sidebar: Entity<Sidebar>,
     conversation: Entity<Conversation>,
     composer: Entity<Composer>,
+    controls: Entity<Controls>,
     /// Projects whose sessions are listed. View-local: which projects a reader
     /// has open says nothing about the session.
     expanded_projects: BTreeSet<ProjectId>,
@@ -63,9 +75,12 @@ impl Workspace {
             ThemeMode::Light
         };
         let tokens = Tokens::new(mode);
+        // These subscribe with `subscribe_in` rather than `subscribe` so the
+        // handlers receive a window: reseeding the runtime pickers needs one, and
+        // every state change can change what they offer.
         let sidebar = cx.new(|_| Sidebar::new(tokens));
-        cx.subscribe(&sidebar, |workspace, _, event, cx| {
-            workspace.handle_sidebar_event(event.clone(), cx);
+        cx.subscribe_in(&sidebar, window, |workspace, _, event, window, cx| {
+            workspace.handle_sidebar_event(event.clone(), window, cx);
         })
         .detach();
 
@@ -84,8 +99,14 @@ impl Workspace {
         .detach();
 
         let composer = cx.new(|cx| Composer::new(tokens, window, cx));
-        cx.subscribe(&composer, |workspace, _, event, cx| {
-            workspace.handle_composer_event(event.clone(), cx);
+        cx.subscribe_in(&composer, window, |workspace, _, event, window, cx| {
+            workspace.handle_composer_event(event.clone(), window, cx);
+        })
+        .detach();
+
+        let controls = cx.new(|cx| Controls::new(tokens, window, cx));
+        cx.subscribe_in(&controls, window, |workspace, _, event, window, cx| {
+            workspace.handle_controls_event(event.clone(), window, cx);
         })
         .detach();
 
@@ -96,6 +117,7 @@ impl Workspace {
             sidebar,
             conversation,
             composer,
+            controls,
             expanded_projects: BTreeSet::new(),
             requests: Vec::new(),
         }
@@ -109,7 +131,12 @@ impl Workspace {
     }
 
     /// Act on what the sidebar reported, and refresh its rows.
-    fn handle_sidebar_event(&mut self, event: SidebarEvent, cx: &mut Context<Self>) {
+    fn handle_sidebar_event(
+        &mut self,
+        event: SidebarEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match event {
             // Both of these need the backend: one opens a folder picker and
             // stores a project, the other launches a Pi session. Neither is
@@ -135,7 +162,7 @@ impl Workspace {
                     .apply(Action::SelectSession(stable_session_id(&pi_path)));
             }
         }
-        self.sync_views(cx);
+        self.sync_views(window, cx);
         cx.notify();
     }
 
@@ -144,7 +171,12 @@ impl Workspace {
     /// Submitting is the shell's to forward to the backend, which the egui app
     /// still owns; for now the prompt lands in the conversation so the round trip
     /// is visible.
-    fn handle_composer_event(&mut self, event: ComposerEvent, cx: &mut Context<Self>) {
+    fn handle_composer_event(
+        &mut self,
+        event: ComposerEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match event {
             ComposerEvent::Submit {
                 content,
@@ -165,14 +197,46 @@ impl Workspace {
                     model: None,
                     attachments,
                 };
-                self.apply(Action::UpsertConversation(item), cx);
+                self.apply(Action::UpsertConversation(item), window, cx);
             }
             ComposerEvent::Stop => {
-                self.apply(Action::SetSessionStatus(SessionStatus::Ready), cx);
+                self.apply(Action::SetSessionStatus(SessionStatus::Ready), window, cx);
             }
             ComposerEvent::RemoveAttachment(path) => {
                 self.composer.update(cx, |composer, cx| {
                     composer.remove_attachment(&path, cx);
+                });
+            }
+        }
+    }
+
+    /// Act on what the runtime controls reported.
+    ///
+    /// All three reach the agent over RPC, which lives behind `AgentRuntime`, so
+    /// they queue as requests the same way the sidebar's do. A model switch is
+    /// applied to state as well, since the picker has to keep showing the choice
+    /// while it waits for the next prompt to take effect.
+    fn handle_controls_event(
+        &mut self,
+        event: ControlsEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            ControlsEvent::SetModel(model) => {
+                self.requests.push(Request::SetModel(model.clone()));
+                self.apply(Action::SetPendingModel(Some(model)), window, cx);
+            }
+            ControlsEvent::SetThinkingLevel(level) => {
+                self.requests.push(Request::SetThinkingLevel(level));
+            }
+            ControlsEvent::SetQueueModes {
+                steering,
+                follow_up,
+            } => {
+                self.requests.push(Request::SetQueueModes {
+                    steering,
+                    follow_up,
                 });
             }
         }
@@ -199,7 +263,7 @@ impl Workspace {
     }
 
     /// Refresh the panes after state changed.
-    fn sync_views(&mut self, cx: &mut Context<Self>) {
+    fn sync_views(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_sidebar(cx);
         self.sync_conversation(cx);
 
@@ -212,6 +276,15 @@ impl Workspace {
             composer.set_tokens(tokens, cx);
             composer.set_busy(busy, cx);
         });
+
+        // The controls reseed from state wholesale: which models exist, which
+        // thinking levels this one offers, and what is selected all change
+        // together when the agent reports back.
+        let state = self.engine.get().clone();
+        self.controls.update(cx, |controls, cx| {
+            controls.set_tokens(tokens, cx);
+            controls.sync(&state, window, cx);
+        });
     }
 
     /// Read-only domain state, for rendering.
@@ -223,7 +296,7 @@ impl Workspace {
     ///
     /// View-local follow-ups arrive as a [`ViewEffect`]; the shell currently
     /// caches nothing per message, so there is nothing to invalidate yet.
-    pub fn apply(&mut self, action: Action, cx: &mut Context<Self>) {
+    pub fn apply(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
         match self.engine.apply(action) {
             Some(ViewEffect::ConversationCleared) => {
                 self.conversation
@@ -239,7 +312,7 @@ impl Workspace {
             )
             | None => {}
         }
-        self.sync_views(cx);
+        self.sync_views(window, cx);
         cx.notify();
     }
 
@@ -254,7 +327,7 @@ impl Workspace {
         self.preference = ThemePreference::Fixed(next);
         self.tokens = Tokens::new(next);
         crate::theme::reapply(next, Some(window), cx);
-        self.sync_views(cx);
+        self.sync_views(window, cx);
         cx.notify();
     }
 
@@ -275,7 +348,7 @@ impl Workspace {
         }
         self.tokens = Tokens::new(system);
         crate::theme::reapply(system, Some(window), cx);
-        self.sync_views(cx);
+        self.sync_views(window, cx);
         cx.notify();
     }
 }
@@ -334,6 +407,10 @@ impl Render for Workspace {
                                 // The settings page lands in a later change.
                             })),
                     )
+                    // Below the banner and above the panes: these configure the
+                    // agent, so they belong with the window chrome rather than
+                    // beside the prompt.
+                    .child(self.controls.clone())
                     .when_some(banner_for(&status, tokens), |this, banner| {
                         this.child(banner)
                     })
