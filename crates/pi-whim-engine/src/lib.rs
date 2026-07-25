@@ -7,6 +7,7 @@
 
 pub mod composer;
 pub mod controls;
+pub mod dialogs;
 pub mod events;
 pub mod launch;
 pub mod mailbox;

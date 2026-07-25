@@ -36,7 +36,7 @@ use pi_whim_engine::session::{
     attachment_from_path, bash_policy_name, canonical_path, ensure_agent_team_extension,
     is_large_paste, now_ms, prompt_with_attachment_paths,
 };
-use pi_whim_engine::{controls, events, launch};
+use pi_whim_engine::{controls, dialogs, events, launch, notice};
 
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
@@ -64,18 +64,24 @@ struct PiWhimApplication<R: AgentRuntime = PiRpcRuntime> {
     secrets: MacosKeychainStore,
     runtime_factory: Box<dyn Fn() -> R + Send>,
     sessions: SessionPool<R>,
-    /// Extension confirmations and supervisor interactions are tagged with the
-    /// owning session so background agents can still prompt the user.
-    pending_extension_request: Option<(String, Value)>,
-    pending_interactions: Vec<(String, Value)>,
+    /// Extension confirmations and supervisor interactions, in the order they
+    /// arrived. Each carries the session that asked, so a background agent can
+    /// prompt the user and still get its answer back.
+    prompts: dialogs::Queue,
     capability_resolver: ModelCapabilityResolver,
     sessions_root_override: Option<PathBuf>,
     agent_directory_override: Option<PathBuf>,
     attachment_store: AttachmentStore,
     finder_paste_monitor: Option<FinderPasteMonitor>,
     finder_paste_monitor_install_pending: bool,
-    error: Option<String>,
-    notice: Option<String>,
+    /// Messages bound for the user, oldest first.
+    ///
+    /// A queue rather than two `Option<String>` fields: orchestration fails in
+    /// bursts — a project that has moved, then a provider with no key — and the
+    /// second was overwriting the first before anyone had read it.
+    notices: notice::Outbox,
+    /// The message currently on screen, taken off the queue.
+    showing: Option<notice::Notice>,
     /// Control-state refreshes in flight, tagged with the session they were
     /// asked about.
     #[allow(clippy::type_complexity)]
@@ -141,16 +147,15 @@ impl Default for PiWhimApplication<PiRpcRuntime> {
             secrets: MacosKeychainStore::default(),
             runtime_factory: Box::new(PiRpcRuntime::default),
             sessions: SessionPool::new(),
-            pending_extension_request: None,
-            pending_interactions: Vec::new(),
+            prompts: dialogs::Queue::new(),
             capability_resolver,
             sessions_root_override: None,
             agent_directory_override: None,
             attachment_store: AttachmentStore::open_default(),
             finder_paste_monitor: None,
             finder_paste_monitor_install_pending: true,
-            error: None,
-            notice: None,
+            notices: notice::Outbox::new(),
+            showing: None,
             control_updates: crossbeam_channel::unbounded(),
         };
         // Probing the keychain can block for a long time and this runs before
@@ -186,32 +191,8 @@ impl<R: AgentRuntime> eframe::App for PiWhimApplication<R> {
         for intent in self.workbench.take_intents() {
             self.handle_intent(intent);
         }
-        self.extension_dialog(context);
-        self.interaction_dialog(context);
-        if let Some(error) = self.error.clone() {
-            let mut open = true;
-            egui::Window::new("Pi-Whim error")
-                .open(&mut open)
-                .collapsible(false)
-                .show(context, |ui| {
-                    ui.label(error);
-                });
-            if !open {
-                self.error = None;
-            }
-        }
-        if let Some(notice) = self.notice.clone() {
-            let mut open = true;
-            egui::Window::new("Pi-Whim")
-                .open(&mut open)
-                .collapsible(false)
-                .show(context, |ui| {
-                    ui.label(notice);
-                });
-            if !open {
-                self.notice = None;
-            }
-        }
+        self.prompt_dialog(context);
+        self.notice_window(context);
         let session_running = self.sessions.any_running();
         let agent_busy = matches!(
             self.workbench.state().session_status,
@@ -268,7 +249,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 if let Some(store) = self.store.as_ref()
                     && let Err(error) = store.delete_project(project_id)
                 {
-                    self.error = Some(error.to_string());
+                    self.notices.error(error.to_string());
                 }
                 self.reload_projects();
             }
@@ -291,14 +272,16 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 if self.workbench.state().selected_project.is_some() {
                     self.add_file_attachments();
                 } else {
-                    self.error = Some("Select a project before adding attachments.".into());
+                    self.notices
+                        .error("Select a project before adding attachments.");
                 }
             }
             UiIntent::AddFolderAttachment => {
                 if self.workbench.state().selected_project.is_some() {
                     self.add_folder_attachment();
                 } else {
-                    self.error = Some("Select a project before adding attachments.".into());
+                    self.notices
+                        .error("Select a project before adding attachments.");
                 }
             }
             UiIntent::RemoveComposerAttachment(path) => self.remove_composer_attachment(&path),
@@ -311,7 +294,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             UiIntent::SetAutoCompaction(enabled) => self.set_auto_compaction(enabled),
             UiIntent::Stop => {
                 if let Err(error) = self.active_command(json!({"type":"abort"})) {
-                    self.error = Some(error);
+                    self.notices.error(error);
                 }
             }
             UiIntent::SetLanguage(language) => {
@@ -357,26 +340,6 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 protocol,
                 api_key,
             ),
-            UiIntent::RespondExtensionUi {
-                request_id,
-                confirmed,
-            } => {
-                let command = json!({"type":"extension_ui_response", "id": request_id, "confirmed": confirmed});
-                let owner = self
-                    .pending_extension_request
-                    .as_ref()
-                    .map(|(key, _)| key.clone());
-                let result = owner
-                    .and_then(|key| self.sessions.get(&key))
-                    .map(|session| session.runtime.respond_extension_ui(command));
-                match result {
-                    Some(Err(error)) => self.error = Some(error.to_string()),
-                    Some(Ok(())) => {}
-                    None => {
-                        self.error = Some("The session that asked is no longer running.".into())
-                    }
-                }
-            }
         }
     }
 
@@ -403,7 +366,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         if let Some(store) = self.store.as_ref()
             && let Err(error) = store.save_project(&project)
         {
-            self.error = Some(error.to_string());
+            self.notices.error(error.to_string());
         }
         self.reload_projects();
     }
@@ -426,7 +389,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                         }
                     }
                 }
-                Err(error) => self.error = Some(error.to_string()),
+                Err(error) => self.notices.error(error.to_string()),
             }
         }
     }
@@ -441,7 +404,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         if let Some(store) = self.store.as_ref()
             && let Err(error) = store.save_preferences(preferences)
         {
-            self.error = Some(error.to_string());
+            self.notices.error(error.to_string());
         }
     }
 
@@ -487,7 +450,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                     .apply(Action::ProviderProfilesLoaded(profiles));
                 self.refresh_provider_key_status(ids);
             }
-            Err(error) => self.error = Some(error.to_string()),
+            Err(error) => self.notices.error(error.to_string()),
         }
     }
 
@@ -497,7 +460,8 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             || profile.base_url.trim().is_empty()
             || profile.models.is_empty()
         {
-            self.error = Some("A provider needs a name, base URL, and at least one model.".into());
+            self.notices
+                .error("A provider needs a name, base URL, and at least one model.");
             return;
         }
         if self
@@ -510,7 +474,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                     && provider_name_key(&existing.name) == provider_name_key(&profile.name)
             })
         {
-            self.error = Some(format!(
+            self.notices.error(format!(
                 "A provider named '{}' already exists.",
                 profile.name
             ));
@@ -524,7 +488,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 .secrets
                 .set(&provider_keychain_account(profile.id), &api_key)
             {
-                self.error = Some(error.to_string());
+                self.notices.error(error.to_string());
                 return;
             }
             profile.has_api_key = self
@@ -536,9 +500,8 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 .is_some();
             if !profile.has_api_key {
                 self.workbench.set_provider_key_status(profile.id, false);
-                self.error = Some(
-                    "The API key could not be read back from Keychain. Pi was not restarted; try Save and apply again."
-                        .into(),
+                self.notices.error(
+                    "The API key could not be read back from Keychain. Pi was not restarted; try Save and apply again.",
                 );
                 return;
             }
@@ -549,9 +512,8 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             .flatten()
             .is_none()
         {
-            self.error = Some(
-                "This provider has no API key in Keychain. Enter and save its API key before starting Pi."
-                    .into(),
+            self.notices.error(
+                "This provider has no API key in Keychain. Enter and save its API key before starting Pi.",
             );
             return;
         }
@@ -559,7 +521,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         if let Some(store) = self.store.as_ref()
             && let Err(error) = store.save_provider_profile(&profile)
         {
-            self.error = Some(error.to_string());
+            self.notices.error(error.to_string());
             return;
         }
         self.reload_provider_profiles();
@@ -571,11 +533,11 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         if let Some(store) = self.store.as_ref()
             && let Err(error) = store.delete_provider_profile(profile_id)
         {
-            self.error = Some(error.to_string());
+            self.notices.error(error.to_string());
             return;
         }
         if let Err(error) = self.secrets.delete(&provider_keychain_account(profile_id)) {
-            self.error = Some(error.to_string());
+            self.notices.error(error.to_string());
         }
         self.reload_provider_profiles();
         self.restart_selected_project();
@@ -585,7 +547,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         if let Some(invalid) = profiles.iter().find(|profile| {
             profile.name.trim().is_empty() || !valid_search_engine_url(&profile.base_url)
         }) {
-            self.error = Some(format!(
+            self.notices.error(format!(
                 "Search engine '{}' needs a name and a valid HTTP or HTTPS base URL.",
                 invalid.name
             ));
@@ -603,7 +565,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         if let Some(store) = self.store.as_ref()
             && let Err(error) = store.save_search_engine_profiles(&profiles)
         {
-            self.error = Some(error.to_string());
+            self.notices.error(error.to_string());
             return;
         }
         self.workbench
@@ -613,18 +575,18 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
 
     fn test_search_engine(&mut self, profile: SearchEngineProfile) {
         if profile.name.trim().is_empty() || !valid_search_engine_url(&profile.base_url) {
-            self.error =
-                Some("Enter a name and valid HTTP or HTTPS base URL before testing.".into());
+            self.notices
+                .error("Enter a name and valid HTTP or HTTPS base URL before testing.");
             return;
         }
         match test_searxng_engine(&profile) {
-            Ok(()) => {
-                self.notice = Some(format!(
-                    "{} is reachable and returned valid SearXNG JSON.",
-                    profile.name
-                ))
-            }
-            Err(error) => self.error = Some(format!("{} test failed: {error}", profile.name)),
+            Ok(()) => self.notices.info(format!(
+                "{} is reachable and returned valid SearXNG JSON.",
+                profile.name
+            )),
+            Err(error) => self
+                .notices
+                .error(format!("{} test failed: {error}", profile.name)),
         }
     }
 
@@ -650,11 +612,10 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                     .enrich_models(&provider_name, &base_url, &mut models);
                 self.workbench.set_discovered_models(models);
             }
-            Ok(_) => {
-                self.error =
-                    Some("The provider returned no models; add a model ID manually.".into())
-            }
-            Err(error) => self.error = Some(error),
+            Ok(_) => self
+                .notices
+                .error("The provider returned no models; add a model ID manually."),
+            Err(error) => self.notices.error(error),
         }
     }
 
@@ -732,12 +693,12 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         {
             Ok(root) => root.join(project.id.to_string()),
             Err(error) => {
-                self.error = Some(error.to_string());
+                self.notices.error(error.to_string());
                 return None;
             }
         };
         if let Err(error) = fs::create_dir_all(&sessions_path) {
-            self.error = Some(error.to_string());
+            self.notices.error(error.to_string());
             return None;
         }
         // Capabilities come from the catalog, which the app owns, so profiles
@@ -759,7 +720,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         ) {
             Ok(environment) => environment,
             Err(error) => {
-                self.error = Some(error);
+                self.notices.error(error);
                 return None;
             }
         };
@@ -777,7 +738,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                             error.to_string(),
                         )));
                 }
-                self.error = Some(error.to_string());
+                self.notices.error(error.to_string());
                 return None;
             }
         }
@@ -806,7 +767,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                         error.to_string(),
                     )));
             }
-            self.error = Some(error.to_string());
+            self.notices.error(error.to_string());
             return None;
         }
         let events = runtime.events();
@@ -874,6 +835,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             .is_some_and(|session| session.project_id == project_id);
 
         for key in self.sessions.remove_project(project_id) {
+            self.prompts.forget_session(&key);
             self.workbench.apply(Action::SessionRunning {
                 path: key,
                 running: false,
@@ -954,11 +916,11 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         match result {
             Some(Ok(_)) => {}
             Some(Err(error)) => {
-                self.error = Some(error.to_string());
+                self.notices.error(error.to_string());
                 return;
             }
             None => {
-                self.error = Some("The session is no longer running.".into());
+                self.notices.error("The session is no longer running.");
                 return;
             }
         }
@@ -986,7 +948,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         if let Err(error) =
             self.active_command(json!({"type":"set_thinking_level", "level": level.as_str()}))
         {
-            self.error = Some(error);
+            self.notices.error(error);
             return;
         }
         self.refresh_runtime_controls();
@@ -996,7 +958,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         if let Err(error) =
             self.active_command(json!({"type":"set_auto_compaction", "enabled": enabled}))
         {
-            self.error = Some(error);
+            self.notices.error(error);
             return;
         }
         self.refresh_runtime_controls();
@@ -1007,7 +969,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             return;
         }
         if let Err(error) = self.active_send(json!({"type":"compact"})) {
-            self.error = Some(error);
+            self.notices.error(error);
             return;
         }
         if let Some(session) = self.active_mut() {
@@ -1026,7 +988,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 self.active_command(json!({"type":"set_follow_up_mode", "mode": follow_up}))
             });
         if let Err(error) = result {
-            self.error = Some(error);
+            self.notices.error(error);
             return;
         }
         self.refresh_runtime_controls();
@@ -1053,7 +1015,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 }
                 let _ = self.load_current_entries();
             }
-            Err(error) => self.error = Some(error),
+            Err(error) => self.notices.error(error),
         }
     }
 
@@ -1075,7 +1037,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         }
         if let Some(store) = self.store.as_ref() {
             if let Err(error) = store.save_session(&session) {
-                self.error = Some(error.to_string());
+                self.notices.error(error.to_string());
                 return;
             }
             if let Ok(sessions) = store.list_sessions(project_id) {
@@ -1104,7 +1066,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             if let Some(summary) = session_summary_from_jsonl(project_id, &path) {
                 valid_session_ids.insert(summary.id);
                 if let Err(error) = store.save_session(&summary) {
-                    self.error = Some(error.to_string());
+                    self.notices.error(error.to_string());
                 }
             }
         }
@@ -1114,7 +1076,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                     && !valid_session_ids.contains(&session.id)
                     && let Err(error) = store.delete_session(session.id)
                 {
-                    self.error = Some(error.to_string());
+                    self.notices.error(error.to_string());
                 }
             }
         }
@@ -1195,7 +1157,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 .runtime
                 .command(json!({"type":"set_session_name", "name": title}))
         {
-            self.error = Some(error.to_string());
+            self.notices.error(error.to_string());
             return;
         }
         if let Some(project_id) = self.workbench.state().selected_project {
@@ -1208,16 +1170,16 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
 
     fn set_current_session_name(&mut self, name: String) {
         let Some(key) = self.sessions.active_key().map(str::to_owned) else {
-            self.error = Some("No active session to name.".into());
+            self.notices.error("No active session to name.");
             return;
         };
         if key.starts_with("draft://") {
-            self.error = Some("No active session to name.".into());
+            self.notices.error("No active session to name.");
             return;
         }
         let name = name.trim().to_owned();
         if name.is_empty() {
-            self.error = Some("Usage: /name <name>".into());
+            self.notices.error("Usage: /name <name>");
             return;
         }
         self.rename_session(key, name);
@@ -1233,10 +1195,10 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         match response {
             Ok(value) => {
                 if let Some(path) = value.get("path").and_then(Value::as_str) {
-                    self.error = Some(format!("Session exported to {path}"));
+                    self.notices.error(format!("Session exported to {path}"));
                 }
             }
-            Err(error) => self.error = Some(error),
+            Err(error) => self.notices.error(error),
         }
     }
 
@@ -1246,7 +1208,8 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             .ok()
             .and_then(|value| value.get("path").and_then(Value::as_str).map(str::to_owned))
         else {
-            self.error = Some("Could not export the session for sharing.".into());
+            self.notices
+                .error("Could not export the session for sharing.");
             return;
         };
         let output = std::process::Command::new("gh")
@@ -1255,18 +1218,21 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         match output {
             Ok(output) if output.status.success() => {
                 let url = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-                self.error = Some(format!("Share URL: {url}"));
+                self.notices.error(format!("Share URL: {url}"));
             }
             Ok(output) => {
-                self.error = Some(String::from_utf8_lossy(&output.stderr).trim().to_string());
+                self.notices
+                    .error(String::from_utf8_lossy(&output.stderr).trim().to_string());
             }
-            Err(error) => self.error = Some(format!("GitHub CLI unavailable: {error}")),
+            Err(error) => self
+                .notices
+                .error(format!("GitHub CLI unavailable: {error}")),
         }
     }
 
     fn clone_session(&mut self) {
         if let Err(error) = self.active_command(json!({"type":"clone"})) {
-            self.error = Some(error);
+            self.notices.error(error);
             return;
         }
         if let Some(project_id) = self.workbench.state().selected_project {
@@ -1276,7 +1242,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
 
     fn fork_session(&mut self, entry_id: String) {
         if let Err(error) = self.active_command(json!({"type":"fork", "entryId": entry_id})) {
-            self.error = Some(error);
+            self.notices.error(error);
             return;
         }
         if let Some(project_id) = self.workbench.state().selected_project {
@@ -1311,13 +1277,13 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             ])
             .status();
         if !matches!(status, Ok(status) if status.success()) {
-            self.error = Some("Could not move the Pi session to Trash".into());
+            self.notices.error("Could not move the Pi session to Trash");
             return;
         }
         if let Some(store) = self.store.as_ref()
             && let Err(error) = store.delete_session(stable_session_id(&path))
         {
-            self.error = Some(error.to_string());
+            self.notices.error(error.to_string());
         }
         if let Some(project_id) = self.workbench.state().selected_project {
             self.discover_sessions(project_id, target.parent().unwrap_or(Path::new("")));
@@ -1328,7 +1294,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         let entries = self
             .active_command(json!({"type":"get_entries"}))
             .map_err(|error| {
-                self.error = Some(error);
+                self.notices.error(error);
             })?;
         self.workbench.apply(Action::ClearConversation);
         for action in entries
@@ -1368,7 +1334,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                     .workbench
                     .composer_draft_mut()
                     .add_attachment(attachment),
-                Err(error) => self.error = Some(error),
+                Err(error) => self.notices.error(error),
             }
         }
     }
@@ -1388,7 +1354,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                     .workbench
                     .composer_draft_mut()
                     .add_attachment(attachment),
-                Err(error) => self.error = Some(error),
+                Err(error) => self.notices.error(error),
             },
         }
     }
@@ -1405,7 +1371,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         if attachment.is_some_and(|attachment| attachment.generated_by_app)
             && let Err(error) = self.attachment_store.remove_generated(path)
         {
-            self.error = Some(error);
+            self.notices.error(error);
         }
     }
 
@@ -1435,7 +1401,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                         .add_attachment(attachment);
                     return true;
                 }
-                Err(error) => self.error = Some(error),
+                Err(error) => self.notices.error(error),
             }
         }
         false
@@ -1443,14 +1409,16 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
 
     fn submit_prompt(&mut self, content: String, attachments: Vec<Attachment>, mode: SubmitMode) {
         if self.workbench.state().selected_project.is_none() {
-            self.error = Some("Select a project before sending a message.".into());
+            self.notices
+                .error("Select a project before sending a message.");
             return;
         }
         if !matches!(
             self.workbench.state().session_status,
             SessionStatus::Ready | SessionStatus::Streaming | SessionStatus::Compacting
         ) {
-            self.error = Some("Pi is not ready for the selected project yet.".into());
+            self.notices
+                .error("Pi is not ready for the selected project yet.");
             return;
         }
         let item = ConversationItem {
@@ -1483,7 +1451,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 .any(|message| message.role != ConversationRole::User);
         if defer_for_compaction {
             let Some(key) = self.sessions.active_key().map(str::to_owned) else {
-                self.error = Some("No active session.".into());
+                self.notices.error("No active session.");
                 return;
             };
             let result = self.active_send(json!({"type":"compact"}));
@@ -1496,12 +1464,12 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                     self.workbench
                         .apply(Action::SetSessionStatus(SessionStatus::Compacting));
                 }
-                Err(error) => self.error = Some(error),
+                Err(error) => self.notices.error(error),
             }
             return;
         }
         let Some(key) = self.sessions.active_key().map(str::to_owned) else {
-            self.error = Some("No active session.".into());
+            self.notices.error("No active session.");
             return;
         };
         if self.workbench.state().pending_model.is_some() {
@@ -1519,7 +1487,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     ) {
         let result = {
             let Some(session) = self.sessions.get(key) else {
-                self.error = Some("The session is no longer running.".into());
+                self.notices.error("The session is no longer running.");
                 return;
             };
             match mode {
@@ -1536,7 +1504,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             }
         };
         if let Err(error) = result {
-            self.error = Some(error.to_string());
+            self.notices.error(error.to_string());
             return;
         }
         let is_active = self.sessions.active_key() == Some(key);
@@ -1606,14 +1574,14 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         match event {
             RuntimeEvent::Agent(value) => self.apply_agent_event(key, value),
             RuntimeEvent::ExtensionUi(value) => {
-                self.pending_extension_request = Some((key.to_owned(), value));
+                self.prompts.push_extension(key, &value);
             }
             RuntimeEvent::Interaction(value) => {
-                self.pending_interactions.push((key.to_owned(), value));
+                self.prompts.push_interaction(key, &value);
             }
             RuntimeEvent::Stderr(message) => {
                 if is_active && !message.trim().is_empty() {
-                    self.error = Some(message);
+                    self.notices.error(message);
                 }
             }
             RuntimeEvent::Exited { generation, code } => {
@@ -1625,6 +1593,9 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                     return;
                 }
                 self.sessions.remove(key);
+                // Nothing is left to answer, and a dialog still up would ask the
+                // reader to unblock a process that has gone.
+                self.prompts.forget_session(key);
                 self.workbench.apply(Action::SessionRunning {
                     path: key.to_owned(),
                     running: false,
@@ -1638,7 +1609,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             }
             RuntimeEvent::Error(error) => {
                 if is_active {
-                    self.error = Some(error);
+                    self.notices.error(error);
                 }
             }
             RuntimeEvent::RpcResponse(_) => {}
@@ -1740,112 +1711,95 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         }
     }
 
-    fn extension_dialog(&mut self, context: &egui::Context) {
-        let Some((_, request)) = self.pending_extension_request.clone() else {
+    /// The one chooser both asking protocols share.
+    ///
+    /// What a request means is read in `engine::dialogs`; what stays here is the
+    /// window and routing the answer back to the session that asked, which may
+    /// be running in the background.
+    fn prompt_dialog(&mut self, context: &egui::Context) {
+        let Some(prompt) = self.prompts.current().cloned() else {
             return;
         };
-        if request.get("method").and_then(Value::as_str) != Some("confirm") {
-            return;
-        }
+        let mut answer = None;
         let mut open = true;
-        egui::Window::new(
-            request
-                .get("title")
-                .and_then(Value::as_str)
-                .unwrap_or("Pi confirmation"),
-        )
-        .open(&mut open)
-        .collapsible(false)
-        .show(context, |ui| {
-            ui.label(
-                request
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Allow this operation?"),
-            );
-            ui.horizontal(|ui| {
-                if ui.button("Allow").clicked() {
-                    self.handle_intent(UiIntent::RespondExtensionUi {
-                        request_id: request["id"].as_str().unwrap_or_default().into(),
-                        confirmed: true,
-                    });
-                    self.pending_extension_request = None;
+        egui::Window::new(prompt.title.as_str())
+            .open(&mut open)
+            .collapsible(false)
+            .show(context, |ui| {
+                if !prompt.message.is_empty() {
+                    ui.label(prompt.message.as_str());
+                    ui.add_space(8.0);
                 }
-                if ui.button("Deny").clicked() {
-                    self.handle_intent(UiIntent::RespondExtensionUi {
-                        request_id: request["id"].as_str().unwrap_or_default().into(),
-                        confirmed: false,
-                    });
-                    self.pending_extension_request = None;
-                }
+                ui.horizontal_wrapped(|ui| {
+                    for choice in &prompt.choices {
+                        if ui.button(choice.label.as_str()).clicked() {
+                            answer = Some(self.prompts.answer(&choice.value));
+                        }
+                    }
+                });
             });
-        });
-        if !open {
-            self.pending_extension_request = None;
+        // Closing the window is an answer too: the agent is blocked waiting, and
+        // the prompt names the cautious one to send.
+        if !open && answer.is_none() {
+            answer = Some(self.prompts.dismiss());
+        }
+        if let Some(Some(answer)) = answer {
+            self.send_answer(answer);
         }
     }
 
-    /// This is the single native chooser used for root-owned approvals and
-    /// questions. Pi's extension confirmations keep using their RPC response,
-    /// while supervisor interactions return through the team tool host.
-    fn interaction_dialog(&mut self, context: &egui::Context) {
-        let Some((session_key, request)) = self.pending_interactions.first().cloned() else {
+    /// Carry a decision back over whichever channel asked.
+    fn send_answer(&mut self, answer: dialogs::Answer) {
+        let Some(session) = self.sessions.get(answer.session_key()) else {
+            self.notices
+                .error("The session that asked is no longer running.");
             return;
         };
-        let request_id = request["request_id"].as_str().unwrap_or_default();
-        let kind = request["kind"].as_str().unwrap_or("question");
-        let title = request["title"].as_str().unwrap_or("Agent request");
-        let message = request["message"].as_str().unwrap_or_default();
-        let options = request["options"].as_array().cloned().unwrap_or_default();
-        let cancel_decision = request["default_option"]
-            .as_str()
-            .filter(|option| {
-                options
-                    .iter()
-                    .any(|candidate| candidate.as_str() == Some(*option))
-            })
-            .unwrap_or(if kind == "approval" { "deny" } else { "cancel" });
+        let result = match &answer {
+            dialogs::Answer::Extension {
+                request_id,
+                confirmed,
+                ..
+            } => session.runtime.respond_extension_ui(
+                json!({"type":"extension_ui_response", "id": request_id, "confirmed": confirmed}),
+            ),
+            dialogs::Answer::Interaction {
+                request_id,
+                decision,
+                ..
+            } => session
+                .runtime
+                .resolve_user_interaction(request_id.clone(), decision.clone())
+                // The supervisor echoes the decision back; nothing here needs it.
+                .map(|_| ()),
+        };
+        if let Err(error) = result {
+            self.notices.error(error.to_string());
+        }
+    }
+
+    /// Show the oldest unread message, one at a time.
+    fn notice_window(&mut self, context: &egui::Context) {
+        if self.showing.is_none() {
+            self.showing = self.notices.take();
+        }
+        let Some(showing) = self.showing.clone() else {
+            return;
+        };
+        let title = if showing.is_error() {
+            "Pi-Whim error"
+        } else {
+            "Pi-Whim"
+        };
         let mut open = true;
         egui::Window::new(title)
             .open(&mut open)
             .collapsible(false)
             .show(context, |ui| {
-                ui.label(message);
-                ui.add_space(8.0);
-                ui.horizontal_wrapped(|ui| {
-                    for option in &options {
-                        let Some(option) = option.as_str() else {
-                            continue;
-                        };
-                        let label = match (kind, option) {
-                            ("approval", "approve") => "Allow once",
-                            ("approval", "deny") => "Deny",
-                            _ => option,
-                        };
-                        if ui.button(label).clicked() {
-                            self.resolve_interaction(&session_key, request_id, option);
-                            self.pending_interactions.remove(0);
-                        }
-                    }
-                });
+                ui.label(showing.message.as_str());
             });
         if !open {
-            self.resolve_interaction(&session_key, request_id, cancel_decision);
-            self.pending_interactions.remove(0);
-        }
-    }
-
-    /// Route an approval/question answer to the supervisor of the session that
-    /// asked, which may be running in the background.
-    fn resolve_interaction(&mut self, session_key: &str, request_id: &str, decision: &str) {
-        let Some(session) = self.sessions.get(session_key) else {
-            return;
-        };
-        if let Err(error) = session
-            .runtime
-            .resolve_user_interaction(request_id.to_owned(), decision.to_owned())
-        {
-            self.error = Some(error.to_string());
+            self.showing = None;
         }
     }
 }
@@ -1876,8 +1830,7 @@ mod tests {
             secrets: MacosKeychainStore::default(),
             runtime_factory: Box::new(move || factory_runtime.clone()),
             sessions: SessionPool::new(),
-            pending_extension_request: None,
-            pending_interactions: Vec::new(),
+            prompts: dialogs::Queue::new(),
             capability_resolver: ModelCapabilityResolver::new(
                 &pi_whim_catalog::SharedCatalog::default(),
                 false,
@@ -1887,8 +1840,8 @@ mod tests {
             attachment_store: AttachmentStore::open(directory.path().join("attachments")).unwrap(),
             finder_paste_monitor: None,
             finder_paste_monitor_install_pending: false,
-            error: None,
-            notice: None,
+            notices: notice::Outbox::new(),
+            showing: None,
             control_updates: crossbeam_channel::unbounded(),
         }
     }

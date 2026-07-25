@@ -128,10 +128,6 @@ pub enum UiIntent {
         protocol: ProviderProtocol,
         api_key: Option<String>,
     },
-    RespondExtensionUi {
-        request_id: String,
-        confirmed: bool,
-    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
