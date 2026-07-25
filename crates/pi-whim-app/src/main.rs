@@ -27,7 +27,7 @@ use uuid::Uuid;
 use macos_paste::{ClipboardAttachment, FinderPasteMonitor};
 use pi_whim_catalog::ModelCapabilityResolver;
 use pi_whim_engine::pool::{SessionPool, SessionRuntime, is_draft};
-use pi_whim_engine::protocol::{assistant_text, queue_mode_name};
+use pi_whim_engine::protocol::queue_mode_name;
 use pi_whim_engine::providers::{
     discover_models, normalize_base_url, provider_keychain_account, test_searxng_engine,
     valid_search_engine_url,
@@ -837,7 +837,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             return;
         };
         let project_id = session.project_id;
-        let running = session.running;
+        let running = session.is_running();
         self.workbench.apply(Action::SelectProject(project_id));
         if !is_draft(key) {
             self.workbench
@@ -1011,7 +1011,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             return;
         }
         if let Some(session) = self.active_mut() {
-            session.running = true;
+            session.turn.running = true;
         }
         self.workbench
             .apply(Action::SetSessionStatus(SessionStatus::Compacting));
@@ -1331,15 +1331,14 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 self.error = Some(error);
             })?;
         self.workbench.apply(Action::ClearConversation);
-        for entry in entries
+        for action in entries
             .get("entries")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
+            .filter_map(events::session_entry_action)
         {
-            if let Some(action) = events::session_entry_action(entry) {
-                self.workbench.apply(action);
-            }
+            self.workbench.apply(action);
         }
         Ok(())
     }
@@ -1474,7 +1473,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             && self.workbench.state().pending_model.is_some()
             && !self
                 .active()
-                .map(|session| session.conversation_compacted)
+                .map(|session| session.turn.conversation_compacted)
                 .unwrap_or(true)
             && self
                 .workbench
@@ -1491,8 +1490,8 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             match result {
                 Ok(()) => {
                     if let Some(session) = self.sessions.get_mut(&key) {
-                        session.pending_prompt = Some((content, attachments, mode));
-                        session.running = true;
+                        session.turn.pending_prompt = Some((content, attachments, mode));
+                        session.turn.running = true;
                     }
                     self.workbench
                         .apply(Action::SetSessionStatus(SessionStatus::Compacting));
@@ -1542,7 +1541,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         }
         let is_active = self.sessions.active_key() == Some(key);
         if let Some(session) = self.sessions.get_mut(key) {
-            session.running = true;
+            session.turn.running = true;
         }
         self.workbench.apply(Action::SessionRunning {
             path: key.to_owned(),
@@ -1646,277 +1645,89 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         }
     }
 
+    /// Translate one agent event and carry out what the translation asked for.
+    ///
+    /// The reading of the event lives in `engine::events`; what stays here is
+    /// only what needs this process's store, window, and Pi connection.
     fn apply_agent_event(&mut self, key: &str, event: Value) {
         let is_active = self.sessions.active_key() == Some(key);
-        match event.get("type").and_then(Value::as_str) {
-            Some("message_start") | Some("message_update") => {
-                let message = event.get("message").cloned().unwrap_or(Value::Null);
-                if message.get("role").and_then(Value::as_str) == Some("assistant") {
-                    let Some(session) = self.sessions.get_mut(key) else {
-                        return;
-                    };
-                    session.running = true;
-                    self.workbench.apply(Action::SessionRunning {
-                        path: key.to_owned(),
-                        running: true,
-                    });
-                    if !is_active {
-                        return;
-                    }
-                    // A new assistant reply means the conversation grew past the
-                    // last compaction; a later model switch should compact again.
-                    session.conversation_compacted = false;
-                    let id = message
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| {
-                            session
-                                .assistant_message_id
-                                .clone()
-                                .unwrap_or_else(|| Uuid::new_v4().to_string())
-                        });
-                    if let Some(previous_id) = session.assistant_message_id.replace(id.clone())
-                        && previous_id != id
-                    {
-                        self.workbench.apply(Action::RekeyConversation {
-                            from: previous_id,
-                            to: id.clone(),
-                        });
-                    }
-                    let text = assistant_text(&message);
-                    self.workbench
-                        .apply(Action::UpsertConversation(ConversationItem {
-                            id,
-                            role: ConversationRole::Assistant,
-                            full_text: text,
-                            streaming: true,
-                            tool_name: None,
-                            tool_report: None,
-                            tool_details: None,
-                            is_error: false,
-                            model: message
-                                .get("model")
-                                .and_then(Value::as_str)
-                                .map(str::to_owned),
-                            attachments: Vec::new(),
-                        }));
-                }
-            }
-            Some("message_end")
-                if event
-                    .get("message")
-                    .and_then(|message| message.get("role"))
-                    .and_then(Value::as_str)
-                    == Some("assistant") =>
-            {
-                let Some(session) = self.sessions.get_mut(key) else {
-                    return;
-                };
-                if is_active && let Some(id) = session.assistant_message_id.take() {
-                    self.workbench.apply(Action::FinishMessage(id));
-                }
-            }
-            Some("tool_execution_start") | Some("tool_execution_end") => {
-                if is_active {
-                    let action =
-                        events::tool_event_action(&event, &self.workbench.state().conversation);
-                    self.workbench.apply(action);
-                }
-            }
-            Some("queue_update") => {
-                if !is_active {
-                    return;
-                }
-                let steering = event
-                    .get("steering")
-                    .and_then(Value::as_array)
-                    .map(|items| {
-                        items
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(str::to_owned)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let follow_up = event
-                    .get("followUp")
-                    .and_then(Value::as_array)
-                    .map(|items| {
-                        items
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(str::to_owned)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                self.workbench.apply(Action::QueueUpdated {
-                    steering,
-                    follow_up,
-                });
-            }
-            Some("agent_settled") => {
-                let Some(session) = self.sessions.get_mut(key) else {
-                    return;
-                };
-                session.running = false;
-                let project_id = session.project_id;
-                let state = session.runtime.command(json!({"type":"get_state"})).ok();
-                self.workbench.apply(Action::SessionRunning {
-                    path: key.to_owned(),
-                    running: false,
-                });
-                if let Some(state) = state
-                    && let Some(path) = state.get("sessionFile").and_then(Value::as_str)
-                {
-                    self.index_session(
-                        project_id,
-                        path,
-                        state.get("sessionName").and_then(Value::as_str),
-                    );
-                    if path != key {
-                        self.rekey_session(key, path);
-                    }
-                }
-                if is_active {
-                    self.workbench
-                        .apply(Action::SetSessionStatus(SessionStatus::Ready));
-                    let _ = self.load_current_entries();
-                    self.refresh_runtime_controls();
-                }
-            }
-            Some("session_info_changed") => {
-                let Some(session) = self.sessions.get(key) else {
-                    return;
-                };
-                let project_id = session.project_id;
-                if let Ok(state) = session.runtime.command(json!({"type":"get_state"}))
-                    && let Some(path) = state.get("sessionFile").and_then(Value::as_str)
-                {
-                    self.index_session(project_id, path, event.get("name").and_then(Value::as_str));
-                }
-            }
-            Some("thinking_level_changed") => {
-                if is_active {
-                    self.refresh_runtime_controls();
-                }
-            }
-            Some("compaction_start") => {
-                let Some(session) = self.sessions.get_mut(key) else {
-                    return;
-                };
-                session.running = true;
-                self.workbench.apply(Action::SessionRunning {
-                    path: key.to_owned(),
-                    running: true,
-                });
-                if !is_active {
-                    return;
-                }
-                let item_id = format!("compaction-{}", now_ms());
-                session.compaction_item_id = Some(item_id.clone());
-                self.workbench
-                    .apply(Action::UpsertConversation(ConversationItem {
-                        id: item_id,
-                        role: ConversationRole::Tool,
-                        full_text: "Compacting…".into(),
-                        streaming: false,
-                        tool_name: Some("compact".into()),
-                        tool_report: None,
-                        tool_details: None,
-                        is_error: false,
-                        model: None,
-                        attachments: Vec::new(),
-                    }));
-                self.workbench
-                    .apply(Action::SetSessionStatus(SessionStatus::Compacting));
-            }
-            Some("compaction_end") => {
-                let error = event.get("errorMessage").and_then(Value::as_str);
-                let Some(session) = self.sessions.get_mut(key) else {
-                    return;
-                };
-                session.running = false;
-                session.conversation_compacted = error.is_none();
-                let pending_prompt = session.pending_prompt.take();
-                let compaction_item_id = session.compaction_item_id.take();
-                self.workbench.apply(Action::SessionRunning {
-                    path: key.to_owned(),
-                    running: false,
-                });
-                if !is_active {
-                    // The deferred prompt continues even with the session in
-                    // the background; only the visible status updates skip.
-                    if let Some((content, attachments, mode)) = pending_prompt {
-                        if self.workbench.state().pending_model.is_some() {
-                            self.apply_pending_model(key);
-                        }
-                        self.send_prompt(key, content, attachments, mode);
-                    }
-                    return;
-                }
-                let benign = error.is_some_and(|e| e.contains("Nothing to compact"));
-                let status = match error {
-                    Some(_) if benign => SessionStatus::Ready,
-                    Some(e) => SessionStatus::Failed(e.to_owned()),
-                    None => SessionStatus::Ready,
-                };
-                self.workbench.apply(Action::SetSessionStatus(status));
-                if let Some(item_id) = compaction_item_id {
-                    let (text, is_error) = match error {
-                        Some(_) if benign => {
-                            ("Nothing to compact (session too small)".to_owned(), false)
-                        }
-                        Some(e) => (e.to_owned(), true),
-                        None => {
-                            let result = event.get("result");
-                            let before = result
-                                .and_then(|r| r.get("tokensBefore"))
-                                .and_then(Value::as_i64);
-                            let after = result
-                                .and_then(|r| r.get("estimatedTokensAfter"))
-                                .and_then(Value::as_i64);
-                            match (before, after) {
-                                (Some(b), Some(a)) => {
-                                    (format!("Compacted context · {b} → {a} tokens"), false)
-                                }
-                                _ => ("Compacted context".to_owned(), false),
-                            }
-                        }
-                    };
-                    self.workbench
-                        .apply(Action::UpsertConversation(ConversationItem {
-                            id: item_id,
-                            role: ConversationRole::Tool,
-                            full_text: text,
-                            streaming: false,
-                            tool_name: Some("compact".into()),
-                            tool_report: None,
-                            tool_details: None,
-                            is_error,
-                            model: None,
-                            attachments: Vec::new(),
-                        }));
-                }
-                // After a switch-triggered compaction, apply the pending model
-                // and send the prompt that was held back.
-                if let Some((content, attachments, mode)) = pending_prompt {
-                    if self.workbench.state().pending_model.is_some() {
-                        self.apply_pending_model(key);
-                    }
-                    self.send_prompt(key, content, attachments, mode);
-                }
-            }
-            Some("entry_appended") => {
-                if is_active
-                    && let Some(entry) = event.get("entry")
-                    && let Some(action) = events::session_entry_action(entry)
-                {
-                    self.workbench.apply(action);
-                }
-            }
-            _ => {}
+        let now = now_ms();
+        let Some(session) = self.sessions.get_mut(key) else {
+            return;
+        };
+        // The conversation is cloned because `translate` reads it while holding
+        // the turn mutably. Only tool events look at it, and only to find one
+        // entry, so a borrow split would cost more in plumbing than this does.
+        let conversation = self.workbench.state().conversation.clone();
+        let outcome = events::translate(
+            &event,
+            events::Context {
+                key,
+                is_active,
+                conversation: &conversation,
+                now_ms: now,
+            },
+            &mut session.turn,
+        );
+        for action in outcome.actions {
+            self.workbench.apply(action);
         }
+        for effect in outcome.effects {
+            self.perform_effect(key, effect);
+        }
+    }
+
+    /// Carry out one effect the translation asked for.
+    ///
+    /// Each of these needs something `engine::events` deliberately has no handle
+    /// on: the Pi process, the session index, or the composer.
+    fn perform_effect(&mut self, key: &str, effect: events::Effect) {
+        match effect {
+            // A fresh session starts before Pi has written a transcript, and
+            // fork and clone move an existing one, so the pooled key is not
+            // always where the file ends up.
+            events::Effect::SyncSessionFile => {
+                if let Some((project_id, path, name)) = self.reported_session_file(key) {
+                    self.index_session(project_id, &path, name.as_deref());
+                    if path != key {
+                        self.rekey_session(key, &path);
+                    }
+                }
+            }
+            events::Effect::RenameSessionFile(name) => {
+                if let Some((project_id, path, _)) = self.reported_session_file(key) {
+                    self.index_session(project_id, &path, name.as_deref());
+                }
+            }
+            events::Effect::ReloadEntries => {
+                let _ = self.load_current_entries();
+            }
+            events::Effect::RefreshControls => self.refresh_runtime_controls(),
+            events::Effect::SendPendingPrompt((content, attachments, mode)) => {
+                // A switch-triggered compaction held this prompt back so the
+                // prior model compacted the history first; now the new model
+                // takes over and the turn continues.
+                if self.workbench.state().pending_model.is_some() {
+                    self.apply_pending_model(key);
+                }
+                self.send_prompt(key, content, attachments, mode);
+            }
+        }
+    }
+
+    /// Ask a session's own process where it is writing, and under what name.
+    fn reported_session_file(&self, key: &str) -> Option<(ProjectId, String, Option<String>)> {
+        let session = self.sessions.get(key)?;
+        let state = session.runtime.command(json!({"type":"get_state"})).ok()?;
+        let path = state.get("sessionFile").and_then(Value::as_str)?;
+        Some((
+            session.project_id,
+            path.to_owned(),
+            state
+                .get("sessionName")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        ))
     }
 
     /// Settings like the bash policy are process launch flags, so changing
@@ -2171,7 +1982,7 @@ mod tests {
         assert!(
             app.sessions
                 .get(&running_key)
-                .is_some_and(|session| session.running)
+                .is_some_and(SessionRuntime::is_running)
         );
 
         // Switching away must not abort A: no abort/new_session/switch_session
@@ -2182,7 +1993,7 @@ mod tests {
         assert!(
             app.sessions
                 .get(&running_key)
-                .is_some_and(|session| session.running)
+                .is_some_and(SessionRuntime::is_running)
         );
         assert!(!observer.commands().iter().any(|command| {
             matches!(

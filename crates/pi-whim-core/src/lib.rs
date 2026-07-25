@@ -529,7 +529,12 @@ pub enum SessionStatus {
     Failed(String),
 }
 
-#[derive(Clone, Debug)]
+/// A change to [`AppState`], and the only way to make one.
+///
+/// `PartialEq` is here for the tests that assert what a translation produced:
+/// comparing the actions is how wire-protocol handling is checked without
+/// standing up a reducer and reading state back out of it.
+#[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     ProjectsLoaded(Vec<Project>),
     SessionsLoaded {
