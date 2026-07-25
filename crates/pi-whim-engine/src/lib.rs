@@ -5,6 +5,8 @@
 //! actions. It holds no UI framework types, so it can be exercised headlessly
 //! against a fake runtime.
 
+pub mod composer;
 pub mod protocol;
 pub mod providers;
 pub mod session;
+pub mod state;
