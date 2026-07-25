@@ -6,3 +6,4 @@
 //! against a fake runtime.
 
 pub mod protocol;
+pub mod providers;

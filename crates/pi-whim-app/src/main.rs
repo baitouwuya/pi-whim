@@ -10,8 +10,8 @@ use std::{
 use eframe::egui;
 use pi_whim_core::{
     Action, Attachment, AttachmentKind, BashPolicy, ConversationItem, ConversationRole,
-    ModelOption, Project, ProjectId, ProviderId, ProviderModel, ProviderProfile, ProviderProtocol,
-    QueueMode, SearchEngineProfile, SessionStatus, SessionSummary, SlashCommandInfo, ThinkingLevel,
+    ModelOption, Project, ProjectId, ProviderId, ProviderProfile, ProviderProtocol, QueueMode,
+    SearchEngineProfile, SessionStatus, SessionSummary, SlashCommandInfo, ThinkingLevel,
     normalize_provider_display_name, provider_name_key, stable_session_id,
 };
 use pi_whim_persistence::{
@@ -29,6 +29,10 @@ use pi_whim_catalog::ModelCapabilityResolver;
 use pi_whim_engine::protocol::{
     assistant_text, model_option, queue_mode, queue_mode_name, session_metrics, tool_call_report,
     tool_event_details, tool_result_report, tool_result_summary,
+};
+use pi_whim_engine::providers::{
+    configured_provider_environment, discover_models, normalize_base_url, pi_models_json,
+    provider_config_key, provider_keychain_account, test_searxng_engine, valid_search_engine_url,
 };
 
 fn main() -> eframe::Result<()> {
@@ -2277,227 +2281,7 @@ fn pi_agent_directory() -> Result<PathBuf, String> {
     Ok(root)
 }
 
-fn provider_keychain_account(id: ProviderId) -> String {
-    format!("provider-api-key-{id}")
-}
-
-fn provider_environment_name(id: ProviderId) -> String {
-    format!("PI_WHIM_PROVIDER_{}", id.simple())
-}
-
-fn configured_provider_environment(
-    profiles: Vec<ProviderProfile>,
-    mut get_key: impl FnMut(ProviderId) -> Result<Option<String>, String>,
-) -> Result<(Vec<ProviderProfile>, HashMap<String, String>), String> {
-    let had_profiles = !profiles.is_empty();
-    let mut configured_profiles = Vec::new();
-    let mut environment = HashMap::new();
-    for profile in profiles {
-        if let Some(key) = get_key(profile.id)? {
-            environment.insert(provider_environment_name(profile.id), key);
-            configured_profiles.push(profile);
-        }
-    }
-    if had_profiles && configured_profiles.is_empty() {
-        return Err(
-            "No configured provider has an API key in Keychain. Open Settings > Providers, select a provider, and save its API key."
-                .into(),
-        );
-    }
-    Ok((configured_profiles, environment))
-}
-
-fn normalize_base_url(value: &str) -> String {
-    value.trim().trim_end_matches('/').to_owned()
-}
-
-fn valid_search_engine_url(value: &str) -> bool {
-    let value = normalize_base_url(value);
-    let Some((scheme, rest)) = value.split_once("://") else {
-        return false;
-    };
-    matches!(scheme, "http" | "https") && !rest.is_empty() && !rest.starts_with('/')
-}
-
-fn test_searxng_engine(profile: &SearchEngineProfile) -> Result<(), String> {
-    let endpoint = format!("{}/search", normalize_base_url(&profile.base_url));
-    let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_secs(6)))
-        .max_redirects(0)
-        .build()
-        .new_agent();
-    let mut response = agent
-        .get(&endpoint)
-        .query("q", "pi-whim")
-        .query("format", "json")
-        .query("categories", "general")
-        .header("Accept", "application/json")
-        .call()
-        .map_err(|error| error.to_string())?;
-    let body: Value = response
-        .body_mut()
-        .read_json()
-        .map_err(|error| format!("invalid JSON response: {error}"))?;
-    if body.get("results").and_then(Value::as_array).is_none() {
-        return Err("response has no results array".into());
-    }
-    Ok(())
-}
-
 /// Pi accepts an environment reference here, keeping API keys out of models.json.
-fn pi_models_json(profiles: &[ProviderProfile]) -> Value {
-    let providers = profiles
-        .iter()
-        .map(|profile| {
-            let models = profile
-                .models
-                .iter()
-                .map(|model| {
-                    json!({
-                        "id": model.id,
-                        "name": model.name,
-                        "reasoning": model.reasoning,
-                        "thinkingLevelMap": model.thinking_level_map,
-                        "input": if model.supports_images { json!(["text", "image"]) } else { json!(["text"]) },
-                        "contextWindow": 128000,
-                        "maxTokens": 16384,
-                        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-                    })
-                })
-                .collect::<Vec<_>>();
-            (
-                provider_config_key(profile.id),
-                json!({
-                    "name": profile.name,
-                    "baseUrl": normalize_base_url(&profile.base_url),
-                    "api": profile.protocol.pi_api(),
-                    "apiKey": format!("${}", provider_environment_name(profile.id)),
-                    "models": models,
-                }),
-            )
-        })
-        .collect::<serde_json::Map<_, _>>();
-    json!({ "providers": providers })
-}
-
-fn provider_config_key(id: ProviderId) -> String {
-    format!("pi-whim-{}", id.simple())
-}
-
-fn discover_models(
-    base_url: &str,
-    protocol: ProviderProtocol,
-    api_key: Option<&str>,
-) -> Result<Vec<ProviderModel>, String> {
-    let base_url = normalize_base_url(base_url);
-    if base_url.is_empty() {
-        return Err("Enter a base URL before discovering models.".into());
-    }
-    let endpoint = match protocol {
-        ProviderProtocol::OpenAiCompletions | ProviderProtocol::OpenAiResponses => {
-            join_api_path(&base_url, "models")
-        }
-        ProviderProtocol::AnthropicMessages => join_api_path(&base_url, "v1/models"),
-        ProviderProtocol::GoogleGenerativeAi => join_api_path(&base_url, "models"),
-    };
-    let mut request = ureq::get(&endpoint).header("Accept", "application/json");
-    if let Some(api_key) = api_key.filter(|key| !key.trim().is_empty()) {
-        request = match protocol {
-            ProviderProtocol::OpenAiCompletions | ProviderProtocol::OpenAiResponses => {
-                request.header("Authorization", &format!("Bearer {api_key}"))
-            }
-            ProviderProtocol::AnthropicMessages => request
-                .header("x-api-key", api_key)
-                .header("anthropic-version", "2023-06-01"),
-            ProviderProtocol::GoogleGenerativeAi => request.header("x-goog-api-key", api_key),
-        };
-    }
-    let mut response = request
-        .call()
-        .map_err(|error| format!("Model discovery failed: {error}"))?;
-    let body: Value = response
-        .body_mut()
-        .read_json()
-        .map_err(|error| format!("Model discovery returned invalid JSON: {error}"))?;
-    let candidates = match protocol {
-        ProviderProtocol::OpenAiCompletions | ProviderProtocol::OpenAiResponses => body
-            .get("data")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|entry| {
-                entry.get("id").and_then(Value::as_str).map(|id| {
-                    let mut model = ProviderModel::new(id);
-                    model.name = entry
-                        .get("display_name")
-                        .or_else(|| entry.get("name"))
-                        .and_then(Value::as_str)
-                        .unwrap_or(id)
-                        .to_owned();
-                    model
-                })
-            })
-            .collect(),
-        ProviderProtocol::AnthropicMessages => body
-            .get("data")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|entry| {
-                entry.get("id").and_then(Value::as_str).map(|id| {
-                    let mut model = ProviderModel::new(id);
-                    model.name = entry
-                        .get("display_name")
-                        .and_then(Value::as_str)
-                        .unwrap_or(id)
-                        .to_owned();
-                    model
-                })
-            })
-            .collect(),
-        ProviderProtocol::GoogleGenerativeAi => body
-            .get("models")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|entry| {
-                entry.get("name").and_then(Value::as_str).map(|id| {
-                    let id = id.strip_prefix("models/").unwrap_or(id);
-                    let mut model = ProviderModel::new(id);
-                    model.name = entry
-                        .get("displayName")
-                        .and_then(Value::as_str)
-                        .unwrap_or(id)
-                        .to_owned();
-                    model.supports_images = entry
-                        .get("supportedGenerationMethods")
-                        .and_then(Value::as_array)
-                        .is_some_and(|methods| {
-                            methods.iter().any(|method| method == "generateContent")
-                        });
-                    model
-                })
-            })
-            .collect(),
-    };
-    let mut models: Vec<ProviderModel> = candidates;
-    models.sort_by_key(|model| model.name.to_lowercase());
-    models.dedup_by(|left, right| left.id == right.id);
-    Ok(models)
-}
-
-fn join_api_path(base_url: &str, suffix: &str) -> String {
-    let base_url = base_url.trim_end_matches('/');
-    let suffix = suffix.trim_start_matches('/');
-    if base_url.ends_with("/v1") && suffix.starts_with("v1/") {
-        format!("{base_url}/{}", suffix.trim_start_matches("v1/"))
-    } else {
-        format!("{base_url}/{suffix}")
-    }
-}
 fn attachment_from_path(path: &Path, generated_by_app: bool) -> Result<Attachment, String> {
     let path = path.canonicalize().map_err(|error| error.to_string())?;
     let metadata = path.metadata().map_err(|error| error.to_string())?;
@@ -2567,7 +2351,7 @@ fn ensure_agent_team_extension(sessions_path: &Path) -> std::io::Result<PathBuf>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pi_whim_core::{ConversationItem, ModelCapabilitySource, ThinkingLevelMap};
+    use pi_whim_core::ConversationItem;
     use pi_whim_runtime::FakeRuntime;
     use serde_json::json;
     use tempfile::TempDir;
@@ -2621,83 +2405,6 @@ mod tests {
             .apply(Action::ProjectsLoaded(vec![project.clone()]));
         app.start_new_session(project.id);
         assert!(app.active_session.is_some());
-    }
-
-    #[test]
-    fn generated_pi_models_config_only_references_a_key_environment_variable() {
-        let mut model = ProviderModel::new("gpt-example");
-        model.reasoning = true;
-        model.thinking_level_map = ThinkingLevelMap::from_entries([
-            (ThinkingLevel::Minimal, None),
-            (ThinkingLevel::Xhigh, Some("xhigh".into())),
-        ]);
-        model.capability_source = ModelCapabilitySource::BundledCatalog;
-        let profile = ProviderProfile {
-            id: Uuid::new_v4(),
-            name: "Private gateway".into(),
-            base_url: "https://gateway.example/v1/".into(),
-            protocol: ProviderProtocol::OpenAiCompletions,
-            models: vec![model],
-            updated_at_ms: 1,
-            has_api_key: true,
-        };
-        let config = pi_models_json(std::slice::from_ref(&profile));
-        let provider = config["providers"]
-            .as_object()
-            .unwrap()
-            .values()
-            .next()
-            .unwrap();
-        assert_eq!(provider["baseUrl"], "https://gateway.example/v1");
-        assert_eq!(
-            provider["apiKey"],
-            format!("${}", provider_environment_name(profile.id))
-        );
-        assert!(!config.to_string().contains("sk-"));
-        assert_eq!(provider["models"][0]["reasoning"], true);
-        assert_eq!(
-            provider["models"][0]["thinkingLevelMap"]["minimal"],
-            Value::Null
-        );
-        assert_eq!(provider["models"][0]["thinkingLevelMap"]["xhigh"], "xhigh");
-    }
-
-    #[test]
-    fn provider_without_a_key_does_not_block_a_configured_provider() {
-        let missing_id = Uuid::new_v4();
-        let configured_id = Uuid::new_v4();
-        let profile = |id| ProviderProfile {
-            id,
-            name: "Private gateway".into(),
-            base_url: "https://gateway.example/v1".into(),
-            protocol: ProviderProtocol::OpenAiCompletions,
-            models: vec![ProviderModel::new("gpt-example")],
-            updated_at_ms: 1,
-            has_api_key: id == configured_id,
-        };
-
-        let (profiles, environment) = configured_provider_environment(
-            vec![profile(missing_id), profile(configured_id)],
-            |id| Ok((id == configured_id).then(|| "secret-key".to_owned())),
-        )
-        .unwrap();
-
-        assert_eq!(profiles.len(), 1);
-        assert_eq!(profiles[0].id, configured_id);
-        assert_eq!(
-            environment.get(&provider_environment_name(configured_id)),
-            Some(&"secret-key".to_owned())
-        );
-        assert!(!environment.contains_key(&provider_environment_name(missing_id)));
-    }
-
-    #[test]
-    fn search_engine_urls_accept_local_http_and_secure_https_only() {
-        assert!(valid_search_engine_url("http://localhost:8080"));
-        assert!(valid_search_engine_url("https://search.example/"));
-        assert!(!valid_search_engine_url("search.example"));
-        assert!(!valid_search_engine_url("ftp://search.example"));
-        assert!(!valid_search_engine_url("https:///search.example"));
     }
 
     #[test]
