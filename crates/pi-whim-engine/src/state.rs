@@ -41,6 +41,12 @@ impl EngineState {
         Self::default()
     }
 
+    /// Adopt an already-populated state, for callers that seed defaults before
+    /// any action has been applied.
+    pub fn from_state(state: AppState) -> Self {
+        Self { state }
+    }
+
     /// Read access for rendering.
     pub fn get(&self) -> &AppState {
         &self.state

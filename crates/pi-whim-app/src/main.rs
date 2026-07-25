@@ -205,7 +205,7 @@ impl<R: AgentRuntime> eframe::App for PiWhimApplication<R> {
         }
         let session_running = self.sessions.any_running();
         let agent_busy = matches!(
-            self.workbench.state.session_status,
+            self.workbench.state().session_status,
             SessionStatus::Starting | SessionStatus::Streaming | SessionStatus::Compacting
         );
         if session_running || agent_busy {
@@ -279,14 +279,14 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             UiIntent::ExportSession(path) => self.export_session(path),
             UiIntent::ShareSession => self.share_session(),
             UiIntent::AddFileAttachments => {
-                if self.workbench.state.selected_project.is_some() {
+                if self.workbench.state().selected_project.is_some() {
                     self.add_file_attachments();
                 } else {
                     self.error = Some("Select a project before adding attachments.".into());
                 }
             }
             UiIntent::AddFolderAttachment => {
-                if self.workbench.state.selected_project.is_some() {
+                if self.workbench.state().selected_project.is_some() {
                     self.add_folder_attachment();
                 } else {
                     self.error = Some("Select a project before adding attachments.".into());
@@ -424,10 +424,10 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
 
     fn save_preferences(&mut self) {
         let preferences = AppPreferences {
-            language: self.workbench.state.language,
-            bash_policy: self.workbench.state.bash_policy,
-            bash_blocked_patterns: self.workbench.state.bash_blocked_patterns.clone(),
-            agent_team_config: self.workbench.state.agent_team_config.clone(),
+            language: self.workbench.state().language,
+            bash_policy: self.workbench.state().bash_policy,
+            bash_blocked_patterns: self.workbench.state().bash_blocked_patterns.clone(),
+            agent_team_config: self.workbench.state().agent_team_config.clone(),
         };
         if let Some(store) = self.store.as_ref()
             && let Err(error) = store.save_preferences(preferences)
@@ -469,7 +469,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         }
         if self
             .workbench
-            .state
+            .state()
             .provider_profiles
             .iter()
             .any(|existing| {
@@ -688,7 +688,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
 
     fn find_project(&self, id: ProjectId) -> Option<Project> {
         self.workbench
-            .state
+            .state()
             .projects
             .iter()
             .find(|project| project.id == id)
@@ -731,7 +731,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         }
         let stored = self
             .workbench
-            .state
+            .state()
             .sessions
             .get(&project_id)
             .and_then(|sessions| sessions.first())
@@ -795,11 +795,11 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         }
         environment.insert(
             "PI_WHIM_BASH_POLICY".into(),
-            bash_policy_name(&self.workbench.state.bash_policy).into(),
+            bash_policy_name(&self.workbench.state().bash_policy).into(),
         );
         environment.insert(
             "PI_WHIM_BASH_BLOCKED_PATTERNS".into(),
-            serde_json::to_string(&self.workbench.state.bash_blocked_patterns)
+            serde_json::to_string(&self.workbench.state().bash_blocked_patterns)
                 .unwrap_or_else(|_| "[]".into()),
         );
         let mut runtime = (self.runtime_factory)();
@@ -809,8 +809,8 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             session_path: session_path.map(str::to_owned),
             extension_paths,
             environment,
-            agent_team_config: self.workbench.state.agent_team_config.clone(),
-            search_engines: self.workbench.state.search_engine_profiles.clone(),
+            agent_team_config: self.workbench.state().agent_team_config.clone(),
+            search_engines: self.workbench.state().search_engine_profiles.clone(),
         }) {
             if self.sessions.active_key().is_none() {
                 self.workbench
@@ -915,7 +915,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         }
         let provider_names = self
             .workbench
-            .state
+            .state()
             .provider_profiles
             .iter()
             .map(|profile| (provider_config_key(profile.id), profile.name.clone()))
@@ -1057,7 +1057,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
 
     /// Apply a deferred model switch: send set_model and refresh controls.
     fn apply_pending_model(&mut self, key: &str) {
-        if let Some(model) = self.workbench.state.pending_model.clone() {
+        if let Some(model) = self.workbench.state().pending_model.clone() {
             self.set_model_on(key, model);
             self.workbench.apply(Action::SetPendingModel(None));
         }
@@ -1084,7 +1084,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     }
 
     fn compact_session(&mut self) {
-        if !matches!(self.workbench.state.session_status, SessionStatus::Ready) {
+        if !matches!(self.workbench.state().session_status, SessionStatus::Ready) {
             return;
         }
         if let Err(error) = self.active_send(json!({"type":"compact"})) {
@@ -1217,7 +1217,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             session.project_id == project_id
                 && !self
                     .workbench
-                    .state
+                    .state()
                     .conversation
                     .iter()
                     .any(|message| message.role == ConversationRole::User)
@@ -1279,7 +1279,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             self.error = Some(error.to_string());
             return;
         }
-        if let Some(project_id) = self.workbench.state.selected_project {
+        if let Some(project_id) = self.workbench.state().selected_project {
             self.index_session(project_id, &path, Some(&title));
         }
         if self.sessions.active_key() == Some(path.as_str()) {
@@ -1350,7 +1350,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             self.error = Some(error);
             return;
         }
-        if let Some(project_id) = self.workbench.state.selected_project {
+        if let Some(project_id) = self.workbench.state().selected_project {
             self.refresh_session_state(project_id);
         }
     }
@@ -1360,7 +1360,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             self.error = Some(error);
             return;
         }
-        if let Some(project_id) = self.workbench.state.selected_project {
+        if let Some(project_id) = self.workbench.state().selected_project {
             self.refresh_session_state(project_id);
         }
     }
@@ -1400,7 +1400,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         {
             self.error = Some(error.to_string());
         }
-        if let Some(project_id) = self.workbench.state.selected_project {
+        if let Some(project_id) = self.workbench.state().selected_project {
             self.discover_sessions(project_id, target.parent().unwrap_or(Path::new("")));
         }
     }
@@ -1522,12 +1522,12 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     }
 
     fn submit_prompt(&mut self, content: String, attachments: Vec<Attachment>, mode: SubmitMode) {
-        if self.workbench.state.selected_project.is_none() {
+        if self.workbench.state().selected_project.is_none() {
             self.error = Some("Select a project before sending a message.".into());
             return;
         }
         if !matches!(
-            self.workbench.state.session_status,
+            self.workbench.state().session_status,
             SessionStatus::Ready | SessionStatus::Streaming | SessionStatus::Compacting
         ) {
             self.error = Some("Pi is not ready for the selected project yet.".into());
@@ -1550,14 +1550,14 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         // conversation, so the prior model compacts the existing history first
         // (cache-friendly). Skip when there's nothing to compact or it just did.
         let defer_for_compaction = matches!(mode, SubmitMode::Prompt)
-            && self.workbench.state.pending_model.is_some()
+            && self.workbench.state().pending_model.is_some()
             && !self
                 .active()
                 .map(|session| session.conversation_compacted)
                 .unwrap_or(true)
             && self
                 .workbench
-                .state
+                .state()
                 .conversation
                 .iter()
                 .any(|message| message.role != ConversationRole::User);
@@ -1584,7 +1584,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             self.error = Some("No active session.".into());
             return;
         };
-        if self.workbench.state.pending_model.is_some() {
+        if self.workbench.state().pending_model.is_some() {
             self.apply_pending_model(&key);
         }
         self.send_prompt(&key, content, attachments, mode);
@@ -1635,7 +1635,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     }
 
     fn ensure_session_title(&mut self) {
-        let Some(project_id) = self.workbench.state.selected_project else {
+        let Some(project_id) = self.workbench.state().selected_project else {
             return;
         };
         let Ok(state) = self.active_command(json!({"type":"get_state"})) else {
@@ -1646,7 +1646,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         }
         let Some(user_message) = self
             .workbench
-            .state
+            .state()
             .conversation
             .iter()
             .find(|message| message.role == ConversationRole::User)
@@ -1927,7 +1927,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                     // The deferred prompt continues even with the session in
                     // the background; only the visible status updates skip.
                     if let Some((content, attachments, mode)) = pending_prompt {
-                        if self.workbench.state.pending_model.is_some() {
+                        if self.workbench.state().pending_model.is_some() {
                             self.apply_pending_model(key);
                         }
                         self.send_prompt(key, content, attachments, mode);
@@ -1980,7 +1980,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 // After a switch-triggered compaction, apply the pending model
                 // and send the prompt that was held back.
                 if let Some((content, attachments, mode)) = pending_prompt {
-                    if self.workbench.state.pending_model.is_some() {
+                    if self.workbench.state().pending_model.is_some() {
                         self.apply_pending_model(key);
                     }
                     self.send_prompt(key, content, attachments, mode);
@@ -2011,7 +2011,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             .unwrap_or(false);
         let previous = self
             .workbench
-            .state
+            .state()
             .conversation
             .iter()
             .find(|message| message.id == id.as_str())
@@ -2105,7 +2105,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     /// them restarts every session of the selected project (sessions resume
     /// from disk; in-flight runs are aborted by the restart, as before).
     fn restart_selected_project(&mut self) {
-        if let Some(project) = self.workbench.state.selected_project {
+        if let Some(project) = self.workbench.state().selected_project {
             self.stop_project_runtimes(project);
             self.start_project(project);
         }
@@ -2344,7 +2344,7 @@ mod tests {
         let observer = runtime.clone();
         let mut app = test_application(&directory, runtime);
         start_test_session(&mut app, &directory);
-        let project_id = app.workbench.state.selected_project.unwrap();
+        let project_id = app.workbench.state().selected_project.unwrap();
         let running_key = app.sessions.active_key().unwrap().to_owned();
 
         // Session A starts streaming.
@@ -2414,9 +2414,9 @@ mod tests {
             },
         );
 
-        assert_eq!(app.workbench.state.thinking_level, ThinkingLevel::Off);
+        assert_eq!(app.workbench.state().thinking_level, ThinkingLevel::Off);
         assert_eq!(
-            app.workbench.state.available_thinking_levels,
+            app.workbench.state().available_thinking_levels,
             vec![ThinkingLevel::Off, ThinkingLevel::Low, ThinkingLevel::High]
         );
         let recorded_commands = observer.commands();
@@ -2454,7 +2454,7 @@ mod tests {
         // Switch is deferred: the pending model is recorded but no set_model
         // RPC is sent until the next prompt triggers compaction.
         assert_eq!(
-            app.workbench.state.pending_model.as_ref().unwrap().id,
+            app.workbench.state().pending_model.as_ref().unwrap().id,
             "model-b"
         );
         assert!(
@@ -2515,7 +2515,7 @@ mod tests {
 
         app.set_auto_compaction(false);
 
-        assert!(!app.workbench.state.auto_compaction_enabled);
+        assert!(!app.workbench.state().auto_compaction_enabled);
         let command = observer
             .commands()
             .into_iter()
@@ -2560,7 +2560,7 @@ mod tests {
         );
         assert_eq!(
             app.workbench
-                .state
+                .state()
                 .current_model
                 .as_ref()
                 .map(|model| (model.provider.clone(), model.id.clone())),

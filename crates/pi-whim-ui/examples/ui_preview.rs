@@ -90,7 +90,7 @@ fn mock_workbench(status: &str) -> Workbench {
         .nth(4)
         .map(|arg| arg != "en")
         .unwrap_or(true);
-    workbench.state.dispatch(Action::SetLanguage(if language {
+    workbench.apply(Action::SetLanguage(if language {
         Language::SimplifiedChinese
     } else {
         Language::English
@@ -137,10 +137,8 @@ fn mock_workbench(status: &str) -> Workbench {
             },
         ],
     });
-    workbench
-        .state
-        .dispatch(Action::SelectProject(main_project));
-    workbench.state.dispatch(Action::SelectSession(session_a));
+    workbench.apply(Action::SelectProject(main_project));
+    workbench.apply(Action::SelectSession(session_a));
 
     let model = ModelOption {
         provider: "openai".into(),
@@ -148,7 +146,7 @@ fn mock_workbench(status: &str) -> Workbench {
         id: "gpt-5.1-codex".into(),
         name: "gpt-5.1-codex".into(),
     };
-    workbench.state.dispatch(Action::RuntimeControlsUpdated {
+    workbench.apply(Action::RuntimeControlsUpdated {
         current_model: Some(model.clone()),
         available_models: vec![
             model,
@@ -170,25 +168,21 @@ fn mock_workbench(status: &str) -> Workbench {
         steering_mode: QueueMode::OneAtATime,
         follow_up_mode: QueueMode::OneAtATime,
     });
-    workbench
-        .state
-        .dispatch(Action::RuntimeCommandsUpdated(vec![
-            pi_whim_core::SlashCommandInfo {
-                name: "review".into(),
-                description: "Review the current diff".into(),
-                source: "prompt".into(),
-            },
-        ]));
-    workbench
-        .state
-        .dispatch(Action::SessionMetricsUpdated(SessionMetrics {
-            total_messages: 47,
-            user_messages: 19,
-            assistant_messages: 21,
-            tool_calls: 7,
-            total_tokens: 82_430,
-            cost_microusd: 1_240_000,
-        }));
+    workbench.apply(Action::RuntimeCommandsUpdated(vec![
+        pi_whim_core::SlashCommandInfo {
+            name: "review".into(),
+            description: "Review the current diff".into(),
+            source: "prompt".into(),
+        },
+    ]));
+    workbench.apply(Action::SessionMetricsUpdated(SessionMetrics {
+        total_messages: 47,
+        user_messages: 19,
+        assistant_messages: 21,
+        tool_calls: 7,
+        total_tokens: 82_430,
+        cost_microusd: 1_240_000,
+    }));
 
     let session_status = match status {
         "streaming" => SessionStatus::Streaming,
@@ -199,9 +193,7 @@ fn mock_workbench(status: &str) -> Workbench {
         ),
         _ => SessionStatus::Ready,
     };
-    workbench
-        .state
-        .dispatch(Action::SetSessionStatus(session_status));
+    workbench.apply(Action::SetSessionStatus(session_status));
 
     if status == "bubble" {
         for item in [
@@ -212,17 +204,17 @@ fn mock_workbench(status: &str) -> Workbench {
             ),
             item("b2", ConversationRole::Assistant, "On it — reskinning now."),
         ] {
-            workbench.state.dispatch(Action::UpsertConversation(item));
+            workbench.apply(Action::UpsertConversation(item));
         }
     } else if status != "empty" {
         for item in mock_conversation() {
-            workbench.state.dispatch(Action::UpsertConversation(item));
+            workbench.apply(Action::UpsertConversation(item));
         }
     }
     if status == "slash" {
         workbench.composer_draft_mut().set_text("/");
     }
-    workbench.state.dispatch(Action::QueueUpdated {
+    workbench.apply(Action::QueueUpdated {
         steering: vec!["also check the runtime crate".into()],
         follow_up: vec![],
     });

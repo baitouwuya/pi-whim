@@ -24,6 +24,7 @@ use pi_whim_core::{
     ThinkingLevel, provider_name_key,
 };
 use pi_whim_engine::composer::Composer;
+use pi_whim_engine::state::{EngineState, ViewEffect};
 use pi_whim_engine::typewriter::Typewriter;
 
 use markdown::MarkdownRenderer;
@@ -312,7 +313,7 @@ impl ProviderDraft {
 }
 
 pub struct Workbench {
-    pub state: AppState,
+    engine: EngineState,
     /// The prompt being drafted. View-local, so it is not in `state`.
     composer: Composer,
     /// How much of each streaming message has been revealed.
@@ -394,7 +395,7 @@ impl Default for Workbench {
             ..AppState::default()
         };
         Self {
-            state,
+            engine: EngineState::from_state(state),
             composer: Composer::new(),
             typewriter: Typewriter::new(),
             intents: Vec::new(),
@@ -447,37 +448,42 @@ impl Workbench {
         });
     }
 
+    /// Read-only view of the domain state, for rendering.
+    pub fn state(&self) -> &AppState {
+        self.engine.get()
+    }
+
+    /// Apply `action` through the engine's reducer, then do whatever view-local
+    /// bookkeeping it calls for.
     pub fn apply(&mut self, action: Action) {
-        match action {
-            Action::ProviderProfilesLoaded(profiles) => {
-                self.sync_provider_draft(&profiles);
-                self.state
-                    .dispatch(Action::ProviderProfilesLoaded(profiles));
-            }
-            Action::SearchEngineProfilesLoaded(profiles) => {
-                self.sync_search_engine_draft(&profiles);
-                self.state
-                    .dispatch(Action::SearchEngineProfilesLoaded(profiles));
-            }
-            Action::ProjectsLoaded(projects) => {
-                if self.state.projects.is_empty() && self.expanded_projects.is_empty() {
+        // Re-keying has to be handled before the reducer runs: afterwards the
+        // old id is gone from the conversation and the reveal progress could no
+        // longer be matched up.
+        if let Action::RekeyConversation { from, to } = &action {
+            self.typewriter.rekey(from, to);
+        }
+        // Likewise, whether this is the first list of projects can only be
+        // known before the reducer replaces it.
+        let had_no_projects = self.state().projects.is_empty();
+
+        let Some(effect) = self.engine.apply(action) else {
+            return;
+        };
+        match effect {
+            ViewEffect::ProvidersReloaded(profiles) => self.sync_provider_draft(&profiles),
+            ViewEffect::SearchEnginesReloaded(profiles) => self.sync_search_engine_draft(&profiles),
+            ViewEffect::ProjectsLoaded(projects) => {
+                // Expand every project the first time a list arrives, but leave
+                // the user's own collapsing alone afterwards.
+                if had_no_projects && self.expanded_projects.is_empty() {
                     self.expanded_projects
                         .extend(projects.iter().map(|project| project.id));
                 }
-                self.state.dispatch(Action::ProjectsLoaded(projects));
             }
-            Action::ClearConversation => {
+            ViewEffect::ConversationCleared => {
                 self.message_layouts.clear();
                 self.typewriter.clear();
-                self.state.dispatch(Action::ClearConversation);
             }
-            Action::RekeyConversation { from, to } => {
-                // Pi assigns a real message id once streaming starts; carry the
-                // reveal progress across so the text does not restart.
-                self.typewriter.rekey(&from, &to);
-                self.state.dispatch(Action::RekeyConversation { from, to });
-            }
-            action => self.state.dispatch(action),
         }
     }
 
@@ -558,7 +564,7 @@ impl Workbench {
 
         match command {
             SlashCommand::NewSession => {
-                if let Some(project_id) = self.state.selected_project {
+                if let Some(project_id) = self.state().selected_project {
                     self.intents.push(UiIntent::StartNewSession(project_id));
                 }
                 self.composer.clear_text();
@@ -582,7 +588,7 @@ impl Workbench {
                 self.composer.clear_text();
             }
             SlashCommand::CopyLastMessage => {
-                if let Some(message) = self.state.conversation.iter().rev().find(|message| {
+                if let Some(message) = self.state().conversation.iter().rev().find(|message| {
                     message.role == ConversationRole::Assistant
                         && !message.streaming
                         && !message.full_text.trim().is_empty()
@@ -609,7 +615,7 @@ impl Workbench {
                 self.composer.clear_text();
             }
             SlashCommand::ShowSessionInfo => {
-                let metrics = self.state.session_metrics.clone().unwrap_or_default();
+                let metrics = self.state().session_metrics.clone().unwrap_or_default();
                 self.push_command_output(format!(
                     "Session info\n\nMessages: {} ({} user, {} assistant)\nTool calls: {}\nTokens: {}\nCost: ${:.4}",
                     metrics.total_messages,
@@ -656,23 +662,22 @@ impl Workbench {
     }
 
     fn push_command_output(&mut self, text: String) {
-        self.state
-            .dispatch(Action::UpsertConversation(pi_whim_core::ConversationItem {
-                id: format!("slash-command-{}", now_ms()),
-                role: ConversationRole::System,
-                full_text: text,
-                streaming: false,
-                tool_name: None,
-                tool_report: None,
-                tool_details: None,
-                is_error: false,
-                model: None,
-                attachments: Vec::new(),
-            }));
+        self.apply(Action::UpsertConversation(pi_whim_core::ConversationItem {
+            id: format!("slash-command-{}", now_ms()),
+            role: ConversationRole::System,
+            full_text: text,
+            streaming: false,
+            tool_name: None,
+            tool_report: None,
+            tool_details: None,
+            is_error: false,
+            model: None,
+            attachments: Vec::new(),
+        }));
     }
 
     fn slash_toolbar(&mut self, context: &egui::Context) -> bool {
-        let Some(options) = slash_commands::options(&self.state, self.composer.text()) else {
+        let Some(options) = slash_commands::options(self.state(), self.composer.text()) else {
             self.slash_query = None;
             self.slash_dismissed_query = None;
             return false;
@@ -748,7 +753,7 @@ impl Workbench {
                     .show(ui, |ui| {
                         ui.set_min_width(700.0_f32.min(screen.width() - 24.0));
                         ui.label(
-                            RichText::new(tr(&self.state, "slash-commands"))
+                            RichText::new(tr(self.state(), "slash-commands"))
                                 .font(mono_font(10.0))
                                 .color(MUTED_INK),
                         );
@@ -815,7 +820,7 @@ impl Workbench {
                         });
                         ui.add_space(3.0);
                         ui.label(
-                            RichText::new(tr(&self.state, "slash-help"))
+                            RichText::new(tr(self.state(), "slash-help"))
                                 .font(mono_font(10.0))
                                 .color(MUTED_INK),
                         );
@@ -831,7 +836,10 @@ impl Workbench {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_frame).as_secs_f32();
         self.last_frame = now;
-        if self.typewriter.advance(&self.state.conversation, elapsed) {
+        if self
+            .typewriter
+            .advance(&self.engine.get().conversation, elapsed)
+        {
             context.request_repaint_after(std::time::Duration::from_millis(33));
         }
         install_theme(context);
@@ -864,7 +872,7 @@ impl Workbench {
                         if icons::button(
                             ui,
                             icons::Icon::Settings,
-                            tr(&self.state, "settings"),
+                            tr(self.state(), "settings"),
                             Vec2::splat(28.0),
                             true,
                         )
@@ -872,16 +880,16 @@ impl Workbench {
                         {
                             self.page = WorkbenchPage::Settings(SettingsSection::General);
                         }
-                        let language = match self.state.language {
+                        let language = match self.state().language {
                             Language::English => "中文",
                             Language::SimplifiedChinese => "EN",
                         };
                         if bracket_button(ui, language).clicked() {
-                            let next = match self.state.language {
+                            let next = match self.state().language {
                                 Language::English => Language::SimplifiedChinese,
                                 Language::SimplifiedChinese => Language::English,
                             };
-                            self.state.dispatch(Action::SetLanguage(next));
+                            self.apply(Action::SetLanguage(next));
                             self.intents.push(UiIntent::SetLanguage(next));
                         }
                     });
@@ -892,12 +900,12 @@ impl Workbench {
     /// Codex-style status chip: a colored dot plus a mono label, tinted by the
     /// current agent state. Clicking a failed pill revives a dismissed banner.
     fn status_pill(&mut self, ui: &mut Ui) {
-        let (color, label) = status_visual(&self.state);
+        let (color, label) = status_visual(self.state());
         let busy = matches!(
-            self.state.session_status,
+            self.state().session_status,
             SessionStatus::Starting | SessionStatus::Streaming | SessionStatus::Compacting
         );
-        let failed = matches!(self.state.session_status, SessionStatus::Failed(_));
+        let failed = matches!(self.state().session_status, SessionStatus::Failed(_));
         Frame::default()
             .fill(tint(color, 20))
             .stroke(Stroke::new(1.0_f32, tint(color, 110)))
@@ -915,7 +923,11 @@ impl Workbench {
                     };
                     ui.painter().circle_filled(rect.center(), 3.5, dot);
                     let label = ui.label(RichText::new(label).font(mono_font(10.5)).color(color));
-                    if failed && label.on_hover_text(tr(&self.state, "show-error")).clicked() {
+                    if failed
+                        && label
+                            .on_hover_text(tr(self.state(), "show-error"))
+                            .clicked()
+                    {
                         self.dismissed_error = None;
                     }
                 });
@@ -925,7 +937,7 @@ impl Workbench {
     /// Prominent request-failure banner under the top bar. The previous design
     /// only surfaced errors as a tiny "ERROR" label, easy to miss entirely.
     fn error_banner(&mut self, context: &egui::Context) {
-        let error = match &self.state.session_status {
+        let error = match &self.state().session_status {
             SessionStatus::Failed(error) => error.clone(),
             _ => {
                 self.dismissed_error = None;
@@ -948,7 +960,7 @@ impl Workbench {
                     ui.add_space(6.0);
                     ui.vertical(|ui| {
                         ui.label(
-                            RichText::new(tr(&self.state, "error-banner-title"))
+                            RichText::new(tr(self.state(), "error-banner-title"))
                                 .strong()
                                 .color(ERROR_STRONG),
                         );
@@ -958,7 +970,7 @@ impl Workbench {
                         if icons::button(
                             ui,
                             icons::Icon::Close,
-                            tr(&self.state, "dismiss"),
+                            tr(self.state(), "dismiss"),
                             Vec2::splat(26.0),
                             false,
                         )
@@ -966,7 +978,7 @@ impl Workbench {
                         {
                             self.dismissed_error = Some(error.clone());
                         }
-                        if bracket_button(ui, tr(&self.state, "copy-error")).clicked() {
+                        if bracket_button(ui, tr(self.state(), "copy-error")).clicked() {
                             ui.ctx().copy_text(error.clone());
                         }
                     });
@@ -977,7 +989,7 @@ impl Workbench {
     /// Context compaction hint: a slim accent banner shown while Pi summarizes
     /// older messages, so the pause never looks like a hang.
     fn compacting_banner(&mut self, context: &egui::Context) {
-        if !matches!(self.state.session_status, SessionStatus::Compacting) {
+        if !matches!(self.state().session_status, SessionStatus::Compacting) {
             return;
         }
         TopBottomPanel::top("compacting-banner")
@@ -992,13 +1004,13 @@ impl Workbench {
                     ui.spacing_mut().item_spacing.x = 8.0;
                     icons::display(ui, icons::Icon::Compress, Vec2::splat(18.0), ACCENT_STRONG);
                     ui.label(
-                        RichText::new(tr(&self.state, "compacting-banner"))
+                        RichText::new(tr(self.state(), "compacting-banner"))
                             .font(mono_font(11.0))
                             .strong()
                             .color(ACCENT_STRONG),
                     );
                     ui.label(
-                        RichText::new(tr(&self.state, "compacting-detail"))
+                        RichText::new(tr(self.state(), "compacting-detail"))
                             .small()
                             .color(MUTED_INK),
                     );
@@ -1023,19 +1035,24 @@ impl Workbench {
                 ui.set_height(20.0);
                 ui.horizontal(|ui| {
                     let mut location = self
-                        .state
+                        .state()
                         .selected_project
-                        .and_then(|id| self.state.projects.iter().find(|project| project.id == id))
+                        .and_then(|id| {
+                            self.state()
+                                .projects
+                                .iter()
+                                .find(|project| project.id == id)
+                        })
                         .map(|project| project.name.clone())
                         .unwrap_or_else(|| "pi-whim".into());
                     let session_title = self
-                        .state
+                        .state()
                         .selected_project
-                        .and_then(|id| self.state.sessions.get(&id))
+                        .and_then(|id| self.state().sessions.get(&id))
                         .and_then(|sessions| {
                             sessions
                                 .iter()
-                                .find(|session| Some(session.id) == self.state.selected_session)
+                                .find(|session| Some(session.id) == self.state().selected_session)
                         })
                         .map(|session| session.title.clone());
                     if let Some(title) = session_title {
@@ -1047,17 +1064,17 @@ impl Workbench {
                             .color(MUTED_INK),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let (auto_label, auto_color) = if self.state.auto_compaction_enabled {
-                            (tr(&self.state, "auto-compact-on"), SUCCESS)
+                        let (auto_label, auto_color) = if self.state().auto_compaction_enabled {
+                            (tr(self.state(), "auto-compact-on"), SUCCESS)
                         } else {
-                            (tr(&self.state, "auto-compact-off"), MUTED_INK)
+                            (tr(self.state(), "auto-compact-off"), MUTED_INK)
                         };
                         ui.label(
                             RichText::new(auto_label)
                                 .font(mono_font(10.0))
                                 .color(auto_color),
                         );
-                        if let Some(metrics) = &self.state.session_metrics {
+                        if let Some(metrics) = &self.state().session_metrics {
                             ui.label(
                                 RichText::new(format!(
                                     "${:.4} · {} tok · {} msg",
@@ -1089,7 +1106,7 @@ impl Workbench {
             .show(context, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new(tr(&self.state, "projects"))
+                        RichText::new(tr(self.state(), "projects"))
                             .font(serif_font(20.0))
                             .color(INK),
                     );
@@ -1097,7 +1114,7 @@ impl Workbench {
                         if icons::button(
                             ui,
                             icons::Icon::Plus,
-                            tr(&self.state, "add-project"),
+                            tr(self.state(), "add-project"),
                             Vec2::splat(26.0),
                             false,
                         )
@@ -1108,7 +1125,7 @@ impl Workbench {
                     });
                 });
                 ui.add_space(10.0);
-                let search_hint = tr(&self.state, "search").to_owned();
+                let search_hint = tr(self.state(), "search").to_owned();
                 ui.add(
                     TextEdit::singleline(self.composer.search_mut())
                         .hint_text(search_hint)
@@ -1116,7 +1133,7 @@ impl Workbench {
                 );
                 ui.add_space(10.0);
                 let project_ids: Vec<_> = self
-                    .state
+                    .state()
                     .projects
                     .iter()
                     .map(|project| project.id)
@@ -1133,7 +1150,7 @@ impl Workbench {
 
     fn project_row(&mut self, ui: &mut Ui, project_id: ProjectId) {
         let Some(project) = self
-            .state
+            .state()
             .projects
             .iter()
             .find(|project| project.id == project_id)
@@ -1149,7 +1166,7 @@ impl Workbench {
         {
             return;
         }
-        let selected = self.state.selected_project == Some(project.id);
+        let selected = self.state().selected_project == Some(project.id);
         let expanded = self.expanded_projects.contains(&project.id);
         let mut project_response = None;
         ui.horizontal(|ui| {
@@ -1195,45 +1212,45 @@ impl Workbench {
             }
             if response.clicked() {
                 self.expanded_projects.insert(project.id);
-                self.state.dispatch(Action::SelectProject(project.id));
+                self.apply(Action::SelectProject(project.id));
                 self.intents.push(UiIntent::StartProject(project.id));
             }
             project_response = Some(response);
             if icons::button(
                 ui,
                 icons::Icon::Plus,
-                tr(&self.state, "new-session"),
+                tr(self.state(), "new-session"),
                 Vec2::splat(26.0),
                 false,
             )
             .clicked()
             {
                 self.expanded_projects.insert(project.id);
-                self.state.dispatch(Action::SelectProject(project.id));
+                self.apply(Action::SelectProject(project.id));
                 self.intents.push(UiIntent::StartNewSession(project.id));
             }
         });
         project_response
             .expect("project row response")
             .context_menu(|ui| {
-                if ui.button(tr(&self.state, "show-finder")).clicked() {
+                if ui.button(tr(self.state(), "show-finder")).clicked() {
                     self.intents.push(UiIntent::RevealProject(project.id));
                     ui.close_menu();
                 }
-                if ui.button(tr(&self.state, "remove")).clicked() {
+                if ui.button(tr(self.state(), "remove")).clicked() {
                     self.intents.push(UiIntent::RemoveProject(project.id));
                     ui.close_menu();
                 }
             });
         if self.expanded_projects.contains(&project.id) {
             let sessions = self
-                .state
+                .state()
                 .sessions
                 .get(&project.id)
                 .cloned()
                 .unwrap_or_default();
             for session in sessions {
-                let selected_session = self.state.selected_session == Some(session.id);
+                let selected_session = self.state().selected_session == Some(session.id);
                 let mut session_response = None;
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
@@ -1249,11 +1266,11 @@ impl Workbench {
                         ui.painter().rect_filled(row_rect, 0, tint(INK, 9));
                     }
                     let title: &str = if session.title.is_empty() {
-                        tr(&self.state, "new-session")
+                        tr(self.state(), "new-session")
                     } else {
                         &session.title
                     };
-                    let session_running = self.state.running_sessions.contains(&session.pi_path);
+                    let session_running = self.state().running_sessions.contains(&session.pi_path);
                     if session_running {
                         ui.painter().circle_filled(
                             row_rect.left_center() + egui::vec2(6.0, 0.0),
@@ -1273,27 +1290,27 @@ impl Workbench {
                 });
                 let response = session_response.expect("session row response");
                 if response.clicked() {
-                    self.state.dispatch(Action::SelectSession(session.id));
+                    self.apply(Action::SelectSession(session.id));
                     self.intents.push(UiIntent::SwitchSession {
                         project_id: project.id,
                         path: session.pi_path.clone(),
                     });
                 }
                 response.context_menu(|ui| {
-                    if ui.button(tr(&self.state, "rename")).clicked() {
+                    if ui.button(tr(self.state(), "rename")).clicked() {
                         self.rename_session_path = Some(session.pi_path.clone());
                         self.rename_session_title = session.title.clone();
                         ui.close_menu();
                     }
-                    if ui.button(tr(&self.state, "clone")).clicked() {
+                    if ui.button(tr(self.state(), "clone")).clicked() {
                         self.intents.push(UiIntent::CloneSession);
                         ui.close_menu();
                     }
-                    if ui.button(tr(&self.state, "copy-session-id")).clicked() {
+                    if ui.button(tr(self.state(), "copy-session-id")).clicked() {
                         ui.ctx().copy_text(session.id.to_string());
                         ui.close_menu();
                     }
-                    if ui.button(tr(&self.state, "delete")).clicked() {
+                    if ui.button(tr(self.state(), "delete")).clicked() {
                         self.intents
                             .push(UiIntent::DeleteSession(session.pi_path.clone()));
                         ui.close_menu();
@@ -1321,10 +1338,13 @@ impl Workbench {
                         Layout::left_to_right(Align::Center),
                         |ui| {
                             let project = self
-                                .state
+                                .state()
                                 .selected_project
                                 .and_then(|id| {
-                                    self.state.projects.iter().find(|project| project.id == id)
+                                    self.state()
+                                        .projects
+                                        .iter()
+                                        .find(|project| project.id == id)
                                 })
                                 .map(|project| project.name.as_str())
                                 .unwrap_or("pi-whim");
@@ -1334,12 +1354,12 @@ impl Workbench {
                                     .color(ACCENT_STRONG),
                             );
                             let session_title = self
-                                .state
+                                .state()
                                 .selected_project
-                                .and_then(|id| self.state.sessions.get(&id))
+                                .and_then(|id| self.state().sessions.get(&id))
                                 .and_then(|sessions| {
                                     sessions.iter().find(|session| {
-                                        Some(session.id) == self.state.selected_session
+                                        Some(session.id) == self.state().selected_session
                                     })
                                 })
                                 .map(|session| session.title.as_str());
@@ -1362,7 +1382,7 @@ impl Workbench {
                     .auto_shrink([false; 2])
                     .show_viewport(ui, |ui, viewport| {
                         ui.set_width(ui.clip_rect().width());
-                        if self.state.conversation.is_empty() {
+                        if self.state().conversation.is_empty() {
                             ui.add_space(120.0);
                             // A single centered column: icon, heading, detail
                             // and the hint chips all share one vertical axis.
@@ -1383,22 +1403,22 @@ impl Workbench {
                                         );
                                         ui.add_space(10.0);
                                         ui.label(
-                                            RichText::new(tr(&self.state, "empty-heading"))
+                                            RichText::new(tr(self.state(), "empty-heading"))
                                                 .font(serif_font(34.0))
                                                 .color(INK),
                                         );
                                         ui.add_space(4.0);
                                         ui.label(
-                                            RichText::new(tr(&self.state, "empty-detail"))
+                                            RichText::new(tr(self.state(), "empty-detail"))
                                                 .color(MUTED_INK),
                                         );
                                         ui.add_space(20.0);
                                         ui.horizontal(|ui| {
                                             ui.spacing_mut().item_spacing.x = 8.0;
                                             for hint in [
-                                                tr(&self.state, "hint-slash"),
-                                                tr(&self.state, "hint-enter"),
-                                                tr(&self.state, "hint-shift-enter"),
+                                                tr(self.state(), "hint-slash"),
+                                                tr(self.state(), "hint-enter"),
+                                                tr(self.state(), "hint-shift-enter"),
                                             ] {
                                                 Frame::default()
                                                     .fill(tint(ACCENT_STRONG, 10))
@@ -1425,9 +1445,9 @@ impl Workbench {
                         let message_width = ui.clip_rect().width().min(CHAT_CONTENT_WIDTH);
                         let content_origin = ui.max_rect().top();
                         let mut previous_role: Option<ConversationRole> = None;
-                        for message_index in 0..self.state.conversation.len() {
+                        for message_index in 0..self.state().conversation.len() {
                             let (message_id, role, cache_key) = {
-                                let message = &self.state.conversation[message_index];
+                                let message = &self.state().conversation[message_index];
                                 (
                                     message.id.clone(),
                                     message.role.clone(),
@@ -1469,7 +1489,7 @@ impl Workbench {
                             }
                             previous_role = Some(role);
                         }
-                        if matches!(self.state.session_status, SessionStatus::Streaming) {
+                        if matches!(self.state().session_status, SessionStatus::Streaming) {
                             self.thinking_indicator(ui);
                         }
                     });
@@ -1477,15 +1497,15 @@ impl Workbench {
     }
 
     fn runtime_controls(&mut self, ui: &mut Ui) {
-        if self.state.selected_project.is_none() {
+        if self.state().selected_project.is_none() {
             return;
         }
-        if !self.state.available_models.is_empty() {
+        if !self.state().available_models.is_empty() {
             let current = self
-                .state
+                .state()
                 .pending_model
                 .clone()
-                .or_else(|| self.state.current_model.clone())
+                .or_else(|| self.state().current_model.clone())
                 .map(|model| model.name.clone())
                 .unwrap_or_else(|| "Model".into());
             egui::ComboBox::from_id_salt("model-picker")
@@ -1493,14 +1513,15 @@ impl Workbench {
                 .selected_text(current)
                 .show_ui(ui, |ui| {
                     ui.set_min_width(340.0);
+                    let search_hint = tr(self.state(), "search-models");
                     ui.add(
                         TextEdit::singleline(&mut self.model_search)
-                            .hint_text(tr(&self.state, "search-models"))
+                            .hint_text(search_hint)
                             .desired_width(f32::INFINITY),
                     );
                     let query = self.model_search.trim().to_lowercase();
                     let mut groups = BTreeMap::<String, Vec<ModelOption>>::new();
-                    for model in self.state.available_models.clone() {
+                    for model in self.state().available_models.clone() {
                         if !query.is_empty()
                             && !model.name.to_lowercase().contains(&query)
                             && !model.id.to_lowercase().contains(&query)
@@ -1524,10 +1545,10 @@ impl Workbench {
                             );
                             for model in models {
                                 let active = self
-                                    .state
+                                    .state()
                                     .pending_model
                                     .as_ref()
-                                    .or(self.state.current_model.as_ref());
+                                    .or(self.state().current_model.as_ref());
                                 let selected = active.is_some_and(|current| {
                                     current.provider == model.provider && current.id == model.id
                                 });
@@ -1551,40 +1572,40 @@ impl Workbench {
                         }
                     });
                 });
-        } else if let SessionStatus::Failed(error) = &self.state.session_status {
+        } else if let SessionStatus::Failed(error) = &self.state().session_status {
             ui.label(
                 RichText::new(format!(
                     "{}: {error}",
-                    tr(&self.state, "models-unavailable")
+                    tr(self.state(), "models-unavailable")
                 ))
                 .font(mono_font(10.0))
                 .color(ERROR_STRONG),
             );
         } else {
             ui.label(
-                RichText::new(tr(&self.state, "models-unavailable"))
+                RichText::new(tr(self.state(), "models-unavailable"))
                     .font(mono_font(10.0))
                     .color(MUTED_INK),
             );
         }
-        if !self.state.available_thinking_levels.is_empty() {
-            let mut level = self.state.thinking_level;
+        if !self.state().available_thinking_levels.is_empty() {
+            let mut level = self.state().thinking_level;
             egui::ComboBox::from_id_salt("thinking-picker")
                 .width(92.0)
-                .selected_text(format!("{}: {level}", tr(&self.state, "thinking")))
+                .selected_text(format!("{}: {level}", tr(self.state(), "thinking")))
                 .show_ui(ui, |ui| {
-                    for candidate in &self.state.available_thinking_levels {
+                    for candidate in &self.state().available_thinking_levels {
                         ui.selectable_value(&mut level, *candidate, candidate.as_str());
                     }
                 });
-            if level != self.state.thinking_level {
+            if level != self.state().thinking_level {
                 self.intents.push(UiIntent::SetThinkingLevel(level));
             }
         }
     }
 
     fn message_card(&mut self, ui: &mut Ui, message_index: usize) {
-        let Some(message) = self.state.conversation.get(message_index).cloned() else {
+        let Some(message) = self.state().conversation.get(message_index).cloned() else {
             return;
         };
         let viewport_width = ui.clip_rect().width();
@@ -1612,7 +1633,7 @@ impl Workbench {
                             // an in-bubble horizontal row overlaps the text in
                             // a right-to-left layout.
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui.small_button(tr(&self.state, "fork-here")).clicked() {
+                                if ui.small_button(tr(self.state(), "fork-here")).clicked() {
                                     self.intents.push(UiIntent::ForkSession(message.id.clone()));
                                 }
                             });
@@ -1638,7 +1659,7 @@ impl Workbench {
                                         } else {
                                             icons::Icon::Copy
                                         },
-                                        tr(&self.state, "copy-report"),
+                                        tr(self.state(), "copy-report"),
                                         Vec2::new(28.0, 26.0),
                                         false,
                                     )
@@ -1698,7 +1719,7 @@ impl Workbench {
                                                 {
                                                     ui.push_id("raw-tool-details", |ui| {
                                                         ui.collapsing(
-                                                            tr(&self.state, "raw-tool-details"),
+                                                            tr(self.state(), "raw-tool-details"),
                                                             |ui| {
                                                                 ui.label(
                                                                     RichText::new(details)
@@ -1721,7 +1742,8 @@ impl Workbench {
                             );
                         }
                     }
-                    if message.streaming && ui.small_button(tr(&self.state, "show-all")).clicked() {
+                    if message.streaming && ui.small_button(tr(self.state(), "show-all")).clicked()
+                    {
                         self.typewriter.reveal_all(&message);
                     }
                 },
@@ -1749,7 +1771,7 @@ impl Workbench {
                 );
             }
             ui.label(
-                RichText::new(tr(&self.state, "generating"))
+                RichText::new(tr(self.state(), "generating"))
                     .font(mono_font(10.0))
                     .color(MUTED_INK),
             );
@@ -1764,12 +1786,12 @@ impl Workbench {
                     .inner_margin(Margin::symmetric(16, 10)),
             )
             .show(context, |ui| {
-                let project_selected = self.state.selected_project.is_some();
+                let project_selected = self.state().selected_project.is_some();
                 if !project_selected {
                     ui.horizontal(|ui| {
                         ui.add_space(composer_padding(ui));
                         ui.label(
-                            RichText::new(tr(&self.state, "select-project-to-chat"))
+                            RichText::new(tr(self.state(), "select-project-to-chat"))
                                 .font(mono_font(11.0))
                                 .color(MUTED_INK),
                         );
@@ -1798,7 +1820,7 @@ impl Workbench {
                                         );
                                         let composer_id = composer_input_id();
                                         let composer_hint =
-                                            tr(&self.state, "composer-placeholder").to_owned();
+                                            tr(self.state(), "composer-placeholder").to_owned();
                                         // Consume toolbar navigation before TextEdit can turn Tab into focus traversal.
                                         let slash_open = self.slash_toolbar(context);
                                         let input = ui.add(
@@ -1819,7 +1841,7 @@ impl Workbench {
                                                 RichText::new("+").font(mono_font(18.0)),
                                                 |ui| {
                                                     if ui
-                                                        .button(tr(&self.state, "choose-files"))
+                                                        .button(tr(self.state(), "choose-files"))
                                                         .clicked()
                                                     {
                                                         self.intents
@@ -1827,7 +1849,7 @@ impl Workbench {
                                                         ui.close_menu();
                                                     }
                                                     if ui
-                                                        .button(tr(&self.state, "choose-folder"))
+                                                        .button(tr(self.state(), "choose-folder"))
                                                         .clicked()
                                                     {
                                                         self.intents
@@ -1838,13 +1860,13 @@ impl Workbench {
                                             );
                                             attachment_menu
                                                 .response
-                                                .on_hover_text(tr(&self.state, "add-attachment"));
+                                                .on_hover_text(tr(self.state(), "add-attachment"));
                                             self.runtime_controls(ui);
                                             ui.with_layout(
                                                 Layout::right_to_left(Align::Center),
                                                 |ui| {
                                                     if matches!(
-                                                        self.state.session_status,
+                                                        self.state().session_status,
                                                         SessionStatus::Streaming
                                                             | SessionStatus::Compacting
                                                     ) && ui
@@ -1852,7 +1874,7 @@ impl Workbench {
                                                             [72.0, 30.0],
                                                             Button::new(
                                                                 RichText::new(tr(
-                                                                    &self.state,
+                                                                    self.state(),
                                                                     "stop",
                                                                 ))
                                                                 .font(mono_font(11.0))
@@ -1868,7 +1890,7 @@ impl Workbench {
                                                     let submit = icons::filled_button(
                                                         ui,
                                                         icons::Icon::Send,
-                                                        tr(&self.state, "send"),
+                                                        tr(self.state(), "send"),
                                                         Vec2::new(46.0, 30.0),
                                                         ACCENT_STRONG,
                                                     );
@@ -1892,7 +1914,9 @@ impl Workbench {
                                                             input.key_pressed(egui::Key::Escape)
                                                         })
                                                     {
-                                                        for message in &self.state.conversation {
+                                                        for message in
+                                                            &self.engine.get().conversation
+                                                        {
                                                             self.typewriter.reveal_all(message);
                                                         }
                                                     }
@@ -1911,8 +1935,8 @@ impl Workbench {
     /// context is visible where the user is typing.
     fn composer_chips(&mut self, ui: &mut Ui) {
         let has_attachments = !self.composer.attachments().is_empty();
-        let steering = self.state.pending_steering.len();
-        let follow_ups = self.state.pending_follow_up.len();
+        let steering = self.state().pending_steering.len();
+        let follow_ups = self.state().pending_follow_up.len();
         if !has_attachments && steering == 0 && follow_ups == 0 {
             return;
         }
@@ -1925,14 +1949,14 @@ impl Workbench {
             if steering > 0 {
                 chip(
                     ui,
-                    &format!("{} {}", tr(&self.state, "queued"), steering),
+                    &format!("{} {}", tr(self.state(), "queued"), steering),
                     WARNING,
                 );
             }
             if follow_ups > 0 {
                 chip(
                     ui,
-                    &format!("{} {}", tr(&self.state, "follow-ups"), follow_ups),
+                    &format!("{} {}", tr(self.state(), "follow-ups"), follow_ups),
                     BLUE,
                 );
             }
@@ -1954,7 +1978,7 @@ impl Workbench {
                 if icons::button(
                     ui,
                     icons::Icon::Back,
-                    tr(&self.state, "back"),
+                    tr(self.state(), "back"),
                     Vec2::splat(30.0),
                     false,
                 )
@@ -1966,16 +1990,16 @@ impl Workbench {
                 ui.horizontal(|ui| {
                     ui.add_space(10.0);
                     ui.label(
-                        RichText::new(tr(&self.state, "settings"))
+                        RichText::new(tr(self.state(), "settings"))
                             .font(serif_font(22.0))
                             .color(INK),
                     );
                 });
                 ui.add_space(14.0);
                 for (target, label) in [
-                    (SettingsSection::General, tr(&self.state, "general")),
-                    (SettingsSection::Providers, tr(&self.state, "providers")),
-                    (SettingsSection::WebSearch, tr(&self.state, "web-search")),
+                    (SettingsSection::General, tr(self.state(), "general")),
+                    (SettingsSection::Providers, tr(self.state(), "providers")),
+                    (SettingsSection::WebSearch, tr(self.state(), "web-search")),
                 ] {
                     let (row_rect, response) = ui.allocate_exact_size(
                         Vec2::new(ui.available_width(), 32.0),
@@ -2021,40 +2045,41 @@ impl Workbench {
     }
 
     fn general_settings(&mut self, ui: &mut Ui) {
-        settings::page_header(ui, tr(&self.state, "general"), None);
+        settings::page_header(ui, tr(self.state(), "general"), None);
 
-        settings::section_header(ui, tr(&self.state, "appearance"), None);
-        settings::form_row(ui, tr(&self.state, "language"), None, |ui| {
-            let previous_language = self.state.language;
+        settings::section_header(ui, tr(self.state(), "appearance"), None);
+        settings::form_row(ui, tr(self.state(), "language"), None, |ui| {
+            let previous_language = self.state().language;
+            let mut language = previous_language;
             settings::segmented(
                 ui,
-                &mut self.state.language,
+                &mut language,
                 &[
                     (Language::English, "English"),
                     (Language::SimplifiedChinese, "简体中文"),
                 ],
             );
-            if self.state.language != previous_language {
-                self.intents
-                    .push(UiIntent::SetLanguage(self.state.language));
+            if language != previous_language {
+                self.apply(Action::SetLanguage(language));
+                self.intents.push(UiIntent::SetLanguage(language));
             }
         });
 
         settings::section_header(
             ui,
-            tr(&self.state, "context"),
-            Some(tr(&self.state, "context-help")),
+            tr(self.state(), "context"),
+            Some(tr(self.state(), "context-help")),
         );
         settings::form_row(
             ui,
-            tr(&self.state, "auto-compaction"),
-            Some(tr(&self.state, "auto-compaction-help")),
+            tr(self.state(), "auto-compaction"),
+            Some(tr(self.state(), "auto-compaction-help")),
             |ui| {
-                let mut enabled = self.state.auto_compaction_enabled;
+                let mut enabled = self.state().auto_compaction_enabled;
                 if ui
                     .add_sized(
                         [settings::control_width(ui), settings::control_height()],
-                        Checkbox::new(&mut enabled, tr(&self.state, "auto-compaction")),
+                        Checkbox::new(&mut enabled, tr(self.state(), "auto-compaction")),
                     )
                     .changed()
                 {
@@ -2065,33 +2090,35 @@ impl Workbench {
 
         settings::section_header(
             ui,
-            tr(&self.state, "bash-policy"),
-            Some(tr(&self.state, "bash-help")),
+            tr(self.state(), "bash-policy"),
+            Some(tr(self.state(), "bash-help")),
         );
-        settings::form_row(ui, tr(&self.state, "command-policy"), None, |ui| {
-            let mut policy = self.state.bash_policy;
+        settings::form_row(ui, tr(self.state(), "command-policy"), None, |ui| {
+            let mut policy = self.state().bash_policy;
             settings::segmented(
                 ui,
                 &mut policy,
                 &[
-                    (BashPolicy::Allow, tr(&self.state, "allow")),
-                    (BashPolicy::Ask, tr(&self.state, "ask")),
-                    (BashPolicy::Deny, tr(&self.state, "deny")),
+                    (BashPolicy::Allow, tr(self.state(), "allow")),
+                    (BashPolicy::Ask, tr(self.state(), "ask")),
+                    (BashPolicy::Deny, tr(self.state(), "deny")),
                 ],
             );
-            if policy != self.state.bash_policy {
-                self.state.dispatch(Action::SetBashPolicy(policy));
+            if policy != self.state().bash_policy {
+                self.apply(Action::SetBashPolicy(policy));
                 self.intents.push(UiIntent::SetBashPolicy(policy));
             }
         });
         settings::form_row(
             ui,
-            tr(&self.state, "blocked-patterns"),
-            Some(tr(&self.state, "blocked-patterns-help")),
+            tr(self.state(), "blocked-patterns"),
+            Some(tr(self.state(), "blocked-patterns-help")),
             |ui| {
+                let stored_patterns = self.state().bash_blocked_patterns.join("\n");
+                let apply_label = tr(self.state(), "apply-command-filters");
                 let blocked_patterns = self
                     .bash_blocked_patterns_draft
-                    .get_or_insert_with(|| self.state.bash_blocked_patterns.join("\n"));
+                    .get_or_insert(stored_patterns);
                 ui.add_sized(
                     [settings::control_width(ui), 96.0],
                     TextEdit::multiline(blocked_patterns)
@@ -2100,7 +2127,7 @@ impl Workbench {
                         .desired_width(settings::control_width(ui)),
                 );
                 ui.add_space(6.0);
-                if settings::action_button(ui, tr(&self.state, "apply-command-filters")).clicked() {
+                if settings::action_button(ui, apply_label).clicked() {
                     self.intents.push(UiIntent::SetBashBlockedPatterns(
                         blocked_patterns.lines().map(str::to_owned).collect(),
                     ));
@@ -2110,17 +2137,17 @@ impl Workbench {
 
         settings::section_header(
             ui,
-            tr(&self.state, "agent-team"),
-            Some(tr(&self.state, "agent-team-help")),
+            tr(self.state(), "agent-team"),
+            Some(tr(self.state(), "agent-team-help")),
         );
-        let mut team_config = self.state.agent_team_config.clone();
-        settings::form_row(ui, tr(&self.state, "max-agent-depth"), None, |ui| {
+        let mut team_config = self.state().agent_team_config.clone();
+        settings::form_row(ui, tr(self.state(), "max-agent-depth"), None, |ui| {
             settings::compact_control(
                 ui,
                 DragValue::new(&mut team_config.max_depth).range(1..=MAX_AGENT_DEPTH),
             );
         });
-        settings::form_row(ui, tr(&self.state, "max-agents-per-level"), None, |ui| {
+        settings::form_row(ui, tr(self.state(), "max-agents-per-level"), None, |ui| {
             settings::compact_control(
                 ui,
                 DragValue::new(&mut team_config.max_agents_per_level)
@@ -2128,36 +2155,36 @@ impl Workbench {
             );
         });
         team_config = team_config.normalized();
-        if team_config != self.state.agent_team_config {
-            self.state
-                .dispatch(Action::SetAgentTeamConfig(team_config.clone()));
+        if team_config != self.state().agent_team_config {
+            self.apply(Action::SetAgentTeamConfig(team_config.clone()));
             self.intents.push(UiIntent::SetAgentTeamConfig(team_config));
         }
 
-        settings::section_header(ui, tr(&self.state, "queue-mode"), None);
-        let mut steering_mode = self.state.steering_mode;
-        let mut follow_up_mode = self.state.follow_up_mode;
-        settings::form_row(ui, tr(&self.state, "steer-mode"), None, |ui| {
+        settings::section_header(ui, tr(self.state(), "queue-mode"), None);
+        let mut steering_mode = self.state().steering_mode;
+        let mut follow_up_mode = self.state().follow_up_mode;
+        settings::form_row(ui, tr(self.state(), "steer-mode"), None, |ui| {
             settings::segmented(
                 ui,
                 &mut steering_mode,
                 &[
-                    (QueueMode::OneAtATime, tr(&self.state, "one-at-a-time")),
-                    (QueueMode::All, tr(&self.state, "all")),
+                    (QueueMode::OneAtATime, tr(self.state(), "one-at-a-time")),
+                    (QueueMode::All, tr(self.state(), "all")),
                 ],
             );
         });
-        settings::form_row(ui, tr(&self.state, "follow-up-mode"), None, |ui| {
+        settings::form_row(ui, tr(self.state(), "follow-up-mode"), None, |ui| {
             settings::segmented(
                 ui,
                 &mut follow_up_mode,
                 &[
-                    (QueueMode::OneAtATime, tr(&self.state, "one-at-a-time")),
-                    (QueueMode::All, tr(&self.state, "all")),
+                    (QueueMode::OneAtATime, tr(self.state(), "one-at-a-time")),
+                    (QueueMode::All, tr(self.state(), "all")),
                 ],
             );
         });
-        if steering_mode != self.state.steering_mode || follow_up_mode != self.state.follow_up_mode
+        if steering_mode != self.state().steering_mode
+            || follow_up_mode != self.state().follow_up_mode
         {
             self.intents.push(UiIntent::SetQueueModes {
                 steering: steering_mode,
@@ -2170,24 +2197,24 @@ impl Workbench {
     fn provider_settings(&mut self, ui: &mut Ui) {
         settings::page_header(
             ui,
-            tr(&self.state, "providers"),
-            Some(tr(&self.state, "providers-help")),
+            tr(self.state(), "providers"),
+            Some(tr(self.state(), "providers-help")),
         );
 
-        settings::section_header(ui, tr(&self.state, "configured-providers"), None);
+        settings::section_header(ui, tr(self.state(), "configured-providers"), None);
         settings::control_row(ui, |ui| {
             let selector_width = settings::inline_leading_width(ui, settings::control_height());
             let selected_name = self
                 .provider_draft
                 .id
                 .and_then(|id| {
-                    self.state
+                    self.state()
                         .provider_profiles
                         .iter()
                         .find(|profile| profile.id == id)
                 })
-                .map(|profile| profile.name.as_str())
-                .unwrap_or_else(|| tr(&self.state, "add-provider"));
+                .map(|profile| profile.name.clone())
+                .unwrap_or_else(|| tr(self.state(), "add-provider").to_owned());
             let mut selected_profile = None;
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = settings::inline_gap();
@@ -2195,7 +2222,7 @@ impl Workbench {
                     .width(selector_width)
                     .selected_text(selected_name)
                     .show_ui(ui, |ui| {
-                        for profile in self.state.provider_profiles.clone() {
+                        for profile in self.state().provider_profiles.clone() {
                             let selected = self.provider_draft.id == Some(profile.id);
                             if ui.selectable_label(selected, &profile.name).clicked() {
                                 selected_profile = Some(profile);
@@ -2205,7 +2232,7 @@ impl Workbench {
                 if icons::button(
                     ui,
                     icons::Icon::Plus,
-                    tr(&self.state, "add-provider"),
+                    tr(self.state(), "add-provider"),
                     Vec2::splat(settings::control_height()),
                     true,
                 )
@@ -2221,10 +2248,10 @@ impl Workbench {
 
         settings::section_header(
             ui,
-            tr(&self.state, "connection"),
-            Some(tr(&self.state, "connection-help")),
+            tr(self.state(), "connection"),
+            Some(tr(self.state(), "connection-help")),
         );
-        settings::form_row(ui, tr(&self.state, "preset"), None, |ui| {
+        settings::form_row(ui, tr(self.state(), "preset"), None, |ui| {
             let mut preset = self.provider_draft.preset;
             egui::ComboBox::from_id_salt("provider-preset")
                 .width(settings::control_width(ui))
@@ -2241,11 +2268,11 @@ impl Workbench {
         });
         let draft_name_key = provider_name_key(&self.provider_draft.name);
         let duplicate_provider_name = !draft_name_key.is_empty()
-            && self.state.provider_profiles.iter().any(|profile| {
+            && self.state().provider_profiles.iter().any(|profile| {
                 Some(profile.id) != self.provider_draft.id
                     && provider_name_key(&profile.name) == draft_name_key
             });
-        settings::form_row(ui, tr(&self.state, "provider-name"), None, |ui| {
+        settings::form_row(ui, tr(self.state(), "provider-name"), None, |ui| {
             settings::sized_control(
                 ui,
                 TextEdit::singleline(&mut self.provider_draft.name)
@@ -2253,7 +2280,7 @@ impl Workbench {
             );
             if duplicate_provider_name {
                 ui.label(
-                    RichText::new(tr(&self.state, "provider-name-duplicate"))
+                    RichText::new(tr(self.state(), "provider-name-duplicate"))
                         .small()
                         .color(ERROR_STRONG),
                 );
@@ -2266,7 +2293,7 @@ impl Workbench {
                     .desired_width(settings::control_width(ui)),
             );
         });
-        settings::form_row(ui, tr(&self.state, "protocol"), None, |ui| {
+        settings::form_row(ui, tr(self.state(), "protocol"), None, |ui| {
             let old_protocol = self.provider_draft.protocol;
             egui::ComboBox::from_id_salt("provider-protocol")
                 .width(settings::control_width(ui))
@@ -2290,12 +2317,12 @@ impl Workbench {
         settings::form_row(
             ui,
             "API Key",
-            Some(tr(&self.state, "provider-help")),
+            Some(tr(self.state(), "provider-help")),
             |ui| {
                 let key_hint = if self.provider_draft.has_api_key {
-                    tr(&self.state, "key-stored")
+                    tr(self.state(), "key-stored")
                 } else {
-                    tr(&self.state, "key-required")
+                    tr(self.state(), "key-required")
                 };
                 settings::sized_control(
                     ui,
@@ -2314,14 +2341,14 @@ impl Workbench {
 
         settings::section_header(
             ui,
-            tr(&self.state, "models"),
-            Some(tr(&self.state, "models-help")),
+            tr(self.state(), "models"),
+            Some(tr(self.state(), "models-help")),
         );
         settings::control_row(ui, |ui| {
             let can_discover = !self.provider_draft.base_url.trim().is_empty();
             if ui
                 .add_enabled_ui(can_discover, |ui| {
-                    settings::action_button(ui, tr(&self.state, "discover-models"))
+                    settings::action_button(ui, tr(self.state(), "discover-models"))
                 })
                 .inner
                 .clicked()
@@ -2339,17 +2366,18 @@ impl Workbench {
             let model_input_width =
                 settings::inline_leading_width(ui, settings::action_button_width());
             let mut add_model_clicked = false;
+            let model_id_hint = tr(self.state(), "model-id");
+            let add_model_label = tr(self.state(), "add-model");
             let model_id_input = ui
                 .horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = settings::inline_gap();
                     let input = ui.add_sized(
                         [model_input_width, settings::control_height()],
                         TextEdit::singleline(&mut self.provider_draft.manual_model_id)
-                            .hint_text(tr(&self.state, "model-id"))
+                            .hint_text(model_id_hint)
                             .desired_width(model_input_width),
                     );
-                    add_model_clicked =
-                        settings::action_button(ui, tr(&self.state, "add-model")).clicked();
+                    add_model_clicked = settings::action_button(ui, add_model_label).clicked();
                     input
                 })
                 .inner;
@@ -2373,7 +2401,7 @@ impl Workbench {
         });
         if self.provider_draft.models.is_empty() {
             settings::control_row(ui, |ui| {
-                ui.label(RichText::new(tr(&self.state, "no-models")).color(MUTED_INK));
+                ui.label(RichText::new(tr(self.state(), "no-models")).color(MUTED_INK));
             });
         } else {
             let mut remove = None;
@@ -2427,7 +2455,7 @@ impl Workbench {
                             if icons::button(
                                 ui,
                                 icons::Icon::Close,
-                                tr(&self.state, "remove-model"),
+                                tr(self.state(), "remove-model"),
                                 Vec2::splat(settings::control_height()),
                                 false,
                             )
@@ -2459,7 +2487,7 @@ impl Workbench {
                 if let Some(id) = self.provider_draft.id
                     && settings::action_button(
                         ui,
-                        RichText::new(tr(&self.state, "delete-provider")).color(ERROR_STRONG),
+                        RichText::new(tr(self.state(), "delete-provider")).color(ERROR_STRONG),
                     )
                     .clicked()
                 {
@@ -2469,7 +2497,7 @@ impl Workbench {
                 ui.add_space(spacer);
                 if ui
                     .add_enabled_ui(can_save, |ui| {
-                        settings::action_button(ui, tr(&self.state, "save-and-apply"))
+                        settings::action_button(ui, tr(self.state(), "save-and-apply"))
                     })
                     .inner
                     .clicked()
@@ -2484,15 +2512,21 @@ impl Workbench {
     fn web_search_settings(&mut self, ui: &mut Ui) {
         settings::page_header(
             ui,
-            tr(&self.state, "web-search"),
-            Some(tr(&self.state, "web-search-help")),
+            tr(self.state(), "web-search"),
+            Some(tr(self.state(), "web-search-help")),
         );
-        settings::section_header(ui, tr(&self.state, "search-engines"), None);
+        settings::section_header(ui, tr(self.state(), "search-engines"), None);
 
         let mut select = None;
         let mut remove = None;
         let mut move_engine = None;
-        for (index, profile) in self.state.search_engine_profiles.clone().iter().enumerate() {
+        for (index, profile) in self
+            .state()
+            .search_engine_profiles
+            .clone()
+            .iter()
+            .enumerate()
+        {
             settings::control_row(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = settings::inline_gap();
@@ -2510,7 +2544,7 @@ impl Workbench {
                             remove = Some(index);
                         }
                         if ui.small_button("v").clicked()
-                            && index + 1 < self.state.search_engine_profiles.len()
+                            && index + 1 < self.state().search_engine_profiles.len()
                         {
                             move_engine = Some((index, index + 1));
                         }
@@ -2525,24 +2559,24 @@ impl Workbench {
             self.search_engine_draft = SearchEngineDraft::from_profile(&profile);
         }
         if let Some(index) = remove {
-            let mut profiles = self.state.search_engine_profiles.clone();
+            let mut profiles = self.state().search_engine_profiles.clone();
             profiles.remove(index);
             self.search_engine_draft = SearchEngineDraft::default();
             self.intents.push(UiIntent::SaveSearchEngines(profiles));
         }
         if let Some((from, to)) = move_engine {
-            let mut profiles = self.state.search_engine_profiles.clone();
+            let mut profiles = self.state().search_engine_profiles.clone();
             profiles.swap(from, to);
             self.intents.push(UiIntent::SaveSearchEngines(profiles));
         }
         settings::control_row(ui, |ui| {
-            if settings::action_button(ui, tr(&self.state, "add-search-engine")).clicked() {
+            if settings::action_button(ui, tr(self.state(), "add-search-engine")).clicked() {
                 self.search_engine_draft = SearchEngineDraft::default();
             }
         });
 
-        settings::section_header(ui, tr(&self.state, "search-engine-details"), None);
-        settings::form_row(ui, tr(&self.state, "provider-name"), None, |ui| {
+        settings::section_header(ui, tr(self.state(), "search-engine-details"), None);
+        settings::form_row(ui, tr(self.state(), "provider-name"), None, |ui| {
             settings::sized_control(
                 ui,
                 TextEdit::singleline(&mut self.search_engine_draft.name)
@@ -2552,7 +2586,7 @@ impl Workbench {
         settings::form_row(
             ui,
             "Base URL",
-            Some(tr(&self.state, "searxng-url-help")),
+            Some(tr(self.state(), "searxng-url-help")),
             |ui| {
                 settings::sized_control(
                     ui,
@@ -2562,17 +2596,15 @@ impl Workbench {
                 );
             },
         );
-        settings::form_row(ui, tr(&self.state, "enabled"), None, |ui| {
-            ui.checkbox(
-                &mut self.search_engine_draft.enabled,
-                tr(&self.state, "enabled"),
-            );
+        let enabled_label = tr(self.state(), "enabled");
+        settings::form_row(ui, enabled_label, None, |ui| {
+            ui.checkbox(&mut self.search_engine_draft.enabled, enabled_label);
         });
 
         settings::control_row(ui, |ui| {
-            let mut profiles = self.state.search_engine_profiles.clone();
+            let mut profiles = self.state().search_engine_profiles.clone();
             let profile = self.search_engine_draft.to_profile(profiles.len() as u32);
-            if settings::action_button(ui, tr(&self.state, "save-search-engine")).clicked() {
+            if settings::action_button(ui, tr(self.state(), "save-search-engine")).clicked() {
                 if let Some(index) = profiles
                     .iter()
                     .position(|existing| existing.id == profile.id)
@@ -2584,7 +2616,7 @@ impl Workbench {
                 self.intents.push(UiIntent::SaveSearchEngines(profiles));
             }
             ui.add_space(settings::inline_gap());
-            if settings::action_button(ui, tr(&self.state, "test-search-engine")).clicked() {
+            if settings::action_button(ui, tr(self.state(), "test-search-engine")).clicked() {
                 self.intents.push(UiIntent::TestSearchEngine(profile));
             }
         });
@@ -2596,12 +2628,12 @@ impl Workbench {
             return;
         };
         let mut open = true;
-        egui::Window::new(tr(&self.state, "rename-session"))
+        egui::Window::new(tr(self.state(), "rename-session"))
             .open(&mut open)
             .collapsible(false)
             .show(context, |ui| {
                 ui.add(TextEdit::singleline(&mut self.rename_session_title).desired_width(300.0));
-                if ui.button(tr(&self.state, "save")).clicked()
+                if ui.button(tr(self.state(), "save")).clicked()
                     && !self.rename_session_title.trim().is_empty()
                 {
                     let title = std::mem::take(&mut self.rename_session_title);
