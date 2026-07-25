@@ -10,6 +10,7 @@
 
 pub mod chat;
 pub mod chrome;
+pub mod dialogs;
 pub mod elements;
 pub mod fonts;
 pub mod icons;

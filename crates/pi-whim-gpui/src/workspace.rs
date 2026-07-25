@@ -15,6 +15,8 @@ use pi_whim_core::{
     Action, AppState, ConversationItem, ConversationRole, ModelOption, ProjectId, QueueMode,
     SessionStatus, ThinkingLevel, stable_session_id,
 };
+use pi_whim_engine::dialogs::{Answer, Prompt};
+use pi_whim_engine::notice::Outbox;
 use pi_whim_engine::slash_commands::SlashCommand;
 use pi_whim_engine::state::{EngineState, ViewEffect};
 use pi_whim_theme::{ThemeMode, ThemePreference, Tokens, text};
@@ -25,6 +27,7 @@ use crate::{
         Palette, PaletteEvent, Sidebar, SidebarEvent,
     },
     chrome::{Banner, TopBar},
+    dialogs::{PromptEvent, Prompts, Rename, RenameEvent},
     elements::GraphPaper,
     theme::IntoHsla,
 };
@@ -53,6 +56,23 @@ pub enum Request {
     /// Run a slash command. Every one of these needs the store, the clipboard, or
     /// an RPC, so the shell does not try to interpret them.
     RunCommand(SlashCommand),
+    /// Show a project's folder in Finder.
+    RevealProject(ProjectId),
+    /// Forget a project. Its sessions stop; the folder on disk is left alone.
+    RemoveProject(ProjectId),
+    /// Store a new title for the session at `path`.
+    RenameSession {
+        path: String,
+        title: String,
+    },
+    /// Copy the visible session's transcript into a new one.
+    CloneSession,
+    /// Put text on the clipboard.
+    CopyToClipboard(String),
+    /// Move a session's transcript to the trash.
+    DeleteSession(String),
+    /// Send a decision back to the agent that asked for it.
+    AnswerPrompt(Answer),
 }
 
 /// The application shell.
@@ -65,6 +85,14 @@ pub struct Workspace {
     composer: Entity<Composer>,
     controls: Entity<Controls>,
     palette: Entity<Palette>,
+    prompts: Entity<Prompts>,
+    rename: Entity<Rename>,
+    /// Messages waiting to be shown.
+    ///
+    /// Held rather than pushed straight to the window because the shell is
+    /// reachable without one — the app can report a failure before the first
+    /// render — and because the notification stack lives on the window, not here.
+    notices: Outbox,
     /// Projects whose sessions are listed. View-local: which projects a reader
     /// has open says nothing about the session.
     expanded_projects: BTreeSet<ProjectId>,
@@ -121,6 +149,29 @@ impl Workspace {
         })
         .detach();
 
+        let prompts = cx.new(|_| Prompts::new(tokens));
+        cx.subscribe(&prompts, |workspace, _, event, cx| {
+            let PromptEvent::Answered(answer) = event;
+            // Straight through: the shell has no session pool, and an unanswered
+            // question leaves the agent that asked it blocked.
+            workspace
+                .requests
+                .push(Request::AnswerPrompt(answer.clone()));
+            cx.notify();
+        })
+        .detach();
+
+        let rename = cx.new(|cx| Rename::new(tokens, window, cx));
+        cx.subscribe(&rename, |workspace, _, event, cx| {
+            let RenameEvent::Renamed { path, title } = event;
+            workspace.requests.push(Request::RenameSession {
+                path: path.clone(),
+                title: title.clone(),
+            });
+            cx.notify();
+        })
+        .detach();
+
         Self {
             preference,
             tokens,
@@ -130,9 +181,42 @@ impl Workspace {
             composer,
             controls,
             palette,
+            prompts,
+            rename,
+            notices: Outbox::new(),
             expanded_projects: BTreeSet::new(),
             requests: Vec::new(),
         }
+    }
+
+    /// Queue a question from the agent.
+    ///
+    /// Takes a parsed [`Prompt`]: reading the wire request is `engine::dialogs`'
+    /// job, and this crate has no `serde_json` on purpose.
+    pub fn ask(&mut self, prompt: Prompt, cx: &mut Context<Self>) {
+        self.prompts
+            .update(cx, |prompts, cx| prompts.push(prompt, cx));
+        cx.notify();
+    }
+
+    /// Drop the questions a session asked, because it has gone.
+    pub fn forget_session(&mut self, session_key: &str, cx: &mut Context<Self>) {
+        self.prompts.update(cx, |prompts, cx| {
+            prompts.forget_session(session_key, cx);
+        });
+        cx.notify();
+    }
+
+    /// Report a failure to the user.
+    pub fn report_error(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
+        self.notices.error(message);
+        cx.notify();
+    }
+
+    /// Tell the user something that is not a failure.
+    pub fn report_info(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
+        self.notices.info(message);
+        cx.notify();
     }
 
     /// Take the requests the views have raised since the last drain.
@@ -172,6 +256,21 @@ impl Workspace {
                 self.engine.apply(Action::SelectProject(project_id));
                 self.engine
                     .apply(Action::SelectSession(stable_session_id(&pi_path)));
+            }
+            // The rest of the row menu is the backend's: Finder, the store, the
+            // clipboard, and the trash all sit behind the boundary this crate
+            // does not cross.
+            SidebarEvent::RevealProject(id) => self.requests.push(Request::RevealProject(id)),
+            SidebarEvent::RemoveProject(id) => self.requests.push(Request::RemoveProject(id)),
+            SidebarEvent::CloneSession => self.requests.push(Request::CloneSession),
+            SidebarEvent::CopySessionId(id) => {
+                self.requests.push(Request::CopyToClipboard(id.to_string()))
+            }
+            SidebarEvent::DeleteSession(path) => self.requests.push(Request::DeleteSession(path)),
+            SidebarEvent::RenameSession { pi_path, title } => {
+                self.rename.update(cx, |rename, cx| {
+                    rename.open(pi_path, &title, window, cx);
+                });
             }
         }
         self.sync_views(window, cx);
@@ -337,6 +436,11 @@ impl Workspace {
             controls.set_tokens(tokens, cx);
             controls.sync(&state, window, cx);
         });
+
+        self.prompts
+            .update(cx, |prompts, cx| prompts.set_tokens(tokens, cx));
+        self.rename
+            .update(cx, |rename, cx| rename.set_tokens(tokens, cx));
     }
 
     /// Read-only domain state, for rendering.
@@ -428,8 +532,14 @@ fn toggle_expanded(expanded: &mut BTreeSet<ProjectId>, id: ProjectId) -> bool {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = self.tokens;
+        // Drained here rather than at the report site: pushing onto the window's
+        // notification stack needs a window, and callers report failures from
+        // places that have none — including before the first render.
+        if !self.notices.is_empty() {
+            crate::dialogs::show_notices(&mut self.notices, window, cx);
+        }
         let state = self.engine.get();
         let status = state.session_status.clone();
 
@@ -510,6 +620,10 @@ impl Render for Workspace {
                             ),
                     ),
             )
+            // Modals last, so they paint over the panes. Each renders nothing
+            // when it has nothing to ask.
+            .child(self.prompts.clone())
+            .child(self.rename.clone())
     }
 }
 

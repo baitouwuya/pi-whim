@@ -14,6 +14,9 @@ pi-whim-theme = { path = "../pi-whim-theme" }
 
 [dev-dependencies]
 pi-whim-core = { path = "../pi-whim-core" }
+# Only the example needs this: it fakes a wire request so the prompt dialog is on
+# screen. The crate itself never parses JSON — the engine does.
+serde_json.workspace = true
 uuid.workspace = true
 gpui_platform.workspace = true
 gpui-component-assets.workspace = true

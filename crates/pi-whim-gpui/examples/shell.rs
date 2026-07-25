@@ -10,6 +10,7 @@ use pi_whim_core::{
     Action, ConversationItem, ConversationRole, ModelOption, Project, QueueMode, SessionStatus,
     SessionSummary, ThinkingLevel, stable_session_id,
 };
+use pi_whim_engine::dialogs::Prompt;
 use pi_whim_gpui::Workspace;
 use pi_whim_theme::ThemePreference;
 use uuid::Uuid;
@@ -45,6 +46,23 @@ fn seed(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspa
     );
     workspace.apply(Action::SelectProject(project_id), window, cx);
     workspace.apply(Action::SetSessionStatus(SessionStatus::Ready), window, cx);
+
+    // One question waiting, so the chooser is on screen for the visual check.
+    // Answering it or pressing Escape closes it; right-clicking a sidebar row
+    // reaches the rest of the dialog layer.
+    if let Some(prompt) = Prompt::from_interaction(
+        pi_path,
+        &serde_json::json!({
+            "request_id": "int-1",
+            "kind": "approval",
+            "title": "Sub-agent wants to write",
+            "message": "Write to crates/pi-whim-gpui/src/workspace.rs?",
+            "options": ["approve", "deny"],
+        }),
+    ) {
+        workspace.ask(prompt, cx);
+    }
+    workspace.report_info("Share URL: https://gist.github.com/example", cx);
 
     // Two providers, so the picker shows its grouping, and one model whose id
     // matches its name, so the reserved second line is visible in both states.

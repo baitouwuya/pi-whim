@@ -12,8 +12,9 @@ use gpui::{
 use gpui_component::{
     Icon, Sizable,
     button::{Button, ButtonVariants},
+    menu::{ContextMenuExt, PopupMenuItem},
 };
-use pi_whim_core::ProjectId;
+use pi_whim_core::{ProjectId, SessionId};
 use pi_whim_theme::{Tokens, font, layout, radius, text};
 
 use crate::{chat::Row, icons, theme::IntoHsla};
@@ -42,6 +43,50 @@ pub enum SidebarEvent {
         project_id: ProjectId,
         pi_path: String,
     },
+    /// Show the project's folder in Finder.
+    RevealProject(ProjectId),
+    /// Forget a project, which stops its sessions but leaves the folder alone.
+    RemoveProject(ProjectId),
+    /// Give the session at `pi_path` a new title, starting from `title`.
+    RenameSession { pi_path: String, title: String },
+    /// Copy the visible session's transcript into a new one.
+    CloneSession,
+    /// Put the session id on the clipboard.
+    CopySessionId(SessionId),
+    /// Move the session's transcript to the trash.
+    DeleteSession(String),
+}
+
+/// What a row's context menu offers, in order.
+///
+/// Split out as a pure function so the menu can be asserted without a window:
+/// what a right-click can reach is the part worth pinning, not how it is drawn.
+fn row_actions(row: &Row) -> Vec<(&'static str, SidebarEvent)> {
+    match row {
+        Row::Project { id, .. } => vec![
+            ("Show in Finder", SidebarEvent::RevealProject(*id)),
+            ("Remove", SidebarEvent::RemoveProject(*id)),
+        ],
+        Row::Session {
+            id, pi_path, title, ..
+        } => vec![
+            (
+                "Rename",
+                SidebarEvent::RenameSession {
+                    pi_path: pi_path.clone(),
+                    title: title.clone(),
+                },
+            ),
+            ("Clone session", SidebarEvent::CloneSession),
+            ("Copy session ID", SidebarEvent::CopySessionId(*id)),
+            // Last, and separated from the rest by being last: it moves the
+            // transcript to the trash.
+            (
+                "Move to trash",
+                SidebarEvent::DeleteSession(pi_path.clone()),
+            ),
+        ],
+    }
 }
 
 /// The project and session list.
@@ -249,6 +294,23 @@ impl Sidebar {
             .on_click(cx.listener(move |_, _, _, cx| {
                 cx.emit(event.clone());
             }))
+            // Right-click reaches everything a row can do beyond opening it.
+            // These were the only way to rename, clone, or delete a session in
+            // the egui build too; keeping them here means no second surface for
+            // per-row actions.
+            .context_menu({
+                let entity = cx.entity();
+                let actions = row_actions(row);
+                move |menu, _, _| {
+                    actions.iter().fold(menu, |menu, (label, event)| {
+                        let entity = entity.clone();
+                        let event = event.clone();
+                        menu.item(PopupMenuItem::new(*label).on_click(move |_, _, cx| {
+                            entity.update(cx, |_, cx| cx.emit(event.clone()));
+                        }))
+                    })
+                }
+            })
             .into_any_element()
     }
 }
@@ -331,5 +393,80 @@ mod tests {
             panic!("expected a session event");
         };
         assert_eq!(pi_path, "/tmp/a.jsonl");
+    }
+
+    fn project_row() -> Row {
+        Row::Project {
+            id: uuid::Uuid::new_v4(),
+            name: "pi-whim".into(),
+            expanded: true,
+            running: false,
+            selected: false,
+        }
+    }
+
+    fn session_row() -> Row {
+        Row::Session {
+            id: uuid::Uuid::new_v4(),
+            project_id: uuid::Uuid::new_v4(),
+            pi_path: "/tmp/a.jsonl".into(),
+            title: "Migrate the UI".into(),
+            running: false,
+            selected: false,
+        }
+    }
+
+    #[test]
+    fn a_project_and_a_session_offer_different_actions() {
+        // Renaming a project or cloning it would mean nothing; the row menu is
+        // the only place either kind's actions are reachable.
+        let project: Vec<_> = row_actions(&project_row())
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect();
+        let session: Vec<_> = row_actions(&session_row())
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect();
+
+        assert_eq!(project, vec!["Show in Finder", "Remove"]);
+        assert_eq!(
+            session,
+            vec![
+                "Rename",
+                "Clone session",
+                "Copy session ID",
+                "Move to trash"
+            ]
+        );
+    }
+
+    #[test]
+    fn renaming_starts_from_the_title_the_session_has() {
+        // Most renames edit an auto-generated title, so the dialog opens seeded
+        // rather than blank.
+        let actions = row_actions(&session_row());
+        let (_, event) = &actions[0];
+        let SidebarEvent::RenameSession { pi_path, title } = event else {
+            panic!("expected a rename event");
+        };
+        assert_eq!(pi_path, "/tmp/a.jsonl");
+        assert_eq!(title, "Migrate the UI");
+    }
+
+    #[test]
+    fn moving_a_session_to_the_trash_is_last() {
+        // It is the one entry that destroys something, so it does not sit next to
+        // the ones that do not.
+        let actions = row_actions(&session_row());
+        let (label, _) = actions.last().expect("a last action");
+        assert_eq!(*label, "Move to trash");
+    }
+
+    #[test]
+    fn every_row_offers_something() {
+        // A right-click that opens an empty menu reads as a broken control.
+        assert!(!row_actions(&project_row()).is_empty());
+        assert!(!row_actions(&session_row()).is_empty());
     }
 }

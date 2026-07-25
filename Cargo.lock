@@ -5671,6 +5671,7 @@ dependencies = [
  "pi-whim-core",
  "pi-whim-engine",
  "pi-whim-theme",
+ "serde_json",
  "uuid",
 ]
 
