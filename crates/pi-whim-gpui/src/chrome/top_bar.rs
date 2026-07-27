@@ -5,7 +5,7 @@ use gpui::{
     prelude::FluentBuilder, px, rems,
 };
 use gpui_component::button::{Button, ButtonVariants};
-use pi_whim_core::{SessionMetrics, SessionStatus};
+use pi_whim_core::{Language, SessionMetrics, SessionStatus, strings::text as translate};
 use pi_whim_theme::{ThemeMode, Tokens, text};
 
 use crate::{
@@ -22,6 +22,9 @@ type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 pub struct TopBar {
     status: SessionStatus,
     mode: ThemeMode,
+    /// Passed in rather than held: this is rebuilt on every render, so there is no
+    /// state here to keep in step with the snapshot.
+    language: Language,
     tokens: Tokens,
     /// What the visible session has cost, once it has reported anything.
     meter: Option<SessionMeter>,
@@ -30,10 +33,11 @@ pub struct TopBar {
 }
 
 impl TopBar {
-    pub fn new(status: SessionStatus, mode: ThemeMode, tokens: Tokens) -> Self {
+    pub fn new(status: SessionStatus, mode: ThemeMode, language: Language, tokens: Tokens) -> Self {
         Self {
             status,
             mode,
+            language,
             tokens,
             meter: None,
             on_toggle_theme: None,
@@ -68,10 +72,11 @@ impl TopBar {
 
     /// Tooltip for the theme toggle, naming where it goes rather than where it is.
     fn theme_toggle_tooltip(&self) -> &'static str {
-        match self.mode {
-            ThemeMode::Light => "Switch to dark",
-            ThemeMode::Dark => "Switch to light",
-        }
+        let key = match self.mode {
+            ThemeMode::Light => "switch-to-dark",
+            ThemeMode::Dark => "switch-to-light",
+        };
+        translate(key, self.language)
     }
 }
 
@@ -90,7 +95,7 @@ impl RenderOnce for TopBar {
         let mut settings_button = Button::new("open-settings")
             .ghost()
             .icon(icons::settings())
-            .tooltip("Settings");
+            .tooltip(translate("settings", self.language));
         if let Some(handler) = self.on_open_settings {
             settings_button = settings_button.on_click(handler);
         }
@@ -112,7 +117,7 @@ impl RenderOnce for TopBar {
                     .text_color(tokens.text.hsla())
                     .child("Pi-Whim"),
             )
-            .child(StatusPill::new(self.status, tokens))
+            .child(StatusPill::new(self.status, self.language, tokens))
             // Push the controls to the trailing edge.
             .child(div().flex_1())
             .when_some(self.meter, |this, meter| this.child(meter))
@@ -128,23 +133,52 @@ mod tests {
     #[test]
     fn the_theme_toggle_tooltip_names_its_destination() {
         // The tooltip says what you get, not what you have.
-        let light = TopBar::new(SessionStatus::Ready, ThemeMode::Light, Tokens::light());
+        let light = TopBar::new(
+            SessionStatus::Ready,
+            ThemeMode::Light,
+            Language::English,
+            Tokens::light(),
+        );
         assert_eq!(light.theme_toggle_tooltip(), "Switch to dark");
 
-        let dark = TopBar::new(SessionStatus::Ready, ThemeMode::Dark, Tokens::dark());
+        let dark = TopBar::new(
+            SessionStatus::Ready,
+            ThemeMode::Dark,
+            Language::English,
+            Tokens::dark(),
+        );
         assert_eq!(dark.theme_toggle_tooltip(), "Switch to light");
+
+        // And it follows the language, like every other label.
+        let chinese = TopBar::new(
+            SessionStatus::Ready,
+            ThemeMode::Light,
+            Language::SimplifiedChinese,
+            Tokens::light(),
+        );
+        assert_eq!(chinese.theme_toggle_tooltip(), "切换到深色");
     }
 
     #[test]
     fn handlers_are_optional() {
         // The preview harness renders the bar without wiring anything up.
-        let bar = TopBar::new(SessionStatus::Offline, ThemeMode::Light, Tokens::light());
+        let bar = TopBar::new(
+            SessionStatus::Offline,
+            ThemeMode::Light,
+            Language::English,
+            Tokens::light(),
+        );
         assert!(bar.on_toggle_theme.is_none());
         assert!(bar.on_open_settings.is_none());
 
-        let wired = TopBar::new(SessionStatus::Offline, ThemeMode::Light, Tokens::light())
-            .on_toggle_theme(|_, _, _| {})
-            .on_open_settings(|_, _, _| {});
+        let wired = TopBar::new(
+            SessionStatus::Offline,
+            ThemeMode::Light,
+            Language::English,
+            Tokens::light(),
+        )
+        .on_toggle_theme(|_, _, _| {})
+        .on_open_settings(|_, _, _| {});
         assert!(wired.on_toggle_theme.is_some());
         assert!(wired.on_open_settings.is_some());
     }

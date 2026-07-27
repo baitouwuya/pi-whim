@@ -60,7 +60,14 @@ pub fn render(
             tokens,
         ))
         .child(provider_list(state, draft, tokens, emit.clone()))
-        .child(form::section_header(tr(state, "connection"), None, tokens))
+        // Where the key ends up is worth saying next to the field that takes it:
+        // a reader typing a secret into a form wants to know it is not going into
+        // the database beside it.
+        .child(form::section_header(
+            tr(state, "connection"),
+            Some(tr(state, "provider-help")),
+            tokens,
+        ))
         .child(preset_row(state, draft, tokens, emit.clone()))
         .child(name_row(state, fields, tokens, collides))
         .child(form::row(

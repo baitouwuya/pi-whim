@@ -16,7 +16,11 @@ use crate::{AppState, Language};
 const STRINGS: &[(&str, &str, &str)] = &[
     ("projects", "Projects", "项目"),
     ("add-project", "Add local project", "添加本地项目"),
-    ("search", "Search projects", "搜索项目"),
+    (
+        "empty-projects",
+        "Add a project folder to begin.",
+        "添加一个项目文件夹以开始。",
+    ),
     ("show-finder", "Show in Finder", "在 Finder 中显示"),
     ("remove", "Remove", "移除"),
     ("rename", "Rename", "重命名"),
@@ -36,29 +40,38 @@ const STRINGS: &[(&str, &str, &str)] = &[
         "选择一个项目，然后告诉 Pi 你想完成什么。",
     ),
     (
-        "select-project-to-chat",
-        "Add and select a project from the sidebar before starting a conversation.",
-        "先从左侧添加并选择一个项目，才能开始对话。",
-    ),
-    ("fork-here", "Fork from here", "从这里分叉"),
-    (
         "composer-placeholder",
         "Tell Pi what you want to do...",
         "告诉 Pi 你想完成什么...",
     ),
-    ("add-attachment", "Add attachment", "添加附件"),
-    ("choose-files", "Choose files...", "选择文件..."),
-    ("choose-folder", "Choose folder...", "选择文件夹..."),
-    ("queued", "QUEUED", "已排队"),
-    ("follow-ups", "FOLLOW-UPS", "后续队列"),
-    ("thinking", "Thinking", "思考"),
+    // One picker takes both, so the button says so rather than naming a kind.
     (
-        "models-unavailable",
-        "No models are available. Save a provider in Settings.",
-        "没有可用模型。请在设置中保存一个模型提供商。",
+        "add-attachment",
+        "Attach files or folders",
+        "附加文件或文件夹",
     ),
-    ("stop", "Stop", "停止"),
+    // Shown in place of the model picker when there is nothing to pick.
+    ("no-models-available", "No models available", "没有可用模型"),
+    ("stop-turn", "Stop the turn in flight", "停止当前回合"),
+    ("model", "Model", "模型"),
+    // The thinking picker shows "Thinking: <level>", so the prefix carries the
+    // separator: Chinese does not put a space before the colon.
+    ("thinking-prefix", "Thinking: ", "思考："),
+    ("thinking-off", "off", "关闭"),
+    ("session-title", "Session title", "会话名称"),
+    ("title-field", "TITLE", "名称"),
+    // The status pill's own vocabulary, lowercase because it is set in the mono
+    // voice pi.dev uses for machine state.
+    ("status-offline", "offline", "离线"),
+    ("status-starting", "starting", "启动中"),
+    ("status-ready", "ready", "就绪"),
+    ("status-streaming", "streaming", "生成中"),
+    ("status-compacting", "compacting", "压缩中"),
+    ("status-failed", "failed", "失败"),
     ("settings", "Settings", "设置"),
+    // The theme toggle names where it goes, not where it is.
+    ("switch-to-dark", "Switch to dark", "切换到深色"),
+    ("switch-to-light", "Switch to light", "切换到浅色"),
     ("general", "General", "通用"),
     ("providers", "Providers", "模型提供商"),
     ("web-search", "Web Search", "网页搜索"),
@@ -68,7 +81,6 @@ const STRINGS: &[(&str, &str, &str)] = &[
         "配置按顺序尝试的网页搜索引擎。",
     ),
     ("search-engines", "Search engines", "搜索引擎"),
-    ("add-search-engine", "Add search engine", "添加搜索引擎"),
     (
         "search-engine-details",
         "Search engine details",
@@ -101,8 +113,6 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ("model-id", "Manual model ID", "手动输入模型 ID"),
     ("no-models", "No models selected.", "尚未选择模型。"),
     ("save-provider", "Save provider", "保存提供商"),
-    ("save-and-apply", "Save and apply", "保存并应用"),
-    ("delete-provider", "Delete provider", "删除提供商"),
     ("language", "Language", "语言"),
     ("api-key", "API key", "API Key"),
     ("base-url", "Base URL", "基础 URL"),
@@ -158,6 +168,103 @@ const STRINGS: &[(&str, &str, &str)] = &[
         "Keys are stored securely in macOS Keychain.",
         "密钥安全存储在 macOS Keychain。",
     ),
+    // Dialogs the agent raises. The title and message come from the agent when it
+    // sends them; these stand in when it does not, and the buttons are always the
+    // app's own words.
+    ("confirm-title", "Pi confirmation", "Pi 确认"),
+    (
+        "confirm-message",
+        "Allow this operation?",
+        "允许这个操作吗？",
+    ),
+    ("agent-request", "Agent request", "代理请求"),
+    ("allow-once", "Allow once", "允许一次"),
+    // Messages the host reports through the notification stack. They are written
+    // where the failure happens, which is outside any view, so they are looked up
+    // against the stored language rather than a view's own copy of it.
+    (
+        "notice-select-project-attachments",
+        "Select a project before adding attachments.",
+        "请先选择一个项目，然后再添加附件。",
+    ),
+    (
+        "notice-select-project-send",
+        "Select a project before sending a message.",
+        "请先选择一个项目，然后再发送消息。",
+    ),
+    (
+        "notice-not-ready",
+        "Pi is not ready for the selected project yet.",
+        "所选项目的 Pi 还没有就绪。",
+    ),
+    ("notice-no-session", "No active session.", "没有活动会话。"),
+    (
+        "notice-session-gone",
+        "The session is no longer running.",
+        "该会话已不在运行。",
+    ),
+    (
+        "notice-asking-session-gone",
+        "The session that asked is no longer running.",
+        "发起询问的会话已不在运行。",
+    ),
+    (
+        "notice-no-session-to-name",
+        "No active session to name.",
+        "没有可命名的活动会话。",
+    ),
+    (
+        "notice-key-unreadable",
+        "The API key could not be read back from Keychain. Pi was not restarted; try Save and apply again.",
+        "无法从 Keychain 读回 API Key。Pi 未重启；请再次尝试保存并应用。",
+    ),
+    (
+        "notice-key-missing",
+        "This provider has no API key in Keychain. Enter and save its API key before starting Pi.",
+        "该提供商在 Keychain 中没有 API Key。请先输入并保存，然后再启动 Pi。",
+    ),
+    (
+        "notice-search-engine-untestable",
+        "Enter a name and valid HTTP or HTTPS base URL before testing.",
+        "请先填写名称和有效的 HTTP 或 HTTPS 基础 URL，然后再测试。",
+    ),
+    (
+        "notice-search-engine-ok",
+        "is reachable and returned valid SearXNG JSON.",
+        "可访问，并返回了有效的 SearXNG JSON。",
+    ),
+    ("notice-test-failed", "test failed", "测试失败"),
+    (
+        "notice-no-models-discovered",
+        "The provider returned no models; add a model ID manually.",
+        "该提供商没有返回任何模型；请手动添加模型 ID。",
+    ),
+    (
+        "notice-session-exported",
+        "Session exported to",
+        "会话已导出到",
+    ),
+    (
+        "notice-export-failed",
+        "Could not export the session for sharing.",
+        "无法导出会话以供分享。",
+    ),
+    ("notice-share-url", "Share URL:", "分享链接："),
+    (
+        "notice-gh-unavailable",
+        "GitHub CLI unavailable:",
+        "GitHub CLI 不可用：",
+    ),
+    (
+        "notice-trash-failed",
+        "Could not move the Pi session to Trash.",
+        "无法把 Pi 会话移到废纸篓。",
+    ),
+    (
+        "notice-name-usage",
+        "Usage: /name <name>",
+        "用法：/name <名称>",
+    ),
     ("back", "Back", "返回"),
     ("appearance", "Appearance", "外观"),
     ("context", "Context", "上下文"),
@@ -172,20 +279,13 @@ const STRINGS: &[(&str, &str, &str)] = &[
         "Automatically compact when context approaches its limit.",
         "在上下文接近上限时自动压缩。",
     ),
-    ("command-policy", "Execution policy", "执行策略"),
     ("allow", "Allow", "允许"),
-    ("ask", "Ask", "询问"),
     ("deny", "Deny", "拒绝"),
     ("blocked-patterns", "Blocked patterns", "阻止模式"),
     (
         "blocked-patterns-help",
         "One Bash command blocking pattern per line.",
         "每行一个 Bash 命令阻止模式。",
-    ),
-    (
-        "apply-command-filters",
-        "Apply command filters",
-        "应用命令过滤器",
     ),
     ("agent-team", "Agent team", "代理团队"),
     (
@@ -208,36 +308,19 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ),
     ("add-provider", "Add provider", "添加提供商"),
     ("connection", "Connection", "连接"),
-    (
-        "connection-help",
-        "Fill in connection details before saving.",
-        "保存前填写连接详情。",
-    ),
-    (
-        "provider-name-duplicate",
-        "This name is already in use.",
-        "名称已被使用。",
-    ),
     ("models", "Models", "模型"),
     (
         "models-help",
         "Discover or manually add available models.",
         "发现或手动添加可用模型。",
     ),
-    ("show-error", "Show error", "显示错误"),
-    ("error-banner-title", "Request failed", "请求失败"),
-    ("dismiss", "Dismiss", "关闭"),
-    ("copy-error", "Copy error", "复制错误"),
     ("compacting-banner", "Compacting context", "正在压缩上下文"),
     (
         "compacting-detail",
         "Pi is condensing earlier messages.",
         "Pi 正在整理早期消息。",
     ),
-    ("auto-compact-on", "AUTO-COMPACT: ON", "自动压缩：开"),
-    ("auto-compact-off", "AUTO-COMPACT: OFF", "自动压缩：关"),
     ("copy-session-id", "Copy session ID", "复制会话 ID"),
-    ("hint-slash", "/ for quick actions", "/ 查看快捷操作"),
     ("hint-enter", "Enter to send", "Enter 发送"),
     (
         "hint-shift-enter",
@@ -245,11 +328,6 @@ const STRINGS: &[(&str, &str, &str)] = &[
         "Shift+Enter 换行",
     ),
     ("search-models", "Search models", "搜索模型"),
-    ("copy-report", "Copy reply", "复制回复"),
-    ("raw-tool-details", "Raw tool details", "原始工具详情"),
-    ("show-all", "Show all", "显示完整内容"),
-    ("generating", "Generating", "正在生成"),
-    ("send", "Send", "发送"),
     ("slash-commands", "Quick actions", "快捷操作"),
     (
         "slash-help",

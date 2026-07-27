@@ -22,12 +22,14 @@
 //!   title, and a reader hunting `sonnet-4-5` is typing the id, not the name.
 
 use gpui::{
-    App, AppContext, Context, Entity, EventEmitter, IntoElement, ParentElement, Render,
-    SharedString, Styled, Window, div, prelude::FluentBuilder, px,
+    App, AppContext, Context, Entity, EventEmitter, InteractiveElement, IntoElement, ParentElement,
+    Render, SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder,
+    px,
 };
 use gpui_component::{
     Sizable,
     select::{SearchableVec, Select, SelectEvent, SelectGroup, SelectItem, SelectState},
+    tooltip::Tooltip,
 };
 use pi_whim_core::{
     AgentPermissionLevel, AppState, Language, ModelOption, SessionStatus, ThinkingLevel,
@@ -221,10 +223,11 @@ fn permission_color(level: AgentPermissionLevel, tokens: Tokens) -> gpui::Hsla {
 ///
 /// A failed session explains itself; an empty list with no failure means the
 /// agent has not answered yet, which is not an error to report as one.
-fn models_unavailable_note(status: &SessionStatus) -> String {
+fn models_unavailable_note(status: &SessionStatus, language: Language) -> String {
+    let note = translate("no-models-available", language);
     match status {
-        SessionStatus::Failed(error) => format!("No models available: {error}"),
-        _ => "No models available".to_owned(),
+        SessionStatus::Failed(error) => format!("{note}: {error}"),
+        _ => note.to_owned(),
     }
 }
 
@@ -366,7 +369,13 @@ impl Controls {
     /// without reading the word next to it.
     fn permission_indicator(&self) -> impl IntoElement {
         let tokens = self.tokens;
+        // The tooltip sits on the group rather than the picker: the dot and the
+        // level name say what is granted, not what kind of setting this is, and
+        // `Select` has no tooltip of its own to hang it from.
+        let label = translate("permission-level", self.language);
         div()
+            .id("permission-level")
+            .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
             .flex()
             .flex_none()
             .items_center()
@@ -431,8 +440,8 @@ impl Render for Controls {
                                 .appearance(false)
                                 .menu_width(px(MODEL_MENU_WIDTH))
                                 .menu_max_h(px(MODEL_MENU_MAX_HEIGHT))
-                                .placeholder("Model")
-                                .search_placeholder("Search models"),
+                                .placeholder(translate("model", self.language))
+                                .search_placeholder(translate("search-models", self.language)),
                         )
                     })
                     .when(self.models.is_empty(), |this| {
@@ -446,7 +455,7 @@ impl Render for Controls {
                                     SessionStatus::Failed(_) => tokens.error.hsla(),
                                     _ => tokens.muted.hsla(),
                                 })
-                                .child(models_unavailable_note(&self.status)),
+                                .child(models_unavailable_note(&self.status, self.language)),
                         )
                     }),
             )
@@ -454,8 +463,8 @@ impl Render for Controls {
                 Select::new(&self.thinking)
                     .xsmall()
                     .appearance(false)
-                    .title_prefix("Thinking: ")
-                    .placeholder("off"),
+                    .title_prefix(translate("thinking-prefix", self.language))
+                    .placeholder(translate("thinking-off", self.language)),
             )
     }
 }
@@ -542,17 +551,28 @@ mod tests {
     #[test]
     fn an_empty_model_list_says_why_when_the_session_failed() {
         // A failure the reader can act on; anything else is just "not yet".
+        let english = Language::English;
         assert_eq!(
-            models_unavailable_note(&SessionStatus::Failed("pi not found".into())),
+            models_unavailable_note(&SessionStatus::Failed("pi not found".into()), english),
             "No models available: pi not found"
         );
         assert_eq!(
-            models_unavailable_note(&SessionStatus::Starting),
+            models_unavailable_note(&SessionStatus::Starting, english),
             "No models available"
         );
         assert_eq!(
-            models_unavailable_note(&SessionStatus::Ready),
+            models_unavailable_note(&SessionStatus::Ready, english),
             "No models available"
+        );
+
+        // The error is the agent's own text, so only the note ahead of it is
+        // translated — but that much has to be.
+        assert!(
+            models_unavailable_note(
+                &SessionStatus::Failed("pi not found".into()),
+                Language::SimplifiedChinese
+            )
+            .ends_with(": pi not found")
         );
     }
 

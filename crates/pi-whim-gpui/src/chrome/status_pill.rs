@@ -4,7 +4,7 @@ use gpui::{
     IntoElement, ParentElement, RenderOnce, Styled, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::Icon;
-use pi_whim_core::SessionStatus;
+use pi_whim_core::{Language, SessionStatus, strings::text as translate};
 use pi_whim_theme::{Tokens, radius, text};
 
 use crate::{icons, theme::IntoHsla};
@@ -13,12 +13,18 @@ use crate::{icons, theme::IntoHsla};
 #[derive(IntoElement)]
 pub struct StatusPill {
     status: SessionStatus,
+    /// Passed in rather than held: the pill is rebuilt on every render.
+    language: Language,
     tokens: Tokens,
 }
 
 impl StatusPill {
-    pub fn new(status: SessionStatus, tokens: Tokens) -> Self {
-        Self { status, tokens }
+    pub fn new(status: SessionStatus, language: Language, tokens: Tokens) -> Self {
+        Self {
+            status,
+            language,
+            tokens,
+        }
     }
 
     /// The dot colour for a status.
@@ -38,15 +44,16 @@ impl StatusPill {
 }
 
 /// The label for a status, in the app's mono voice.
-pub fn status_label(status: &SessionStatus) -> &'static str {
-    match status {
-        SessionStatus::Offline => "offline",
-        SessionStatus::Starting => "starting",
-        SessionStatus::Ready => "ready",
-        SessionStatus::Streaming => "streaming",
-        SessionStatus::Compacting => "compacting",
-        SessionStatus::Failed(_) => "failed",
-    }
+pub fn status_label(status: &SessionStatus, language: Language) -> &'static str {
+    let key = match status {
+        SessionStatus::Offline => "status-offline",
+        SessionStatus::Starting => "status-starting",
+        SessionStatus::Ready => "status-ready",
+        SessionStatus::Streaming => "status-streaming",
+        SessionStatus::Compacting => "status-compacting",
+        SessionStatus::Failed(_) => "status-failed",
+    };
+    translate(key, language)
 }
 
 impl RenderOnce for StatusPill {
@@ -78,7 +85,7 @@ impl RenderOnce for StatusPill {
                 div()
                     .text_size(px(text::LABEL_SIZE))
                     .text_color(tokens.muted.hsla())
-                    .child(status_label(&self.status)),
+                    .child(status_label(&self.status, self.language)),
             )
     }
 }
@@ -98,16 +105,26 @@ mod tests {
             SessionStatus::Compacting,
             SessionStatus::Failed("boom".into()),
         ] {
-            assert!(!status_label(&status).is_empty());
+            // In both languages: a pill that falls back to "?" in Chinese would
+            // read as a rendering bug there instead.
+            assert!(!status_label(&status, Language::English).is_empty());
+            let chinese = status_label(&status, Language::SimplifiedChinese);
+            assert!(!chinese.is_empty());
+            assert_ne!(chinese, "?");
         }
     }
 
     #[test]
     fn failure_and_progress_are_visually_distinct() {
         let tokens = Tokens::light();
-        let failed = StatusPill::new(SessionStatus::Failed("boom".into()), tokens).dot();
-        let streaming = StatusPill::new(SessionStatus::Streaming, tokens).dot();
-        let idle = StatusPill::new(SessionStatus::Offline, tokens).dot();
+        let failed = StatusPill::new(
+            SessionStatus::Failed("boom".into()),
+            Language::English,
+            tokens,
+        )
+        .dot();
+        let streaming = StatusPill::new(SessionStatus::Streaming, Language::English, tokens).dot();
+        let idle = StatusPill::new(SessionStatus::Offline, Language::English, tokens).dot();
 
         assert_ne!(failed, streaming);
         assert_ne!(streaming, idle);
@@ -119,8 +136,8 @@ mod tests {
         // Compaction is the agent doing something, not an idle state.
         let tokens = Tokens::light();
         assert_eq!(
-            StatusPill::new(SessionStatus::Compacting, tokens).dot(),
-            StatusPill::new(SessionStatus::Streaming, tokens).dot()
+            StatusPill::new(SessionStatus::Compacting, Language::English, tokens).dot(),
+            StatusPill::new(SessionStatus::Streaming, Language::English, tokens).dot()
         );
     }
 }

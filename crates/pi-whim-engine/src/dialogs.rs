@@ -29,21 +29,58 @@ pub enum Tone {
     Neutral,
 }
 
+/// Text on its way to the screen.
+///
+/// The engine writes some of this itself — the word on an approval button, the
+/// heading when a request sends none — and passes the rest through from the
+/// agent. Only the first kind can be translated, and only the view knows which
+/// language to translate into, so the two are distinguished here rather than
+/// flattened into one `String` the view would have to guess about.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Label {
+    /// The app's own words, as a key into the string table.
+    Key(&'static str),
+    /// The agent's own text, shown as it was sent.
+    Verbatim(String),
+}
+
+impl Label {
+    fn verbatim(text: &str) -> Self {
+        Self::Verbatim(text.to_owned())
+    }
+
+    /// The agent's text if it sent any, otherwise the app's own wording.
+    fn or_key(text: Option<&str>, key: &'static str) -> Self {
+        match text {
+            Some(text) if !text.is_empty() => Self::verbatim(text),
+            _ => Self::Key(key),
+        }
+    }
+
+    /// Whether there is anything to show.
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Key(_) => false,
+            Self::Verbatim(text) => text.is_empty(),
+        }
+    }
+}
+
 /// One answer the reader can give.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Choice {
     /// What travels back to the agent.
     pub value: String,
     /// What the button says.
-    pub label: String,
+    pub label: Label,
     pub tone: Tone,
 }
 
 impl Choice {
-    fn new(value: &str, label: &str, tone: Tone) -> Self {
+    fn new(value: &str, label: Label, tone: Tone) -> Self {
         Self {
             value: value.to_owned(),
-            label: label.to_owned(),
+            label,
             tone,
         }
     }
@@ -69,8 +106,8 @@ pub struct Prompt {
     pub session_key: String,
     pub source: Source,
     pub request_id: String,
-    pub title: String,
-    pub message: String,
+    pub title: Label,
+    pub message: Label,
     pub choices: Vec<Choice>,
     /// The value used when the dialog is dismissed rather than answered.
     ///
@@ -96,19 +133,17 @@ impl Prompt {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_owned(),
-            title: request
-                .get("title")
-                .and_then(Value::as_str)
-                .unwrap_or("Pi confirmation")
-                .to_owned(),
-            message: request
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("Allow this operation?")
-                .to_owned(),
+            title: Label::or_key(
+                request.get("title").and_then(Value::as_str),
+                "confirm-title",
+            ),
+            message: Label::or_key(
+                request.get("message").and_then(Value::as_str),
+                "confirm-message",
+            ),
             choices: vec![
-                Choice::new(ALLOW, "Allow", Tone::Primary),
-                Choice::new("deny", "Deny", Tone::Danger),
+                Choice::new(ALLOW, Label::Key("allow"), Tone::Primary),
+                Choice::new("deny", Label::Key("deny"), Tone::Danger),
             ],
             // Dismissing a permission request denies it. Anything else would
             // grant access the reader never agreed to.
@@ -153,16 +188,17 @@ impl Prompt {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_owned(),
-            title: request
-                .get("title")
-                .and_then(Value::as_str)
-                .unwrap_or("Agent request")
-                .to_owned(),
-            message: request
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
+            title: Label::or_key(
+                request.get("title").and_then(Value::as_str),
+                "agent-request",
+            ),
+            message: Label::Verbatim(
+                request
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            ),
             choices: options
                 .iter()
                 .map(|option| choice_for(kind, option))
@@ -199,9 +235,9 @@ impl Prompt {
 /// for a person and pass through untouched.
 fn choice_for(kind: &str, option: &str) -> Choice {
     match (kind, option) {
-        ("approval", "approve") => Choice::new(option, "Allow once", Tone::Primary),
-        ("approval", "deny") => Choice::new(option, "Deny", Tone::Danger),
-        _ => Choice::new(option, option, Tone::Neutral),
+        ("approval", "approve") => Choice::new(option, Label::Key("allow-once"), Tone::Primary),
+        ("approval", "deny") => Choice::new(option, Label::Key("deny"), Tone::Danger),
+        _ => Choice::new(option, Label::verbatim(option), Tone::Neutral),
     }
 }
 
@@ -341,12 +377,14 @@ mod tests {
 
         assert_eq!(prompt.source, Source::Extension);
         assert_eq!(prompt.request_id, "req-1");
-        assert_eq!(prompt.title, "Run a command?");
+        assert_eq!(prompt.title, Label::verbatim("Run a command?"));
+        // The two buttons are the app's own words, so they travel as keys and
+        // the view reads them in whichever language is set.
         assert_eq!(
             prompt.choices,
             vec![
-                Choice::new("allow", "Allow", Tone::Primary),
-                Choice::new("deny", "Deny", Tone::Danger),
+                Choice::new("allow", Label::Key("allow"), Tone::Primary),
+                Choice::new("deny", Label::Key("deny"), Tone::Danger),
             ]
         );
     }
@@ -360,6 +398,10 @@ mod tests {
 
         assert!(!prompt.title.is_empty());
         assert!(!prompt.message.is_empty());
+        // And what stands in for them is the app's own wording, not English
+        // baked into the engine.
+        assert_eq!(prompt.title, Label::Key("confirm-title"));
+        assert_eq!(prompt.message, Label::Key("confirm-message"));
     }
 
     #[test]
@@ -408,8 +450,8 @@ mod tests {
         assert_eq!(
             prompt.choices,
             vec![
-                Choice::new("approve", "Allow once", Tone::Primary),
-                Choice::new("deny", "Deny", Tone::Danger),
+                Choice::new("approve", Label::Key("allow-once"), Tone::Primary),
+                Choice::new("deny", Label::Key("deny"), Tone::Danger),
             ]
         );
     }
@@ -430,8 +472,8 @@ mod tests {
         assert_eq!(
             prompt.choices,
             vec![
-                Choice::new("main", "main", Tone::Neutral),
-                Choice::new("develop", "develop", Tone::Neutral),
+                Choice::new("main", Label::verbatim("main"), Tone::Neutral),
+                Choice::new("develop", Label::verbatim("develop"), Tone::Neutral),
             ]
         );
     }

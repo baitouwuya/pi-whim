@@ -14,7 +14,7 @@ use gpui_component::{
     button::{Button, ButtonVariants},
     menu::{ContextMenuExt, PopupMenuItem},
 };
-use pi_whim_core::{ProjectId, SessionId};
+use pi_whim_core::{Language, ProjectId, SessionId, strings::text as translate};
 use pi_whim_theme::{Tokens, font, layout, radius, text};
 
 use crate::{chat::Row, icons, theme::IntoHsla};
@@ -61,28 +61,32 @@ pub enum SidebarEvent {
 ///
 /// Split out as a pure function so the menu can be asserted without a window:
 /// what a right-click can reach is the part worth pinning, not how it is drawn.
-fn row_actions(row: &Row) -> Vec<(&'static str, SidebarEvent)> {
+///
+/// Labels come back translated. `&'static str` still holds because the string
+/// table is static — nothing here allocates a label per call.
+fn row_actions(row: &Row, language: Language) -> Vec<(&'static str, SidebarEvent)> {
+    let label = |key| translate(key, language);
     match row {
         Row::Project { id, .. } => vec![
-            ("Show in Finder", SidebarEvent::RevealProject(*id)),
-            ("Remove", SidebarEvent::RemoveProject(*id)),
+            (label("show-finder"), SidebarEvent::RevealProject(*id)),
+            (label("remove"), SidebarEvent::RemoveProject(*id)),
         ],
         Row::Session {
             id, pi_path, title, ..
         } => vec![
             (
-                "Rename",
+                label("rename"),
                 SidebarEvent::RenameSession {
                     pi_path: pi_path.clone(),
                     title: title.clone(),
                 },
             ),
-            ("Clone session", SidebarEvent::CloneSession),
-            ("Copy session ID", SidebarEvent::CopySessionId(*id)),
+            (label("clone"), SidebarEvent::CloneSession),
+            (label("copy-session-id"), SidebarEvent::CopySessionId(*id)),
             // Last, and separated from the rest by being last: it moves the
             // transcript to the trash.
             (
-                "Move to trash",
+                label("delete"),
                 SidebarEvent::DeleteSession(pi_path.clone()),
             ),
         ],
@@ -92,6 +96,8 @@ fn row_actions(row: &Row) -> Vec<(&'static str, SidebarEvent)> {
 /// The project and session list.
 pub struct Sidebar {
     rows: Vec<Row>,
+    /// The language the column's headings, menus, and empty state are read in.
+    language: Language,
     tokens: Tokens,
 }
 
@@ -101,7 +107,15 @@ impl Sidebar {
     pub fn new(tokens: Tokens) -> Self {
         Self {
             rows: Vec::new(),
+            language: Language::default(),
             tokens,
+        }
+    }
+
+    pub fn set_language(&mut self, language: Language, cx: &mut Context<Self>) {
+        if self.language != language {
+            self.language = language;
+            cx.notify();
         }
     }
 
@@ -147,14 +161,14 @@ impl Sidebar {
                     .font_family(font::MONO)
                     .text_size(px(text::LABEL_SIZE))
                     .text_color(tokens.muted.hsla())
-                    .child("PROJECTS"),
+                    .child(translate("projects", self.language)),
             )
             .child(
                 Button::new("add-project")
                     .ghost()
                     .xsmall()
                     .icon(icons::add())
-                    .tooltip("Add a project folder")
+                    .tooltip(translate("add-project", self.language))
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::AddProject))),
             )
             .into_any_element()
@@ -219,7 +233,7 @@ impl Sidebar {
                         .ghost()
                         .xsmall()
                         .icon(icons::add())
-                        .tooltip("New session in this project")
+                        .tooltip(translate("new-session", self.language))
                         .invisible()
                         .group_hover(group, |this| this.visible())
                         .on_click(cx.listener(move |_, _, _, cx| {
@@ -300,7 +314,7 @@ impl Sidebar {
             // per-row actions.
             .context_menu({
                 let entity = cx.entity();
-                let actions = row_actions(row);
+                let actions = row_actions(row, self.language);
                 move |menu, _, _| {
                     actions.iter().fold(menu, |menu, (label, event)| {
                         let entity = entity.clone();
@@ -349,7 +363,7 @@ impl Render for Sidebar {
                         .pb(px(10.0))
                         .text_size(px(text::LABEL_SIZE))
                         .text_color(tokens.muted.hsla())
-                        .child("Add a project folder to begin."),
+                        .child(translate("empty-projects", self.language)),
                 )
             })
     }
@@ -420,11 +434,11 @@ mod tests {
     fn a_project_and_a_session_offer_different_actions() {
         // Renaming a project or cloning it would mean nothing; the row menu is
         // the only place either kind's actions are reachable.
-        let project: Vec<_> = row_actions(&project_row())
+        let project: Vec<_> = row_actions(&project_row(), Language::English)
             .into_iter()
             .map(|(label, _)| label)
             .collect();
-        let session: Vec<_> = row_actions(&session_row())
+        let session: Vec<_> = row_actions(&session_row(), Language::English)
             .into_iter()
             .map(|(label, _)| label)
             .collect();
@@ -442,10 +456,27 @@ mod tests {
     }
 
     #[test]
+    fn the_row_menu_is_translated() {
+        // Every entry, not just the ones with an obvious translation: a menu that
+        // switches language except for one item reads as a bug in that item.
+        let chinese = row_actions(&session_row(), Language::SimplifiedChinese);
+        let english = row_actions(&session_row(), Language::English);
+
+        for ((chinese_label, _), (english_label, _)) in chinese.iter().zip(&english) {
+            assert_ne!(
+                chinese_label, english_label,
+                "{english_label} is the same in both languages"
+            );
+            // A missing key renders as "?", which would leave a blank-looking row.
+            assert_ne!(*chinese_label, "?");
+        }
+    }
+
+    #[test]
     fn renaming_starts_from_the_title_the_session_has() {
         // Most renames edit an auto-generated title, so the dialog opens seeded
         // rather than blank.
-        let actions = row_actions(&session_row());
+        let actions = row_actions(&session_row(), Language::English);
         let (_, event) = &actions[0];
         let SidebarEvent::RenameSession { pi_path, title } = event else {
             panic!("expected a rename event");
@@ -458,7 +489,7 @@ mod tests {
     fn moving_a_session_to_the_trash_is_last() {
         // It is the one entry that destroys something, so it does not sit next to
         // the ones that do not.
-        let actions = row_actions(&session_row());
+        let actions = row_actions(&session_row(), Language::English);
         let (label, _) = actions.last().expect("a last action");
         assert_eq!(*label, "Move to trash");
     }
@@ -466,7 +497,7 @@ mod tests {
     #[test]
     fn every_row_offers_something() {
         // A right-click that opens an empty menu reads as a broken control.
-        assert!(!row_actions(&project_row()).is_empty());
-        assert!(!row_actions(&session_row()).is_empty());
+        assert!(!row_actions(&project_row(), Language::English).is_empty());
+        assert!(!row_actions(&session_row(), Language::English).is_empty());
     }
 }

@@ -14,7 +14,7 @@ use gpui_component::theme::{Theme as ComponentTheme, ThemeMode as ComponentMode}
 use pi_whim_core::{
     AgentPermissionPolicy, AgentTeamConfig, AppState, Attachment, BashPolicy, Language,
     ModelOption, ProjectId, ProviderId, ProviderProfile, ProviderProtocol, QueueMode,
-    SearchEngineProfile, SessionStatus, SubmitMode, ThinkingLevel,
+    SearchEngineProfile, SessionStatus, SubmitMode, ThinkingLevel, strings::text as translate,
 };
 use pi_whim_engine::dialogs::{Answer, Prompt};
 use pi_whim_engine::notice::Outbox;
@@ -697,8 +697,10 @@ impl Workspace {
     fn sync_sidebar(&mut self, cx: &mut Context<Self>) {
         let rows = chat::rows(&self.state, &self.expanded_projects);
         let tokens = self.tokens;
+        let language = self.state.language;
         self.sidebar.update(cx, |sidebar, cx| {
             sidebar.set_tokens(tokens, cx);
+            sidebar.set_language(language, cx);
             sidebar.set_rows(rows, cx);
         });
     }
@@ -707,8 +709,12 @@ impl Workspace {
     fn sync_conversation(&mut self, cx: &mut Context<Self>) {
         let messages = chat::visible_messages(&self.state);
         let tokens = self.tokens;
+        let language = self.state.language;
+        let has_project = self.state.selected_project.is_some();
         self.conversation.update(cx, |conversation, cx| {
             conversation.set_tokens(tokens, cx);
+            conversation.set_language(language, cx);
+            conversation.set_has_project(has_project, cx);
             conversation.set_messages(messages, cx);
         });
     }
@@ -723,8 +729,10 @@ impl Workspace {
             self.state.session_status,
             SessionStatus::Streaming | SessionStatus::Compacting
         );
+        let language = self.state.language;
         self.composer.update(cx, |composer, cx| {
             composer.set_tokens(tokens, cx);
+            composer.set_language(language, window, cx);
             composer.set_busy(busy, cx);
         });
 
@@ -737,10 +745,14 @@ impl Workspace {
             controls.sync(&state, window, cx);
         });
 
-        self.prompts
-            .update(cx, |prompts, cx| prompts.set_tokens(tokens, cx));
-        self.rename
-            .update(cx, |rename, cx| rename.set_tokens(tokens, cx));
+        self.prompts.update(cx, |prompts, cx| {
+            prompts.set_tokens(tokens, cx);
+            prompts.set_language(language, cx);
+        });
+        self.rename.update(cx, |rename, cx| {
+            rename.set_tokens(tokens, cx);
+            rename.set_language(language, window, cx);
+        });
         self.settings.update(cx, |settings, cx| {
             settings.set_tokens(tokens, cx);
             settings.sync(&state, window, cx);
@@ -946,10 +958,17 @@ impl Workspace {
 ///
 /// Failure takes precedence: if the session has broken, that matters more than
 /// reporting that it is busy.
-fn banner_for(status: &SessionStatus, tokens: Tokens) -> Option<Banner> {
+fn banner_for(status: &SessionStatus, language: Language, tokens: Tokens) -> Option<Banner> {
     match status {
+        // The error text is the agent's own, so it travels through untranslated;
+        // everything the app says around it does not.
         SessionStatus::Failed(error) => Some(Banner::error(error.clone(), tokens)),
-        SessionStatus::Compacting => Some(Banner::progress("Compacting the conversation…", tokens)),
+        SessionStatus::Compacting => Some(
+            Banner::progress(translate("compacting-banner", language), tokens)
+                // The headline names the condition; the line under it says the
+                // conversation survives it, which is the part worth knowing.
+                .detail(translate("compacting-detail", language)),
+        ),
         _ => None,
     }
 }
@@ -1039,7 +1058,7 @@ impl Render for Workspace {
                     .text_color(tokens.text.hsla())
                     .text_size(px(text::BODY_SIZE))
                     .child(
-                        TopBar::new(status.clone(), tokens.mode, tokens)
+                        TopBar::new(status.clone(), tokens.mode, state.language, tokens)
                             .metrics(state.session_metrics.as_ref())
                             .on_toggle_theme(cx.listener(|workspace, _, window, cx| {
                                 workspace.toggle_theme(window, cx);
@@ -1056,9 +1075,10 @@ impl Render for Workspace {
                         this.child(div().flex_1().min_h(px(0.0)).child(self.settings.clone()))
                     })
                     .when(!self.showing_settings, |this| {
-                        this.when_some(banner_for(&status, tokens), |this, banner| {
-                            this.child(banner)
-                        })
+                        this.when_some(
+                            banner_for(&status, state.language, tokens),
+                            |this, banner| this.child(banner),
+                        )
                         // The conversation and sidebar fill whatever the
                         // chrome leaves.
                         .child(
@@ -1097,15 +1117,19 @@ mod tests {
     #[test]
     fn an_idle_session_shows_no_banner() {
         let tokens = Tokens::light();
-        assert!(banner_for(&SessionStatus::Offline, tokens).is_none());
-        assert!(banner_for(&SessionStatus::Ready, tokens).is_none());
-        assert!(banner_for(&SessionStatus::Streaming, tokens).is_none());
+        assert!(banner_for(&SessionStatus::Offline, Language::English, tokens).is_none());
+        assert!(banner_for(&SessionStatus::Ready, Language::English, tokens).is_none());
+        assert!(banner_for(&SessionStatus::Streaming, Language::English, tokens).is_none());
     }
 
     #[test]
     fn compaction_shows_a_progress_banner() {
-        let banner = banner_for(&SessionStatus::Compacting, Tokens::light())
-            .expect("a banner while compacting");
+        let banner = banner_for(
+            &SessionStatus::Compacting,
+            Language::English,
+            Tokens::light(),
+        )
+        .expect("a banner while compacting");
         assert_eq!(banner.severity(), Severity::Progress);
     }
 
@@ -1113,8 +1137,12 @@ mod tests {
     fn failure_shows_an_error_banner() {
         // A broken session matters more than reporting that it is busy, so this
         // is the variant that wins when both could apply.
-        let banner = banner_for(&SessionStatus::Failed("boom".into()), Tokens::light())
-            .expect("a banner after failure");
+        let banner = banner_for(
+            &SessionStatus::Failed("boom".into()),
+            Language::English,
+            Tokens::light(),
+        )
+        .expect("a banner after failure");
         assert_eq!(banner.severity(), Severity::Error);
     }
 

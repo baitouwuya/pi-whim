@@ -52,6 +52,13 @@ pub fn render(
             tokens,
         ))
         .child(engine_list(state, draft, tokens, emit.clone()))
+        // The fields below edit whichever instance is selected above, or a new
+        // one when none is; without a header they read as belonging to the list.
+        .child(form::section_header(
+            tr(state, "search-engine-details"),
+            None,
+            tokens,
+        ))
         .child(form::row(
             tr(state, "provider-name"),
             None,

@@ -3,7 +3,9 @@
 //! The egui build surfaced failures as a small "ERROR" label that was easy to
 //! miss entirely; these take a full row.
 
-use gpui::{IntoElement, ParentElement, RenderOnce, Styled, Window, div, px};
+use gpui::{
+    IntoElement, ParentElement, RenderOnce, Styled, Window, div, prelude::FluentBuilder, px,
+};
 use pi_whim_theme::{Rgba, Tokens, text};
 
 use crate::theme::IntoHsla;
@@ -22,6 +24,12 @@ pub enum Severity {
 pub struct Banner {
     severity: Severity,
     message: String,
+    /// A second, quieter line under the message.
+    ///
+    /// Used where the headline names the condition but not what it means for the
+    /// reader — "compacting context" says nothing about the conversation still
+    /// being there afterwards.
+    detail: Option<String>,
     tokens: Tokens,
 }
 
@@ -30,6 +38,7 @@ impl Banner {
         Self {
             severity: Severity::Error,
             message: message.into(),
+            detail: None,
             tokens,
         }
     }
@@ -38,8 +47,15 @@ impl Banner {
         Self {
             severity: Severity::Progress,
             message: message.into(),
+            detail: None,
             tokens,
         }
+    }
+
+    /// Add the quieter second line.
+    pub fn detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
     }
 
     /// How prominent this banner is.
@@ -83,9 +99,23 @@ impl RenderOnce for Banner {
             .child(
                 div()
                     .flex_1()
-                    .text_size(px(text::DETAIL_SIZE))
-                    .text_color(self.tokens.text.hsla())
-                    .child(self.message),
+                    .flex()
+                    .flex_col()
+                    .gap(px(1.0))
+                    .child(
+                        div()
+                            .text_size(px(text::DETAIL_SIZE))
+                            .text_color(self.tokens.text.hsla())
+                            .child(self.message),
+                    )
+                    .when_some(self.detail, |this, detail| {
+                        this.child(
+                            div()
+                                .text_size(px(text::LABEL_SIZE))
+                                .text_color(self.tokens.muted.hsla())
+                                .child(detail),
+                        )
+                    }),
             )
     }
 }

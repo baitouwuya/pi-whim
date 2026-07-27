@@ -19,7 +19,7 @@ use gpui_component::{
     // action is the keystroke that produces one.
     input::{Input, InputEvent, InputState, Paste as PasteAction},
 };
-use pi_whim_core::{Attachment, SubmitMode};
+use pi_whim_core::{Attachment, Language, SubmitMode, strings::text as translate};
 use pi_whim_engine::composer::Composer as Draft;
 use pi_whim_engine::session::is_large_paste;
 use pi_whim_theme::{Tokens, text};
@@ -42,7 +42,17 @@ const MAX_ROWS: usize = 12;
 ///
 /// It used to be a line of text under the field. That spent a row restating what
 /// the first Enter teaches, so it now hangs off the control it describes.
-pub const SUBMIT_HINT: &str = "Enter to send · Shift+Enter for a newline";
+///
+/// Built from the two hint keys rather than stored as one string: the same two
+/// halves are worth showing separately elsewhere, and one combined entry per
+/// language would have them drift apart.
+fn submit_hint(language: Language) -> String {
+    format!(
+        "{} · {}",
+        translate("hint-enter", language),
+        translate("hint-shift-enter", language)
+    )
+}
 
 /// What the composer asks the shell to do.
 #[derive(Clone, Debug, PartialEq)]
@@ -84,6 +94,8 @@ pub struct Composer {
     draft: Draft,
     /// True while the agent is working, which turns Send into Stop.
     busy: bool,
+    /// The language the placeholder and the buttons' tooltips are read in.
+    language: Language,
     tokens: Tokens,
 }
 
@@ -96,7 +108,7 @@ impl Composer {
                 .multi_line(true)
                 .auto_grow(MIN_ROWS, MAX_ROWS)
                 .soft_wrap(true)
-                .placeholder("Ask Pi…")
+                .placeholder(translate("composer-placeholder", Language::default()))
         });
 
         cx.subscribe_in(
@@ -118,6 +130,7 @@ impl Composer {
             input,
             draft: Draft::new(),
             busy: false,
+            language: Language::default(),
             tokens,
         }
     }
@@ -131,6 +144,27 @@ impl Composer {
 
     pub fn set_tokens(&mut self, tokens: Tokens, cx: &mut Context<Self>) {
         self.tokens = tokens;
+        cx.notify();
+    }
+
+    /// Switch the language of the placeholder and the tooltips.
+    ///
+    /// The placeholder has to be pushed into `InputState` rather than read at
+    /// render: the component owns it, and it is only consulted while the field is
+    /// empty.
+    pub fn set_language(
+        &mut self,
+        language: Language,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.language == language {
+            return;
+        }
+        self.language = language;
+        self.input.update(cx, |input, cx| {
+            input.set_placeholder(translate("composer-placeholder", language), window, cx);
+        });
         cx.notify();
     }
 
@@ -183,19 +217,20 @@ impl Composer {
     /// with a turn: start it, or end the one running. Built here and placed by the
     /// shell — see the note on [`Composer`].
     pub fn send_button(&self, cx: &mut Context<Self>) -> AnyElement {
+        let language = self.language;
         let button = if self.busy {
             Button::new("stop")
                 .danger()
                 .icon(icons::stop())
                 .xsmall()
-                .tooltip("Stop the turn in flight")
+                .tooltip(translate("stop-turn", language))
                 .on_click(cx.listener(|_, _, _, cx| cx.emit(ComposerEvent::Stop)))
         } else {
             Button::new("send")
                 .primary()
                 .icon(icons::send())
                 .xsmall()
-                .tooltip(SUBMIT_HINT)
+                .tooltip(submit_hint(language))
                 .on_click(cx.listener(|composer, _, window, cx| composer.submit(window, cx)))
         };
         button.into_any_element()
@@ -213,7 +248,7 @@ impl Composer {
             .ghost()
             .icon(icons::add())
             .xsmall()
-            .tooltip("Attach files or folders")
+            .tooltip(translate("add-attachment", self.language))
             .on_click(cx.listener(|_, _, _, cx| cx.emit(ComposerEvent::PickAttachments)))
             .into_any_element()
     }

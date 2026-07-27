@@ -12,6 +12,7 @@ use gpui_component::{
     dialog::Dialog,
     input::{Input, InputEvent, InputState},
 };
+use pi_whim_core::{Language, strings::text as translate};
 use pi_whim_theme::{Tokens, text};
 
 use crate::theme::IntoHsla;
@@ -28,6 +29,8 @@ pub struct Rename {
     /// The session being renamed. `None` means the dialog is closed.
     path: Option<String>,
     input: Entity<InputState>,
+    /// The language the heading, the label, and the buttons are read in.
+    language: Language,
     tokens: Tokens,
 }
 
@@ -35,7 +38,10 @@ impl EventEmitter<RenameEvent> for Rename {}
 
 impl Rename {
     pub fn new(tokens: Tokens, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Session title"));
+        let language = Language::default();
+        let input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(translate("session-title", language))
+        });
         // Enter commits, which is what a one-field form should do; reaching for
         // the mouse to confirm a rename is friction with no purpose.
         cx.subscribe_in(&input, window, |rename, _, event, _, cx| {
@@ -48,12 +54,33 @@ impl Rename {
         Self {
             path: None,
             input,
+            language,
             tokens,
         }
     }
 
     pub fn set_tokens(&mut self, tokens: Tokens, cx: &mut Context<Self>) {
         self.tokens = tokens;
+        cx.notify();
+    }
+
+    /// Switch the language of the dialog's own text.
+    ///
+    /// The placeholder has to be pushed into `InputState` rather than read at
+    /// render: the component owns it.
+    pub fn set_language(
+        &mut self,
+        language: Language,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.language == language {
+            return;
+        }
+        self.language = language;
+        self.input.update(cx, |input, cx| {
+            input.set_placeholder(translate("session-title", language), window, cx);
+        });
         cx.notify();
     }
 
@@ -125,10 +152,13 @@ impl Render for Rename {
 
         div().child(
             Dialog::new(cx)
-                .title(SharedString::from("Rename session"))
+                .title(SharedString::from(translate(
+                    "rename-session",
+                    self.language,
+                )))
                 .button_props(
                     gpui_component::dialog::DialogButtonProps::default()
-                        .ok_text("Save")
+                        .ok_text(translate("save", self.language))
                         .show_cancel(true),
                 )
                 .on_ok({
@@ -154,7 +184,7 @@ impl Render for Rename {
                                 .font_family(pi_whim_theme::font::MONO)
                                 .text_size(px(text::LABEL_SIZE))
                                 .text_color(tokens.muted.hsla())
-                                .child("TITLE"),
+                                .child(translate("title-field", self.language)),
                         )
                         .child(Input::new(&self.input)),
                 ),

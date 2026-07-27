@@ -16,7 +16,8 @@ use gpui_component::{
     button::{Button, ButtonVariant, ButtonVariants},
     dialog::Dialog,
 };
-use pi_whim_engine::dialogs::{Answer, Choice, Prompt, Queue, Tone};
+use pi_whim_core::{Language, strings::text as translate};
+use pi_whim_engine::dialogs::{Answer, Choice, Label, Prompt, Queue, Tone};
 use pi_whim_theme::{Tokens, text};
 
 use crate::theme::IntoHsla;
@@ -40,9 +41,22 @@ fn variant(tone: Tone) -> ButtonVariant {
     }
 }
 
+/// What a label reads as on screen.
+///
+/// The engine keeps its own wording as a key and the agent's as text, so this is
+/// where the two come back together.
+fn read(label: &Label, language: Language) -> SharedString {
+    match label {
+        Label::Key(key) => SharedString::from(translate(key, language)),
+        Label::Verbatim(text) => SharedString::from(text.clone()),
+    }
+}
+
 /// The questions waiting, and the one on screen.
 pub struct Prompts {
     queue: Queue,
+    /// The language the app's own wording in a prompt is read in.
+    language: Language,
     tokens: Tokens,
 }
 
@@ -52,6 +66,7 @@ impl Prompts {
     pub fn new(tokens: Tokens) -> Self {
         Self {
             queue: Queue::new(),
+            language: Language::default(),
             tokens,
         }
     }
@@ -59,6 +74,13 @@ impl Prompts {
     pub fn set_tokens(&mut self, tokens: Tokens, cx: &mut Context<Self>) {
         self.tokens = tokens;
         cx.notify();
+    }
+
+    pub fn set_language(&mut self, language: Language, cx: &mut Context<Self>) {
+        if self.language != language {
+            self.language = language;
+            cx.notify();
+        }
     }
 
     /// Whether a question is on screen.
@@ -109,7 +131,7 @@ impl Prompts {
     fn button(&self, index: usize, choice: &Choice, cx: &mut Context<Self>) -> Button {
         let value = choice.value.clone();
         Button::new(("prompt-choice", index))
-            .label(SharedString::from(choice.label.clone()))
+            .label(read(&choice.label, self.language))
             .with_variant(variant(choice.tone))
             .on_click(cx.listener(move |prompts, _, _, cx| {
                 prompts.answer(&value, cx);
@@ -135,7 +157,7 @@ impl Render for Prompts {
 
         div().child(
             Dialog::new(cx)
-                .title(SharedString::from(prompt.title.clone()))
+                .title(read(&prompt.title, self.language))
                 // The choices *are* the actions, so the default OK/Cancel pair
                 // would be a second, contradictory way to answer.
                 .footer(
@@ -157,7 +179,7 @@ impl Render for Prompts {
                         div()
                             .text_size(px(text::DETAIL_SIZE))
                             .text_color(tokens.copy.hsla())
-                            .child(SharedString::from(prompt.message.clone())),
+                            .child(read(&prompt.message, self.language)),
                     )
                 }),
         )

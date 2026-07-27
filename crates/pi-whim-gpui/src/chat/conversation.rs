@@ -18,13 +18,15 @@ use std::collections::HashSet;
 
 use gpui::{
     AnyElement, Context, EventEmitter, IntoElement, ListAlignment, ListState, ParentElement,
-    Render, Styled, Window, div, list, px,
+    Render, Styled, Window, div, list, prelude::FluentBuilder, px,
 };
-use pi_whim_core::{AppState, ConversationItem, ConversationRole};
+use pi_whim_core::{
+    AppState, ConversationItem, ConversationRole, Language, strings::text as translate,
+};
 use pi_whim_engine::typewriter::Typewriter;
-use pi_whim_theme::Tokens;
+use pi_whim_theme::{Tokens, text};
 
-use crate::chat::MessageCard;
+use crate::{chat::MessageCard, theme::IntoHsla};
 
 /// How far beyond the visible span to render, so scrolling does not flash blank.
 const OVERDRAW: f32 = 400.0;
@@ -42,6 +44,13 @@ pub struct Conversation {
     /// Tool entries whose diagnostic detail is showing, by message id.
     expanded: HashSet<String>,
     typewriter: Typewriter,
+    /// Whether a project is selected, which is what the empty state turns on.
+    ///
+    /// Without one there is nothing to talk to, so the empty transcript says how
+    /// to get started rather than sitting blank.
+    has_project: bool,
+    /// The language the empty state is read in.
+    language: Language,
     tokens: Tokens,
     list: ListState,
 }
@@ -54,6 +63,8 @@ impl Conversation {
             messages: Vec::new(),
             expanded: HashSet::new(),
             typewriter: Typewriter::new(),
+            has_project: false,
+            language: Language::default(),
             tokens,
             list: ListState::new(0, ListAlignment::Top, px(OVERDRAW)),
         }
@@ -100,6 +111,21 @@ impl Conversation {
         cx.notify();
     }
 
+    pub fn set_language(&mut self, language: Language, cx: &mut Context<Self>) {
+        if self.language != language {
+            self.language = language;
+            cx.notify();
+        }
+    }
+
+    /// Say whether a project is selected.
+    pub fn set_has_project(&mut self, has_project: bool, cx: &mut Context<Self>) {
+        if self.has_project != has_project {
+            self.has_project = has_project;
+            cx.notify();
+        }
+    }
+
     /// Advance the typewriter, reporting whether anything became visible.
     pub fn advance_typewriter(&mut self, elapsed_seconds: f32, cx: &mut Context<Self>) -> bool {
         let changed = self.typewriter.advance(&self.messages, elapsed_seconds);
@@ -139,6 +165,36 @@ impl Conversation {
 
     pub fn messages(&self) -> &[ConversationItem] {
         &self.messages
+    }
+
+    /// What an empty transcript says instead of nothing.
+    ///
+    /// The heading always shows; the line under it only when there is no project,
+    /// because that is the one case where the reader has something to do first.
+    fn render_empty_state(&self) -> AnyElement {
+        let tokens = self.tokens;
+        div()
+            .flex_1()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .text_size(px(text::BODY_SIZE))
+                    .text_color(tokens.text.hsla())
+                    .child(translate("empty-heading", self.language)),
+            )
+            .when(!self.has_project, |this| {
+                this.child(
+                    div()
+                        .text_size(px(text::DETAIL_SIZE))
+                        .text_color(tokens.muted.hsla())
+                        .child(translate("empty-detail", self.language)),
+                )
+            })
+            .into_any_element()
     }
 
     fn render_entry(&self, index: usize) -> AnyElement {
@@ -189,12 +245,19 @@ impl Render for Conversation {
             .flex()
             .flex_col()
             .min_h(px(0.0))
-            .child(
-                list(self.list.clone(), move |index, _window, cx| {
-                    entity.read(cx).render_entry(index)
-                })
-                .flex_1(),
-            )
+            // A blank canvas reads as a broken view rather than as an empty one,
+            // so the transcript says what to do while there is nothing in it.
+            .when(self.messages.is_empty(), |this| {
+                this.child(self.render_empty_state())
+            })
+            .when(!self.messages.is_empty(), |this| {
+                this.child(
+                    list(self.list.clone(), move |index, _window, cx| {
+                        entity.read(cx).render_entry(index)
+                    })
+                    .flex_1(),
+                )
+            })
     }
 }
 

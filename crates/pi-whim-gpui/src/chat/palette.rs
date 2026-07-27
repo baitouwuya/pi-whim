@@ -16,7 +16,7 @@ use gpui::{
     prelude::FluentBuilder, px,
 };
 use gpui_component::Icon;
-use pi_whim_core::AppState;
+use pi_whim_core::{AppState, Language, strings::text as translate};
 use pi_whim_engine::slash_commands::{
     SlashCommand, SlashCommandOption, options as command_options,
 };
@@ -93,6 +93,12 @@ pub struct Palette {
     /// reopen on the next keystroke that leaves the text unchanged.
     dismissed: Option<String>,
     scroll: ScrollHandle,
+    /// The language the panel's own headings are read in.
+    ///
+    /// Kept from the snapshot `sync` already receives rather than set separately —
+    /// the options' own titles come from the same state, so a second path could
+    /// leave the heading in one language and the rows in the other.
+    language: Language,
     tokens: Tokens,
 }
 
@@ -106,6 +112,7 @@ impl Palette {
             query: None,
             dismissed: None,
             scroll: ScrollHandle::new(),
+            language: Language::default(),
             tokens,
         }
     }
@@ -126,6 +133,7 @@ impl Palette {
     /// purely as a function of the text, with no separate open/close state to
     /// leave stale.
     pub fn sync(&mut self, state: &AppState, composer_text: &str, cx: &mut Context<Self>) {
+        self.language = state.language;
         let Some(options) = command_options(state, composer_text) else {
             // Not a slash query at all. Clearing the dismissal too, so a later
             // `/` reopens rather than staying suppressed.
@@ -242,7 +250,20 @@ impl Render for Palette {
                     .font_family(pi_whim_theme::font::MONO)
                     .text_size(px(text::LABEL_SIZE))
                     .text_color(tokens.muted.hsla())
-                    .child("SLASH COMMANDS"),
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(translate("slash-commands", self.language))
+                    // How to drive it, beside what it is: the keys are not
+                    // discoverable from a list of rows, and this header row is
+                    // already paid for.
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_align(gpui::TextAlign::Right)
+                            .text_color(tokens.line_strong.hsla())
+                            .child(translate("slash-help", self.language)),
+                    ),
             )
             .child(
                 div()
@@ -270,22 +291,31 @@ impl Render for Palette {
                                     .size(px(20.0))
                                     .text_color(tokens.muted.hsla()),
                             )
+                            // Name and description on one line, not stacked. Two
+                            // lines per option made ten commands a wall of text and
+                            // halved how many fit before scrolling; the name is what
+                            // is being scanned, and the description only has to be
+                            // there when the eye stops.
                             .child(
                                 div()
-                                    .flex()
-                                    .flex_col()
-                                    .child(
-                                        div()
-                                            .text_size(px(text::DETAIL_SIZE))
-                                            .text_color(tokens.text.hsla())
-                                            .child(SharedString::from(option.title.clone())),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(text::LABEL_SIZE))
-                                            .text_color(tokens.muted.hsla())
-                                            .child(SharedString::from(option.detail.clone())),
-                                    ),
+                                    .flex_none()
+                                    .text_size(px(text::DETAIL_SIZE))
+                                    .text_color(tokens.text.hsla())
+                                    .child(SharedString::from(option.title.clone())),
+                            )
+                            .child(
+                                // Right-aligned, and the only part that gives up
+                                // space: a long description truncates rather than
+                                // pushing the name it belongs to out of line.
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .text_right()
+                                    .text_size(px(text::LABEL_SIZE))
+                                    .text_color(tokens.muted.hsla())
+                                    .child(SharedString::from(option.detail.clone())),
                             )
                     })),
             )
