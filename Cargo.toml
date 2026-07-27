@@ -42,7 +42,6 @@ gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", 
 keyring = { version = "3.6", features = ["apple-native"] }
 libc = "0.2"
 parking_lot = "0.12"
-rfd = "0.15"
 rusqlite = { version = "0.35", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

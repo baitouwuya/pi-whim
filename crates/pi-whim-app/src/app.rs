@@ -43,6 +43,28 @@ use pi_whim_engine::state::EngineState;
 use pi_whim_engine::{controls, dialogs, events, launch, notice};
 use pi_whim_gpui::Request;
 
+/// A file picker the host should open, and what to do with the answer.
+///
+/// The orchestration decides *that* a picker is wanted — it owns the checks and
+/// the notices — but cannot open one, so it names the intent and the host carries
+/// it out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Picker {
+    /// Files to attach to the draft.
+    Attachments,
+    /// A folder to attach whole.
+    AttachmentFolder,
+    /// A folder to register as a project.
+    Project,
+}
+
+impl Picker {
+    /// Whether this picker chooses folders rather than files.
+    pub(crate) fn wants_directories(self) -> bool {
+        matches!(self, Self::AttachmentFolder | Self::Project)
+    }
+}
+
 pub struct PiWhimApplication<R: AgentRuntime = PiRpcRuntime> {
     engine: EngineState,
     store: Option<SqliteStore>,
@@ -70,6 +92,12 @@ pub struct PiWhimApplication<R: AgentRuntime = PiRpcRuntime> {
     ///
     /// Written by the host, which is the only part of this that has a window.
     clipboard: Option<String>,
+    /// A file picker to open, and what its answer is for.
+    ///
+    /// Staged for the same reason as the clipboard: the platform picker needs the
+    /// window. `Option` rather than a queue — two pickers at once is two modal
+    /// dialogs, and the second would have nothing to add.
+    picker: Option<Picker>,
     capability_resolver: ModelCapabilityResolver,
     sessions_root_override: Option<PathBuf>,
     agent_directory_override: Option<PathBuf>,
@@ -149,6 +177,7 @@ impl Default for PiWhimApplication<PiRpcRuntime> {
             closed: Vec::new(),
             attached: Vec::new(),
             clipboard: None,
+            picker: None,
             capability_resolver,
             sessions_root_override: None,
             agent_directory_override: None,
@@ -211,6 +240,24 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     /// Text a command produced for the clipboard.
     pub(crate) fn take_clipboard(&mut self) -> Option<String> {
         self.clipboard.take()
+    }
+
+    /// A file picker the host should open on this side's behalf.
+    pub(crate) fn take_picker(&mut self) -> Option<Picker> {
+        self.picker.take()
+    }
+
+    /// Act on what a picker returned.
+    pub(crate) fn picked(&mut self, picker: Picker, paths: Vec<PathBuf>) {
+        match picker {
+            Picker::Attachments | Picker::AttachmentFolder => self.attach_paths(paths),
+            // One folder, so the picker was opened without `multiple`.
+            Picker::Project => {
+                if let Some(path) = paths.first() {
+                    self.add_project_at(path);
+                }
+            }
+        }
     }
 
     /// A signal that the online capability catalog has arrived.
@@ -280,7 +327,10 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                     self.notices.error(error);
                 }
             }
-            Request::PickAttachments { directories } => self.pick_attachments(directories),
+            // Opened by the host, which has the window the platform picker needs.
+            Request::PickAttachments { .. } => {
+                debug_assert!(false, "the host opens the picker");
+            }
             Request::SetAutoCompaction(enabled) => self.set_auto_compaction(enabled),
             Request::Stop => {
                 if let Err(error) = self.active_command(json!({"type":"abort"})) {
@@ -340,7 +390,9 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             }
             SlashCommand::AddAttachment => {
                 if self.state().selected_project.is_some() {
-                    self.pick_attachments(false);
+                    // Staged for the host: the picker needs the window, and the
+                    // project check belongs here with the notice it produces.
+                    self.picker = Some(Picker::Attachments);
                 } else {
                     self.notices
                         .error("Select a project before adding attachments.");
@@ -423,14 +475,15 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         }));
     }
 
+    /// Ask for a folder to register. The host opens the picker and answers with
+    /// [`Self::add_project_at`].
     fn add_project(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
-            .set_title("Add Pi-Whim project")
-            .pick_folder()
-        else {
-            return;
-        };
-        let path = canonical_path(&path);
+        self.picker = Some(Picker::Project);
+    }
+
+    /// Register `path` as a project.
+    pub(crate) fn add_project_at(&mut self, path: &Path) {
+        let path = canonical_path(path);
         let name = path
             .file_name()
             .and_then(|value| value.to_str())
@@ -1405,22 +1458,14 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         Ok(())
     }
 
-    /// Ask for something on disk, and stage whatever was chosen.
+    /// Stage the paths a picker returned.
     ///
-    /// Files and folders are separate pickers rather than one that accepts both: a
-    /// folder is attached whole, and a picker that took either would make "this
-    /// file" and "the folder it is in" the same gesture.
-    pub(crate) fn pick_attachments(&mut self, directories: bool) {
-        let dialog = rfd::FileDialog::new();
-        let chosen = if directories {
-            dialog
-                .set_title("Choose attachment folder")
-                .pick_folder()
-                .map(|path| vec![path])
-        } else {
-            dialog.set_title("Choose attachments").pick_files()
-        };
-        for path in chosen.into_iter().flatten() {
+    /// The picker itself is opened by the host, which has the window: the platform
+    /// one is asynchronous, and awaiting it here would mean either blocking the
+    /// main thread or holding a borrow across the await. Turning a path into an
+    /// attachment is still this side's job, because the notices are.
+    pub(crate) fn attach_paths(&mut self, paths: Vec<PathBuf>) {
+        for path in paths {
             match attachment_from_path(&path, false) {
                 Ok(attachment) => self.attached.push(attachment),
                 Err(error) => self.notices.error(error),
@@ -1837,6 +1882,7 @@ mod tests {
             closed: Vec::new(),
             attached: Vec::new(),
             clipboard: None,
+            picker: None,
             capability_resolver: ModelCapabilityResolver::new(
                 &pi_whim_catalog::SharedCatalog::default(),
                 false,

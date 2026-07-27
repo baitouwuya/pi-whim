@@ -22,7 +22,6 @@ pi-whim-gpui = { path = "../pi-whim-gpui" }
 pi-whim-persistence = { path = "../pi-whim-persistence" }
 pi-whim-runtime = { path = "../pi-whim-runtime" }
 pi-whim-theme = { path = "../pi-whim-theme" }
-rfd.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 ureq.workspace = true

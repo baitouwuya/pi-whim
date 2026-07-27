@@ -10,11 +10,11 @@
 //! do the waking: [`pi_whim_gpui::pump`] blocks on a background thread and returns
 //! to the main thread with each batch, so an idle app costs nothing.
 
-use gpui::{ClipboardItem, Context, Entity, IntoElement, Render, Task, Window};
+use gpui::{ClipboardItem, Context, Entity, IntoElement, PathPromptOptions, Render, Task, Window};
 use pi_whim_gpui::{Request, RequestsRaised, Workspace, pump};
 use pi_whim_runtime::AgentRuntime;
 
-use crate::app::PiWhimApplication;
+use crate::app::{PiWhimApplication, Picker};
 
 /// The window's view, and what it drives.
 ///
@@ -107,6 +107,11 @@ impl<R: AgentRuntime + 'static> Host<R> {
         if let Some(text) = self.application.take_clipboard() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
+        // `/attach` and "add project" stage a picker for the same reason: it
+        // needs the window.
+        if let Some(picker) = self.application.take_picker() {
+            self.open_picker(picker, window, cx);
+        }
         self.shell.update(cx, |shell, cx| {
             shell.set_state(state, window, cx);
             for key in closed {
@@ -196,8 +201,50 @@ impl<R: AgentRuntime + 'static> Host<R> {
             Request::CopyToClipboard(text) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
             }
+            Request::PickAttachments { directories } => {
+                let picker = if directories {
+                    Picker::AttachmentFolder
+                } else {
+                    Picker::Attachments
+                };
+                self.open_picker(picker, window, cx);
+            }
             other => self.application.handle(other),
         }
+    }
+
+    /// Open a picker on the orchestration's behalf, and hand back what was chosen.
+    ///
+    /// Files and folders are separate pickers rather than one that accepts both: a
+    /// folder is attached whole, and a picker that took either would make "this
+    /// file" and "the folder it is in" the same gesture.
+    ///
+    /// Asynchronous, and that is load-bearing rather than incidental. `rfd`'s
+    /// blocking dialogs ran a nested native event loop on the main thread, which
+    /// let a pump's task be polled while the app was already borrowed — an abort
+    /// inside gpui's `RefCell`, reached without any panic of ours. Awaiting the
+    /// paths means the borrow is taken once, after the answer.
+    fn open_picker(&mut self, picker: Picker, window: &Window, cx: &mut Context<Self>) {
+        let directories = picker.wants_directories();
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: !directories,
+            directories,
+            // Only attachments come in batches; a project is one folder.
+            multiple: picker == Picker::Attachments,
+            prompt: None,
+        });
+        cx.spawn_in(window, async move |host, cx| {
+            // Three ways to have nothing: the channel dropped, the platform
+            // failed, or the reader cancelled. None is worth reporting.
+            let Ok(Ok(Some(paths))) = paths.await else {
+                return;
+            };
+            let _ = host.update_in(cx, |host, window, cx| {
+                host.application.picked(picker, paths);
+                host.publish(window, cx);
+            });
+        })
+        .detach();
     }
 }
 
