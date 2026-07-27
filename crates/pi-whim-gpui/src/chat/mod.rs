@@ -7,6 +7,7 @@ mod conversation;
 mod message_card;
 mod palette;
 mod paste;
+mod queue_status;
 mod rows;
 mod sidebar;
 
@@ -16,5 +17,6 @@ pub use conversation::{Conversation, ConversationEvent, visible_messages};
 pub use message_card::MessageCard;
 pub use palette::{Palette, PaletteEvent};
 pub use paste::{Clipboard, Paste, classify};
-pub use rows::{Row, rows};
+pub use queue_status::QueueStatus;
+pub use rows::{Row, rows, searchable_rows, session_title_or_default};
 pub use sidebar::{Sidebar, SidebarEvent};

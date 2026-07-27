@@ -1,15 +1,19 @@
 //! General settings: language, context, shell policy, agent team, queue modes.
 //!
-//! Every row reads from `AppState` and reports a change. Nothing here holds a
-//! draft, because there is nothing to validate — the controls only produce legal
-//! values, and the two numeric fields are clamped by the control itself.
+//! Every row reads from `AppState`. Values that restart Pi stay in their input
+//! fields until an explicit Apply, so editing cannot abort a turn in flight.
 
-use gpui::{AnyElement, Entity, IntoElement, ParentElement, Styled, div, px};
+use gpui::{AnyElement, Entity, IntoElement, ParentElement, Styled, Window, div, px};
 use gpui_component::{
+    Sizable,
+    button::{Button, ButtonVariants},
     checkbox::Checkbox,
     input::{Input, InputState, NumberInput},
 };
-use pi_whim_core::{AppState, BashPolicy, Language, QueueMode, strings::tr};
+use pi_whim_core::{
+    AgentTeamConfig, AppState, BashPolicy, Language, QueueMode,
+    strings::{text as translate, tr},
+};
 use pi_whim_theme::Tokens;
 
 use crate::settings::{
@@ -48,7 +52,7 @@ pub fn render(state: &AppState, fields: &Fields, tokens: Tokens, emit: Emit) -> 
             tr(state, "blocked-patterns"),
             Some(tr(state, "blocked-patterns-help")),
             tokens,
-            Input::new(&fields.blocked_patterns),
+            blocked_patterns_control(fields, emit.clone(), state.language),
         ))
         .child(form::section_header(
             tr(state, "agent-team"),
@@ -67,10 +71,69 @@ pub fn render(state: &AppState, fields: &Fields, tokens: Tokens, emit: Emit) -> 
             tokens,
             numeric(&fields.max_agents_per_level),
         ))
+        .child(agent_team_apply(fields, state, emit.clone()))
         .child(form::section_header(tr(state, "queue-mode"), None, tokens))
         .child(steering_row(state, tokens, emit.clone()))
         .child(follow_up_row(state, tokens, emit))
         .into_any_element()
+}
+
+/// Keep destructive launch settings as a draft until the reader applies them.
+///
+/// Changing a character must not restart Pi and abort the current turn; only the
+/// explicit button below crosses the application boundary.
+fn blocked_patterns_control(fields: &Fields, emit: Emit, language: Language) -> AnyElement {
+    let field = fields.blocked_patterns.clone();
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(6.0))
+        .child(Input::new(&field))
+        .child(
+            div().flex().justify_end().child(
+                Button::new("apply-blocked-patterns")
+                    .primary()
+                    .small()
+                    .label(translate("apply", language))
+                    .on_click(move |_, window: &mut Window, cx| {
+                        let patterns = parse_blocked_patterns(&field.read(cx).value());
+                        emit(SettingsEvent::SetBlockedPatterns(patterns), window, cx);
+                    }),
+            ),
+        )
+        .into_any_element()
+}
+
+fn agent_team_apply(fields: &Fields, state: &AppState, emit: Emit) -> AnyElement {
+    let max_depth = fields.max_depth.clone();
+    let max_agents = fields.max_agents_per_level.clone();
+    let current = state.agent_team_config.clone();
+    let language = state.language;
+    form::control_row(
+        Button::new("apply-agent-team")
+            .primary()
+            .small()
+            .label(translate("apply", language))
+            .on_click(move |_, window, cx| {
+                let depth = max_depth
+                    .read(cx)
+                    .value()
+                    .parse::<u8>()
+                    .unwrap_or(current.max_depth);
+                let agents = max_agents
+                    .read(cx)
+                    .value()
+                    .parse::<u16>()
+                    .unwrap_or(current.max_agents_per_level);
+                let config = AgentTeamConfig {
+                    max_depth: depth,
+                    max_agents_per_level: agents,
+                    ..current.clone()
+                }
+                .normalized();
+                emit(SettingsEvent::SetAgentTeamConfig(config), window, cx);
+            }),
+    )
 }
 
 /// A number field, narrower than a text field because the values are single

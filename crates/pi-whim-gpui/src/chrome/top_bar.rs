@@ -6,7 +6,7 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants};
 use pi_whim_core::{Language, SessionMetrics, SessionStatus, strings::text as translate};
-use pi_whim_theme::{ThemeMode, Tokens, text};
+use pi_whim_theme::{ThemeMode, Tokens, font, text};
 
 use crate::{
     chrome::{SessionMeter, StatusPill},
@@ -26,6 +26,8 @@ pub struct TopBar {
     /// state here to keep in step with the snapshot.
     language: Language,
     tokens: Tokens,
+    /// Selected project/session, kept compact in the global title row.
+    location: Option<String>,
     /// What the visible session has cost, once it has reported anything.
     meter: Option<SessionMeter>,
     on_toggle_theme: Option<ClickHandler>,
@@ -39,10 +41,22 @@ impl TopBar {
             mode,
             language,
             tokens,
+            location: None,
             meter: None,
             on_toggle_theme: None,
             on_open_settings: None,
         }
+    }
+
+    pub fn location(mut self, project: Option<&str>, session: Option<&str>) -> Self {
+        self.location =
+            project.map(
+                |project| match session.filter(|title| !title.trim().is_empty()) {
+                    Some(session) => format!("{project} / {session}"),
+                    None => project.to_owned(),
+                },
+            );
+        self
     }
 
     /// Show the session's cost and token counts beside the status.
@@ -118,6 +132,19 @@ impl RenderOnce for TopBar {
                     .child("Pi-Whim"),
             )
             .child(StatusPill::new(self.status, self.language, tokens))
+            .when_some(self.location, |this, location| {
+                this.child(
+                    div()
+                        .max_w(px(360.0))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .font_family(font::MONO)
+                        .text_size(px(text::LABEL_SIZE))
+                        .text_color(tokens.muted.hsla())
+                        .child(location),
+                )
+            })
             // Push the controls to the trailing edge.
             .child(div().flex_1())
             .when_some(self.meter, |this, meter| this.child(meter))
@@ -181,5 +208,21 @@ mod tests {
         .on_open_settings(|_, _, _| {});
         assert!(wired.on_toggle_theme.is_some());
         assert!(wired.on_open_settings.is_some());
+    }
+
+    #[test]
+    fn project_and_session_share_one_compact_location() {
+        let bar = TopBar::new(
+            SessionStatus::Ready,
+            ThemeMode::Light,
+            Language::English,
+            Tokens::light(),
+        )
+        .location(Some("pi-whim"), Some("Restore GPUI parity"));
+
+        assert_eq!(
+            bar.location.as_deref(),
+            Some("pi-whim / Restore GPUI parity")
+        );
     }
 }

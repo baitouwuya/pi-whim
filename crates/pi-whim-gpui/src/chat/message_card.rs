@@ -9,15 +9,23 @@
 //! and is rendered muted rather than shown as markup.
 
 use gpui::{
-    AnyElement, App, Hsla, IntoElement, ParentElement, RenderOnce, SharedString, Styled, Window,
-    div, prelude::FluentBuilder, px,
+    AnyElement, App, Entity, Hsla, IntoElement, ParentElement, RenderOnce, SharedString, Styled,
+    Window, div, prelude::FluentBuilder, px,
 };
-use gpui_component::{Icon, text::TextView};
-use pi_whim_core::{ConversationItem, ConversationRole};
+use gpui_component::{
+    Icon, IconName, Sizable,
+    button::{Button, ButtonVariants},
+    text::TextView,
+};
+use pi_whim_core::{ConversationItem, ConversationRole, Language, strings::text as translate};
 use pi_whim_engine::thinking::{Segment, split_thinking_segments};
 use pi_whim_theme::{Rgba, Tokens, layout, text};
 
-use crate::{icons, theme::IntoHsla};
+use crate::{
+    chat::{Conversation, ConversationEvent},
+    icons,
+    theme::IntoHsla,
+};
 
 /// A single conversation entry.
 #[derive(IntoElement)]
@@ -27,6 +35,9 @@ pub struct MessageCard {
     /// The text to show, which for a streaming message is a prefix of the whole.
     visible_text: SharedString,
     expanded: bool,
+    language: Language,
+    /// The owning transcript receives action events so cards remain stateless.
+    events: Option<Entity<Conversation>>,
     tokens: Tokens,
 }
 
@@ -43,8 +54,20 @@ impl MessageCard {
             message,
             visible_text: visible_text.into(),
             expanded,
+            language: Language::default(),
+            events: None,
             tokens,
         }
+    }
+
+    pub fn language(mut self, language: Language) -> Self {
+        self.language = language;
+        self
+    }
+
+    pub fn events(mut self, owner: Entity<Conversation>) -> Self {
+        self.events = Some(owner);
+        self
     }
 
     /// The most this entry's content may span.
@@ -92,10 +115,60 @@ impl MessageCard {
                         .into_any_element()
                 } else {
                     TextView::markdown(("assistant-md", self.index * 32 + part), slice.to_owned())
+                        .selectable(true)
                         .into_any_element()
                 })
             })
             .collect()
+    }
+
+    /// Compact chips for files that travelled with a sent user message.
+    fn attachment_cards(&self) -> AnyElement {
+        let tokens = self.tokens;
+        div()
+            .flex()
+            .flex_wrap()
+            .gap(px(4.0))
+            .pt(px(6.0))
+            .children(self.message.attachments.iter().map(|attachment| {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .px(px(5.0))
+                    .py(px(2.0))
+                    .bg(opaque_over(tokens.accent_surface_soft(), tokens))
+                    .border_1()
+                    .border_color(tokens.accent_border_muted().hsla())
+                    .text_size(px(text::LABEL_SIZE))
+                    .text_color(tokens.muted.hsla())
+                    .child(Icon::new(icons::attachment()).size(px(10.0)))
+                    .child(attachment.name.clone())
+            }))
+            .into_any_element()
+    }
+
+    fn action_button(
+        &self,
+        id: String,
+        label: &'static str,
+        icon: Option<IconName>,
+        event: ConversationEvent,
+    ) -> Option<AnyElement> {
+        let owner = self.events.clone()?;
+        let button = Button::new(id).ghost().xsmall().tooltip(label);
+        let button = if let Some(icon) = icon {
+            button.icon(icon)
+        } else {
+            button.label(label)
+        };
+        Some(
+            button
+                .on_click(move |_, _, cx| {
+                    owner.update(cx, |_, cx| cx.emit(event.clone()));
+                })
+                .into_any_element(),
+        )
     }
 }
 
@@ -115,6 +188,9 @@ impl RenderOnce for MessageCard {
         let tokens = self.tokens;
         let width = self.content_width();
         let role = self.message.role.clone();
+        let language = self.language;
+        let message_id = self.message.id.clone();
+        let has_attachments = !self.message.attachments.is_empty();
 
         // A prompt is a bubble, so it shrinks to its text; everything else fills
         // the measure, because markdown and tool reports need a stable column to
@@ -125,15 +201,34 @@ impl RenderOnce for MessageCard {
             .when(!self.hugs_its_content(), |this| this.w(px(width)))
             .child(match role {
                 ConversationRole::User => div()
-                    .p(px(10.0))
-                    // Composited rather than translucent: a card sitting on the graph
-                    // paper would otherwise have the grid running through the text
-                    // behind it.
-                    .bg(opaque_over(tokens.accent_surface_soft(), tokens))
-                    .border_1()
-                    .border_color(tokens.accent_border_muted().hsla())
-                    .text_color(tokens.text.hsla())
-                    .child(self.visible_text.clone())
+                    .flex()
+                    .flex_col()
+                    .items_end()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .p(px(10.0))
+                            // Composited rather than translucent: a card sitting on the graph
+                            // paper would otherwise have the grid running through the text
+                            // behind it.
+                            .bg(opaque_over(tokens.accent_surface_soft(), tokens))
+                            .border_1()
+                            .border_color(tokens.accent_border_muted().hsla())
+                            .text_color(tokens.text.hsla())
+                            .when(!self.visible_text.is_empty(), |this| {
+                                this.child(self.visible_text.clone())
+                            })
+                            .when(has_attachments, |this| this.child(self.attachment_cards())),
+                    )
+                    .when_some(
+                        self.action_button(
+                            format!("fork-message-{}", self.index),
+                            translate("fork-here", language),
+                            None,
+                            ConversationEvent::ForkAt(message_id.clone()),
+                        ),
+                        |this, button| this.child(button),
+                    )
                     .into_any_element(),
 
                 ConversationRole::Assistant => div()
@@ -141,6 +236,35 @@ impl RenderOnce for MessageCard {
                     .flex_col()
                     .gap(px(8.0))
                     .children(self.assistant_body())
+                    .when(
+                        self.message.streaming
+                            && self.visible_text.as_ref() != self.message.full_text,
+                        |this| {
+                            this.when_some(
+                                self.action_button(
+                                    format!("reveal-message-{}", self.index),
+                                    translate("show-all", language),
+                                    Some(icons::details(false)),
+                                    ConversationEvent::RevealAll(message_id.clone()),
+                                ),
+                                |this, button| this.child(div().flex().justify_end().child(button)),
+                            )
+                        },
+                    )
+                    .when(
+                        !self.message.streaming && !self.message.full_text.trim().is_empty(),
+                        |this| {
+                            this.when_some(
+                                self.action_button(
+                                    format!("copy-message-{}", self.index),
+                                    translate("copy-report", language),
+                                    Some(icons::copy()),
+                                    ConversationEvent::CopyAssistant(message_id.clone()),
+                                ),
+                                |this, button| this.child(div().flex().justify_end().child(button)),
+                            )
+                        },
+                    )
                     .into_any_element(),
 
                 ConversationRole::Tool => {
@@ -154,6 +278,14 @@ impl RenderOnce for MessageCard {
                     } else {
                         tokens.accent
                     };
+                    let details_button = self.message.tool_details.as_ref().and_then(|_| {
+                        self.action_button(
+                            format!("tool-details-{}", self.index),
+                            translate("raw-tool-details", language),
+                            Some(icons::details(self.expanded)),
+                            ConversationEvent::ToggleToolDetails(message_id.clone()),
+                        )
+                    });
                     div()
                         .flex()
                         .flex_col()
@@ -174,10 +306,12 @@ impl RenderOnce for MessageCard {
                                 })
                                 .child(
                                     div()
+                                        .flex_1()
                                         .text_size(px(text::LABEL_SIZE))
                                         .text_color(accent.hsla())
                                         .child(name),
-                                ),
+                                )
+                                .when_some(details_button, |this, button| this.child(button)),
                         )
                         .when_some(self.message.tool_report.clone(), |this, report| {
                             this.child(

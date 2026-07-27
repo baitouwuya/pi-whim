@@ -15,7 +15,8 @@ use pi_whim_core::{
     Action, AppState, Attachment, ConversationItem, ConversationRole, Language, ModelOption,
     Project, ProjectId, ProviderId, ProviderProfile, ProviderProtocol, QueueMode,
     SearchEngineProfile, SessionMetrics, SessionStatus, SessionSummary, SubmitMode, ThinkingLevel,
-    normalize_provider_display_name, provider_name_key, stable_session_id, strings,
+    normalize_bash_patterns, normalize_provider_display_name, provider_name_key, stable_session_id,
+    strings,
 };
 use pi_whim_persistence::{
     AppPreferences, AttachmentStore, MacosKeychainStore, PreferencesRepository, ProjectRepository,
@@ -298,8 +299,8 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
 
     /// Carry out one request from the shell.
     ///
-    /// The shell has already done its half — the prompt is in the conversation,
-    /// the draft is cleared — so what is left is the store, the pool, and Pi.
+    /// The shell owns transient view state such as the cleared draft. Persistent
+    /// transcript changes, the store, the pool, and Pi remain owned here.
     pub(crate) fn handle(&mut self, request: Request) {
         match request {
             Request::AddProject => self.add_project(),
@@ -351,19 +352,27 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 self.save_preferences();
             }
             Request::SetBashPolicy(policy) => {
-                self.apply(Action::SetBashPolicy(policy));
-                self.save_preferences();
-                self.restart_selected_project();
+                if self.state().bash_policy != policy {
+                    self.apply(Action::SetBashPolicy(policy));
+                    self.save_preferences();
+                    self.restart_selected_project();
+                }
             }
             Request::SetBlockedPatterns(patterns) => {
-                self.apply(Action::SetBashBlockedPatterns(patterns));
-                self.save_preferences();
-                self.restart_selected_project();
+                let patterns = normalize_bash_patterns(patterns);
+                if self.state().bash_blocked_patterns != patterns {
+                    self.apply(Action::SetBashBlockedPatterns(patterns));
+                    self.save_preferences();
+                    self.restart_selected_project();
+                }
             }
             Request::SetAgentTeamConfig(config) => {
-                self.apply(Action::SetAgentTeamConfig(config));
-                self.save_preferences();
-                self.restart_selected_project();
+                let config = config.normalized();
+                if self.state().agent_team_config != config {
+                    self.apply(Action::SetAgentTeamConfig(config));
+                    self.save_preferences();
+                    self.restart_selected_project();
+                }
             }
             Request::SetModel(model) => self.queue_model_switch(model),
             Request::SetThinkingLevel(level) => self.set_thinking_level(level),
@@ -1511,18 +1520,46 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         std::mem::take(&mut self.attached)
     }
 
-    fn submit_prompt(&mut self, content: String, attachments: Vec<Attachment>, mode: SubmitMode) {
+    pub(crate) fn can_submit_prompt(&self) -> bool {
+        let Some(project_id) = self.state().selected_project else {
+            return false;
+        };
+        matches!(
+            self.state().session_status,
+            SessionStatus::Ready | SessionStatus::Streaming | SessionStatus::Compacting
+        ) && self
+            .active()
+            .is_some_and(|session| session.project_id == project_id)
+    }
+
+    /// Report why a prompt could not be accepted without creating a transcript
+    /// entry. The host uses this for the small window between a UI submission and
+    /// draining its request queue.
+    pub(crate) fn report_submission_unavailable(&mut self) {
         if self.state().selected_project.is_none() {
             self.report("notice-select-project-send");
-            return;
-        }
-        if !matches!(
+        } else if !matches!(
             self.state().session_status,
             SessionStatus::Ready | SessionStatus::Streaming | SessionStatus::Compacting
         ) {
             self.report("notice-not-ready");
+        } else {
+            self.report("notice-no-session");
+        }
+    }
+
+    fn submit_prompt(&mut self, content: String, attachments: Vec<Attachment>, mode: SubmitMode) {
+        if !self.can_submit_prompt() {
+            self.report_submission_unavailable();
             return;
         }
+        // Capture this before adding the optimistic user entry: failure to find
+        // an active session must leave both transcript and draft untouched.
+        let key = self
+            .sessions
+            .active_key()
+            .expect("can_submit_prompt requires an active session")
+            .to_owned();
         let item = ConversationItem {
             id: Uuid::new_v4().to_string(),
             role: ConversationRole::User,
@@ -1551,10 +1588,6 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 .iter()
                 .any(|message| message.role != ConversationRole::User);
         if defer_for_compaction {
-            let Some(key) = self.sessions.active_key().map(str::to_owned) else {
-                self.report("notice-no-session");
-                return;
-            };
             let result = self.active_send(json!({"type":"compact"}));
             match result {
                 Ok(()) => {
@@ -1568,10 +1601,6 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             }
             return;
         }
-        let Some(key) = self.sessions.active_key().map(str::to_owned) else {
-            self.report("notice-no-session");
-            return;
-        };
         if self.state().pending_model.is_some() {
             self.apply_pending_model(&key);
         }
@@ -2085,6 +2114,75 @@ mod tests {
         assert_eq!(app.sessions.active_key(), Some(running_key.as_str()));
         assert_eq!(app.sessions.iter().count(), 2);
         assert_eq!(observer.starts().len(), 2);
+    }
+
+    #[test]
+    fn a_missing_runtime_rejects_without_adding_a_user_message() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = test_application(&directory, FakeRuntime::default());
+        let project = project("test", directory.path());
+        let project_id = project.id;
+        app.apply(Action::ProjectsLoaded(vec![project]));
+        app.apply(Action::SelectProject(project_id));
+        app.apply(Action::SetSessionStatus(SessionStatus::Ready));
+
+        assert!(!app.can_submit_prompt());
+        app.submit_prompt("keep this draft".into(), Vec::new(), SubmitMode::Prompt);
+
+        assert!(app.state().conversation.is_empty());
+        assert!(
+            app.take_notices()
+                .iter()
+                .any(|notice| notice.message.contains("No active session"))
+        );
+    }
+
+    #[test]
+    fn an_active_session_from_another_project_cannot_receive_the_prompt() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = FakeRuntime::default();
+        let observer = runtime.clone();
+        let mut app = test_application(&directory, runtime);
+        start_test_session(&mut app, &directory);
+        let commands_before = observer.commands().len();
+
+        let other = project("other", &directory.path().join("other"));
+        let other_id = other.id;
+        let mut projects = app.state().projects.clone();
+        projects.push(other);
+        app.apply(Action::ProjectsLoaded(projects));
+        app.apply(Action::SelectProject(other_id));
+        app.apply(Action::SetSessionStatus(SessionStatus::Ready));
+
+        assert!(!app.can_submit_prompt());
+        app.submit_prompt(
+            "do not misroute this".into(),
+            Vec::new(),
+            SubmitMode::Prompt,
+        );
+
+        assert!(app.state().conversation.is_empty());
+        assert_eq!(observer.commands().len(), commands_before);
+    }
+
+    #[test]
+    fn applying_unchanged_launch_settings_does_not_restart_pi() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = FakeRuntime::default();
+        let observer = runtime.clone();
+        let mut app = test_application(&directory, runtime);
+        start_test_session(&mut app, &directory);
+        let starts = observer.starts().len();
+
+        app.handle(Request::SetBashPolicy(app.state().bash_policy));
+        app.handle(Request::SetBlockedPatterns(
+            app.state().bash_blocked_patterns.clone(),
+        ));
+        app.handle(Request::SetAgentTeamConfig(
+            app.state().agent_team_config.clone(),
+        ));
+
+        assert_eq!(observer.starts().len(), starts);
     }
 
     #[test]

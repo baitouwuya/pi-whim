@@ -5,7 +5,7 @@
 //! testable without a window, which is where the collapsing and selection rules
 //! are worth pinning down.
 
-use pi_whim_core::{AppState, ProjectId, SessionId};
+use pi_whim_core::{AppState, Language, ProjectId, SessionId};
 use std::collections::BTreeSet;
 
 /// One line in the sidebar.
@@ -54,6 +54,21 @@ impl Row {
 /// sessions is working, so collapsing a project does not hide that something is
 /// still going on inside it.
 pub fn rows(state: &AppState, expanded: &BTreeSet<ProjectId>) -> Vec<Row> {
+    build_rows(state, expanded, false)
+}
+
+/// Build the complete tree used by search, including sessions whose projects
+/// are currently collapsed. Project rows retain their real expansion state so
+/// clearing the query can restore the exact tree the reader left.
+pub fn searchable_rows(state: &AppState, expanded: &BTreeSet<ProjectId>) -> Vec<Row> {
+    build_rows(state, expanded, true)
+}
+
+fn build_rows(
+    state: &AppState,
+    expanded: &BTreeSet<ProjectId>,
+    include_collapsed_sessions: bool,
+) -> Vec<Row> {
     let mut rows = Vec::new();
     for project in &state.projects {
         let sessions = state.sessions.get(&project.id);
@@ -72,7 +87,7 @@ pub fn rows(state: &AppState, expanded: &BTreeSet<ProjectId>) -> Vec<Row> {
             selected: state.selected_project == Some(project.id),
         });
 
-        if !is_expanded {
+        if !is_expanded && !include_collapsed_sessions {
             continue;
         }
         for session in sessions.into_iter().flatten() {
@@ -80,13 +95,23 @@ pub fn rows(state: &AppState, expanded: &BTreeSet<ProjectId>) -> Vec<Row> {
                 id: session.id,
                 project_id: project.id,
                 pi_path: session.pi_path.clone(),
-                title: session.title.clone(),
+                // A fresh Pi transcript has no title until its first prompt.
+                // Give it a navigable label instead of rendering a blank row.
+                title: session_title_or_default(&session.title, state.language),
                 running: state.running_sessions.contains(&session.pi_path),
                 selected: state.selected_session == Some(session.id),
             });
         }
     }
     rows
+}
+
+pub fn session_title_or_default(title: &str, language: Language) -> String {
+    if title.trim().is_empty() {
+        pi_whim_core::strings::text("new-session", language).to_owned()
+    } else {
+        title.to_owned()
+    }
 }
 
 #[cfg(test)]
@@ -139,6 +164,22 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert!(!rows[0].is_session());
+    }
+
+    #[test]
+    fn search_data_keeps_sessions_from_collapsed_projects() {
+        let (state, _) = populated();
+        let rows = searchable_rows(&state, &BTreeSet::new());
+
+        assert_eq!(rows.len(), 3);
+        assert!(matches!(
+            rows[0],
+            Row::Project {
+                expanded: false,
+                ..
+            }
+        ));
+        assert!(rows[1..].iter().all(Row::is_session));
     }
 
     #[test]
@@ -233,6 +274,27 @@ mod tests {
         state.dispatch(Action::ProjectsLoaded(vec![project]));
 
         assert_eq!(rows(&state, &BTreeSet::from([id])).len(), 1);
+    }
+
+    #[test]
+    fn an_untitled_session_gets_a_localized_fallback() {
+        let mut state = AppState {
+            language: pi_whim_core::Language::SimplifiedChinese,
+            ..Default::default()
+        };
+        let project = project("alpha");
+        let id = project.id;
+        state.dispatch(Action::ProjectsLoaded(vec![project]));
+        state.dispatch(Action::SessionsLoaded {
+            project_id: id,
+            sessions: vec![session(id, "/tmp/alpha/blank.jsonl", "   ")],
+        });
+
+        let rows = rows(&state, &BTreeSet::from([id]));
+        let Row::Session { title, .. } = &rows[1] else {
+            panic!("expected a session row");
+        };
+        assert_eq!(title, "新建会话");
     }
 
     #[test]

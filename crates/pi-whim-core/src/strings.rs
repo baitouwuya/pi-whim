@@ -15,6 +15,16 @@ use crate::{AppState, Language};
 /// are edited together.
 const STRINGS: &[(&str, &str, &str)] = &[
     ("projects", "Projects", "项目"),
+    (
+        "search-projects",
+        "Search projects and sessions",
+        "搜索项目和会话",
+    ),
+    (
+        "no-search-results",
+        "No matching projects or sessions.",
+        "没有匹配的项目或会话。",
+    ),
     ("add-project", "Add local project", "添加本地项目"),
     (
         "empty-projects",
@@ -282,6 +292,19 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ("allow", "Allow", "允许"),
     ("deny", "Deny", "拒绝"),
     ("blocked-patterns", "Blocked patterns", "阻止模式"),
+    ("apply", "Apply", "应用"),
+    ("remove-attachment", "Remove attachment", "移除附件"),
+    ("fork-here", "Fork here", "从此处分叉"),
+    ("copy-report", "Copy reply", "复制回复"),
+    ("copy-error", "Copy error", "复制错误信息"),
+    ("dismiss", "Dismiss", "关闭"),
+    ("move-up", "Move up", "上移"),
+    ("move-down", "Move down", "下移"),
+    ("raw-tool-details", "Raw tool details", "原始工具详情"),
+    ("show-all", "Show all", "显示完整内容"),
+    ("generating", "Generating", "正在生成"),
+    ("queued", "Queued", "排队中"),
+    ("follow-ups", "Follow-ups", "后续消息"),
     (
         "blocked-patterns-help",
         "One Bash command blocking pattern per line.",

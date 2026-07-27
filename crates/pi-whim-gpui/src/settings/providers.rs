@@ -18,6 +18,7 @@ use pi_whim_engine::settings::{Preset, ProviderDraft};
 use pi_whim_theme::{Tokens, font, text};
 
 use crate::{
+    icons,
     settings::{
         Emit, SettingsEvent,
         form::{self, CONTROL_WIDTH},
@@ -298,18 +299,20 @@ fn model_list(state: &AppState, draft: &ProviderDraft, tokens: Tokens, emit: Emi
     if draft.models.is_empty() {
         return form::control_row(form::help_text(tr(state, "no-models"), tokens));
     }
-    form::control_row(
-        div().flex().flex_col().gap(px(2.0)).children(
-            draft
-                .models
-                .iter()
-                .enumerate()
-                .map(|(index, model)| model_row(index, model, tokens, emit.clone())),
-        ),
-    )
+    form::control_row(div().flex().flex_col().gap(px(2.0)).children(
+        draft.models.iter().enumerate().map(|(index, model)| {
+            model_row(index, model, tr(state, "remove"), tokens, emit.clone())
+        }),
+    ))
 }
 
-fn model_row(index: usize, model: &ProviderModel, tokens: Tokens, emit: Emit) -> AnyElement {
+fn model_row(
+    index: usize,
+    model: &ProviderModel,
+    remove_label: &'static str,
+    tokens: Tokens,
+    emit: Emit,
+) -> AnyElement {
     let id = model.id.clone();
     // The thinking levels are listed because they are the reason a model is worth
     // picking over another, and they are not inferable from the id.
@@ -346,9 +349,10 @@ fn model_row(index: usize, model: &ProviderModel, tokens: Tokens, emit: Emit) ->
         )
         .child(
             Button::new(("remove-model", index as u64))
-                .label("×")
+                .icon(icons::close())
                 .ghost()
                 .xsmall()
+                .tooltip(remove_label)
                 .on_click(move |_, window, cx| {
                     emit(SettingsEvent::RemoveModel(id.clone()), window, cx)
                 }),

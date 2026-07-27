@@ -4,11 +4,18 @@
 //! miss entirely; these take a full row.
 
 use gpui::{
-    IntoElement, ParentElement, RenderOnce, Styled, Window, div, prelude::FluentBuilder, px,
+    App, ClickEvent, IntoElement, ParentElement, RenderOnce, Styled, Window, div,
+    prelude::FluentBuilder, px,
+};
+use gpui_component::{
+    Sizable,
+    button::{Button, ButtonVariants},
 };
 use pi_whim_theme::{Rgba, Tokens, text};
 
 use crate::theme::IntoHsla;
+
+type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 
 /// How prominent a banner should be.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,6 +37,10 @@ pub struct Banner {
     /// reader — "compacting context" says nothing about the conversation still
     /// being there afterwards.
     detail: Option<String>,
+    copy_label: Option<String>,
+    dismiss_label: Option<String>,
+    on_copy: Option<ClickHandler>,
+    on_dismiss: Option<ClickHandler>,
     tokens: Tokens,
 }
 
@@ -39,6 +50,10 @@ impl Banner {
             severity: Severity::Error,
             message: message.into(),
             detail: None,
+            copy_label: None,
+            dismiss_label: None,
+            on_copy: None,
+            on_dismiss: None,
             tokens,
         }
     }
@@ -48,6 +63,10 @@ impl Banner {
             severity: Severity::Progress,
             message: message.into(),
             detail: None,
+            copy_label: None,
+            dismiss_label: None,
+            on_copy: None,
+            on_dismiss: None,
             tokens,
         }
     }
@@ -55,6 +74,26 @@ impl Banner {
     /// Add the quieter second line.
     pub fn detail(mut self, detail: impl Into<String>) -> Self {
         self.detail = Some(detail.into());
+        self
+    }
+
+    pub fn on_copy(
+        mut self,
+        label: impl Into<String>,
+        handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.copy_label = Some(label.into());
+        self.on_copy = Some(Box::new(handler));
+        self
+    }
+
+    pub fn on_dismiss(
+        mut self,
+        label: impl Into<String>,
+        handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.dismiss_label = Some(label.into());
+        self.on_dismiss = Some(Box::new(handler));
         self
     }
 
@@ -85,6 +124,8 @@ impl RenderOnce for Banner {
     fn render(self, _window: &mut Window, _cx: &mut gpui::App) -> impl IntoElement {
         let accent = self.accent();
         let padding = self.vertical_padding();
+        let copy_label = self.copy_label;
+        let dismiss_label = self.dismiss_label;
         div()
             .flex()
             .items_center()
@@ -117,6 +158,26 @@ impl RenderOnce for Banner {
                         )
                     }),
             )
+            .when_some(self.on_copy, |this, handler| {
+                this.child(
+                    Button::new("copy-banner-error")
+                        .ghost()
+                        .xsmall()
+                        .icon(crate::icons::copy())
+                        .tooltip(copy_label.unwrap_or_default())
+                        .on_click(handler),
+                )
+            })
+            .when_some(self.on_dismiss, |this, handler| {
+                this.child(
+                    Button::new("dismiss-banner-error")
+                        .ghost()
+                        .xsmall()
+                        .icon(crate::icons::close())
+                        .tooltip(dismiss_label.unwrap_or_default())
+                        .on_click(handler),
+                )
+            })
     }
 }
 

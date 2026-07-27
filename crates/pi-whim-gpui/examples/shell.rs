@@ -7,8 +7,8 @@
 use gpui::{App, AppContext, Context, Window};
 use gpui_component::Root;
 use pi_whim_core::{
-    Action, AppState, ConversationItem, ConversationRole, ModelOption, Project, QueueMode,
-    SessionStatus, SessionSummary, ThinkingLevel, stable_session_id,
+    Action, AppState, Attachment, AttachmentKind, ConversationItem, ConversationRole, ModelOption,
+    Project, QueueMode, SessionStatus, SessionSummary, ThinkingLevel, stable_session_id,
 };
 use pi_whim_engine::dialogs::Prompt;
 use pi_whim_gpui::Workspace;
@@ -31,12 +31,13 @@ fn seed(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspa
     };
     let project_id = project.id;
     let pi_path = "/Users/example/pi-whim/session.jsonl";
+    let session_id = stable_session_id(pi_path);
 
     state.dispatch(Action::ProjectsLoaded(vec![project]));
     state.dispatch(Action::SessionsLoaded {
         project_id,
         sessions: vec![SessionSummary {
-            id: stable_session_id(pi_path),
+            id: session_id,
             project_id,
             pi_path: pi_path.into(),
             title: "Migrate the UI to gpui".into(),
@@ -45,6 +46,7 @@ fn seed(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspa
         }],
     });
     state.dispatch(Action::SelectProject(project_id));
+    state.dispatch(Action::SelectSession(session_id));
     state.dispatch(Action::SetSessionStatus(SessionStatus::Ready));
 
     // One question waiting, so the chooser is on screen for the visual check.
@@ -92,6 +94,10 @@ fn seed(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspa
         steering_mode: QueueMode::OneAtATime,
         follow_up_mode: QueueMode::All,
     });
+    state.dispatch(Action::QueueUpdated {
+        steering: vec!["Keep the backend boundary intact".into()],
+        follow_up: vec!["Run the complete workspace checks".into()],
+    });
 
     for (id, role, text) in [
         (
@@ -116,9 +122,31 @@ fn seed(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspa
             tool_details: None,
             is_error: false,
             model: None,
-            attachments: Vec::new(),
+            attachments: if id == "m1" {
+                vec![Attachment {
+                    name: "architecture.md".into(),
+                    path: "/Users/example/pi-whim/architecture.md".into(),
+                    kind: AttachmentKind::File,
+                    generated_by_app: false,
+                }]
+            } else {
+                Vec::new()
+            },
         }));
     }
+
+    state.dispatch(Action::UpsertConversation(ConversationItem {
+        id: "m4".into(),
+        role: ConversationRole::Tool,
+        full_text: String::new(),
+        streaming: false,
+        tool_name: Some("cargo test".into()),
+        tool_report: Some("157 GPUI tests passed".into()),
+        tool_details: Some(r#"{"status":"ok","passed":157}"#.into()),
+        is_error: false,
+        model: None,
+        attachments: Vec::new(),
+    }));
 
     workspace.set_state(state, window, cx);
 }

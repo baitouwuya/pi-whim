@@ -202,6 +202,27 @@ impl<R: AgentRuntime + 'static> Host<R> {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
             }
             Request::PickAttachments => self.open_picker(Picker::Attachments, window, cx),
+            Request::SubmitPrompt {
+                content,
+                attachments,
+                mode,
+            } => {
+                // The composer clears only after its local readiness check, but
+                // a session can disappear before this queued request reaches the
+                // host. Restore the exact draft if that race rejects the turn.
+                if !self.application.can_submit_prompt() {
+                    self.application.report_submission_unavailable();
+                    self.shell.update(cx, |shell, cx| {
+                        shell.restore_submission(content, attachments, window, cx);
+                    });
+                } else {
+                    self.application.handle(Request::SubmitPrompt {
+                        content,
+                        attachments,
+                        mode,
+                    });
+                }
+            }
             other => self.application.handle(other),
         }
     }

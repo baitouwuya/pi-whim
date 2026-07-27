@@ -12,6 +12,7 @@ use gpui::{
     prelude::FluentBuilder, px,
 };
 use gpui_component::{
+    Disableable,
     Icon,
     Sizable,
     button::{Button, ButtonVariants},
@@ -94,6 +95,8 @@ pub struct Composer {
     draft: Draft,
     /// True while the agent is working, which turns Send into Stop.
     busy: bool,
+    /// A prompt cannot be accepted until the host selected a project and session.
+    ready: bool,
     /// The language the placeholder and the buttons' tooltips are read in.
     language: Language,
     tokens: Tokens,
@@ -130,6 +133,7 @@ impl Composer {
             input,
             draft: Draft::new(),
             busy: false,
+            ready: false,
             language: Language::default(),
             tokens,
         }
@@ -138,6 +142,13 @@ impl Composer {
     pub fn set_busy(&mut self, busy: bool, cx: &mut Context<Self>) {
         if self.busy != busy {
             self.busy = busy;
+            cx.notify();
+        }
+    }
+
+    pub fn set_ready(&mut self, ready: bool, cx: &mut Context<Self>) {
+        if self.ready != ready {
+            self.ready = ready;
             cx.notify();
         }
     }
@@ -181,6 +192,25 @@ impl Composer {
 
     pub fn attachments(&self) -> &[Attachment] {
         self.draft.attachments()
+    }
+
+    /// Put a failed submission back exactly where it was typed.
+    pub fn restore_draft(
+        &mut self,
+        content: String,
+        attachments: Vec<Attachment>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let restored_text = content.clone();
+        self.input.update(cx, |input, cx| {
+            input.set_value(content, window, cx);
+        });
+        for attachment in attachments {
+            self.draft.add_attachment(attachment);
+        }
+        cx.emit(ComposerEvent::TextChanged(restored_text));
+        cx.notify();
     }
 
     /// What is typed right now.
@@ -230,6 +260,7 @@ impl Composer {
                 .primary()
                 .icon(icons::send())
                 .xsmall()
+                .disabled(!self.ready)
                 .tooltip(submit_hint(language))
                 .on_click(cx.listener(|composer, _, window, cx| composer.submit(window, cx)))
         };
@@ -248,6 +279,7 @@ impl Composer {
             .ghost()
             .icon(icons::add())
             .xsmall()
+            .disabled(!self.ready)
             .tooltip(translate("add-attachment", self.language))
             .on_click(cx.listener(|_, _, _, cx| cx.emit(ComposerEvent::PickAttachments)))
             .into_any_element()
@@ -272,6 +304,11 @@ impl Composer {
 
     /// Submit whatever is drafted, if there is anything worth sending.
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Keep the draft intact until the host says a project/session can accept
+        // it. Clearing first made a rejected send irrecoverably lose the text.
+        if !self.ready {
+            return;
+        }
         // The input owns the text; mirror it into the draft so the emptiness and
         // attachment rules live in one place.
         let typed = self.input.read(cx).value().to_string();
@@ -292,6 +329,7 @@ impl Composer {
         self.input.update(cx, |input, cx| {
             input.set_value("", window, cx);
         });
+        cx.emit(ComposerEvent::TextChanged(String::new()));
         cx.emit(ComposerEvent::Submit {
             content,
             attachments,
@@ -335,12 +373,7 @@ fn read_clipboard(cx: &App) -> Clipboard {
 impl Render for Composer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = self.tokens;
-        let attachments: Vec<String> = self
-            .draft
-            .attachments()
-            .iter()
-            .map(|attachment| attachment.name.clone())
-            .collect();
+        let attachments: Vec<Attachment> = self.draft.attachments().to_vec();
 
         div()
             // Captured, not bubbled: an action reaches the focused element first
@@ -365,23 +398,41 @@ impl Render for Composer {
             // composer box, not here: the runtime controls share that surface, and
             // two entities cannot each draw half of one panel.
             .when(!attachments.is_empty(), |this| {
-                this.child(div().flex().flex_wrap().gap(px(4.0)).children(
-                    attachments.into_iter().map(|name| {
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(4.0))
-                            .px(px(6.0))
-                            .py(px(2.0))
-                            .bg(tokens.accent_surface_soft().hsla())
-                            .border_1()
-                            .border_color(tokens.accent_border_muted().hsla())
-                            .text_size(px(text::LABEL_SIZE))
-                            .text_color(tokens.muted.hsla())
-                            .child(Icon::new(icons::attachment()).size(px(11.0)))
-                            .child(name)
-                    }),
-                ))
+                this.child(
+                    div().flex().flex_wrap().gap(px(4.0)).children(
+                        attachments
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, attachment)| {
+                                let path = attachment.path.clone();
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(4.0))
+                                    .px(px(6.0))
+                                    .py(px(2.0))
+                                    .bg(tokens.accent_surface_soft().hsla())
+                                    .border_1()
+                                    .border_color(tokens.accent_border_muted().hsla())
+                                    .text_size(px(text::LABEL_SIZE))
+                                    .text_color(tokens.muted.hsla())
+                                    .child(Icon::new(icons::attachment()).size(px(11.0)))
+                                    .child(attachment.name)
+                                    .child(
+                                        Button::new(("remove-attachment", index))
+                                            .ghost()
+                                            .xsmall()
+                                            .icon(icons::close())
+                                            .tooltip(translate("remove-attachment", self.language))
+                                            .on_click(cx.listener(move |_, _, _, cx| {
+                                                cx.emit(ComposerEvent::RemoveAttachment(
+                                                    path.clone(),
+                                                ));
+                                            })),
+                                    )
+                            }),
+                    ),
+                )
             })
             // Borderless, and with no focus ring: the box around the whole prompt
             // area is the shell's, and a second edge just inside it drew a field
@@ -390,7 +441,8 @@ impl Render for Composer {
                 Input::new(&self.input)
                     .bordered(false)
                     .focus_bordered(false)
-                    .appearance(false),
+                    .appearance(false)
+                    .disabled(!self.ready),
             )
     }
 }
@@ -399,6 +451,7 @@ impl Render for Composer {
 mod tests {
     use super::*;
     use pi_whim_core::AttachmentKind;
+    use pi_whim_theme::ThemePreference;
 
     fn attachment(path: &str) -> Attachment {
         Attachment {
@@ -457,5 +510,22 @@ mod tests {
         // Attachments alone are worth sending, even with no text.
         draft.add_attachment(attachment("/tmp/image.png"));
         assert!(!draft.is_empty());
+    }
+
+    #[gpui::test]
+    async fn an_unavailable_session_keeps_the_entire_draft(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| crate::init(ThemePreference::default(), cx).unwrap());
+        let composer = cx.add_window(|window, cx| Composer::new(Tokens::light(), window, cx));
+
+        composer
+            .update(cx, |composer, window, cx| {
+                composer.set_text("keep this", window, cx);
+                composer.add_attachment(attachment("/tmp/notes.txt"), cx);
+                composer.submit(window, cx);
+
+                assert_eq!(composer.text(cx), "keep this");
+                assert_eq!(composer.attachments().len(), 1);
+            })
+            .expect("the composer window is open");
     }
 }

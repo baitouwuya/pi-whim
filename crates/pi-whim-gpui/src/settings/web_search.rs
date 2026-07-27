@@ -15,11 +15,15 @@ use gpui_component::{
     checkbox::Checkbox,
     input::{Input, InputState},
 };
-use pi_whim_core::{AppState, SearchEngineProfile, strings::tr};
+use pi_whim_core::{
+    AppState, Language, SearchEngineProfile,
+    strings::{text as translate, tr},
+};
 use pi_whim_engine::settings::SearchEngineDraft;
 use pi_whim_theme::{Tokens, font, text};
 
 use crate::{
+    icons,
     settings::{Emit, SettingsEvent, form},
     theme::IntoHsla,
 };
@@ -88,13 +92,19 @@ fn engine_list(
         return form::control_row(form::help_text(tr(state, "no-search-engines"), tokens));
     }
     let last = profiles.len() - 1;
-    form::control_row(
-        div().flex().flex_col().gap(px(2.0)).children(
-            profiles.iter().enumerate().map(|(index, profile)| {
-                engine_row(index, last, profile, draft, tokens, emit.clone())
-            }),
-        ),
-    )
+    form::control_row(div().flex().flex_col().gap(px(2.0)).children(
+        profiles.iter().enumerate().map(|(index, profile)| {
+            engine_row(
+                index,
+                last,
+                profile,
+                draft,
+                state.language,
+                tokens,
+                emit.clone(),
+            )
+        }),
+    ))
 }
 
 fn engine_row(
@@ -102,6 +112,7 @@ fn engine_row(
     last: usize,
     profile: &SearchEngineProfile,
     draft: &SearchEngineDraft,
+    language: Language,
     tokens: Tokens,
     emit: Emit,
 ) -> AnyElement {
@@ -148,10 +159,11 @@ fn engine_row(
         // to bottom under one click is hard to aim.
         .child(
             Button::new(("engine-up", index as u64))
-                .label("↑")
+                .icon(icons::move_up())
                 .ghost()
                 .xsmall()
                 .disabled(index == 0)
+                .tooltip(translate("move-up", language))
                 .on_click(move |_, window, cx| {
                     up(
                         SettingsEvent::MoveSearchEngine { index, delta: -1 },
@@ -162,10 +174,11 @@ fn engine_row(
         )
         .child(
             Button::new(("engine-down", index as u64))
-                .label("↓")
+                .icon(icons::move_down())
                 .ghost()
                 .xsmall()
                 .disabled(index == last)
+                .tooltip(translate("move-down", language))
                 .on_click(move |_, window, cx| {
                     down(
                         SettingsEvent::MoveSearchEngine { index, delta: 1 },
@@ -176,9 +189,10 @@ fn engine_row(
         )
         .child(
             Button::new(("engine-remove", index as u64))
-                .label("×")
+                .icon(icons::close())
                 .ghost()
                 .xsmall()
+                .tooltip(translate("remove", language))
                 .on_click(move |_, window, cx| {
                     emit(SettingsEvent::RemoveSearchEngine(index), window, cx)
                 }),

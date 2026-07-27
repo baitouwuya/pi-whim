@@ -14,11 +14,11 @@
 //! Here it is a constructor argument, and `CachedMessageLayout` has no
 //! counterpart — gpui measures and caches item heights itself.
 
-use std::collections::HashSet;
+use std::{collections::HashSet, time::Duration};
 
 use gpui::{
-    AnyElement, Context, EventEmitter, IntoElement, ListAlignment, ListState, ParentElement,
-    Render, Styled, Window, div, list, prelude::FluentBuilder, px,
+    AnyElement, Context, EventEmitter, FollowMode, IntoElement, ListAlignment, ListState,
+    ParentElement, Render, Styled, Window, div, list, prelude::FluentBuilder, px,
 };
 use pi_whim_core::{
     AppState, ConversationItem, ConversationRole, Language, strings::text as translate,
@@ -30,12 +30,20 @@ use crate::{chat::MessageCard, theme::IntoHsla};
 
 /// How far beyond the visible span to render, so scrolling does not flash blank.
 const OVERDRAW: f32 = 400.0;
+/// A retained-mode window has no frame callback, so the reveal drives itself.
+const TYPEWRITER_FRAME: Duration = Duration::from_millis(16);
 
 /// What the conversation asks the shell to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConversationEvent {
     /// Show or hide a tool card's raw event data.
     ToggleToolDetails(String),
+    /// Reveal the rest of one streaming reply immediately.
+    RevealAll(String),
+    /// Fork the session at a user message.
+    ForkAt(String),
+    /// Copy a completed assistant reply.
+    CopyAssistant(String),
 }
 
 /// The scrolling list of conversation entries.
@@ -51,6 +59,10 @@ pub struct Conversation {
     has_project: bool,
     /// The language the empty state is read in.
     language: Language,
+    /// Whether the local transcript should show that Pi is generating.
+    generating: bool,
+    /// Prevents more than one reveal loop from running for this conversation.
+    typewriter_running: bool,
     tokens: Tokens,
     list: ListState,
 }
@@ -59,14 +71,21 @@ impl EventEmitter<ConversationEvent> for Conversation {}
 
 impl Conversation {
     pub fn new(tokens: Tokens) -> Self {
+        let list = ListState::new(0, ListAlignment::Top, px(OVERDRAW));
+        // Follow new output until the reader scrolls upward. GPUI disengages and
+        // re-engages this mode from real scroll input, so streaming never fights
+        // someone who is reading earlier messages.
+        list.set_follow_mode(FollowMode::Tail);
         Self {
             messages: Vec::new(),
             expanded: HashSet::new(),
             typewriter: Typewriter::new(),
             has_project: false,
             language: Language::default(),
+            generating: false,
+            typewriter_running: false,
             tokens,
-            list: ListState::new(0, ListAlignment::Top, px(OVERDRAW)),
+            list,
         }
     }
 
@@ -81,6 +100,26 @@ impl Conversation {
         }
         let previous = self.messages.len();
         let next = messages.len();
+
+        // Pi replaces a draft streaming id with its real entry id in place.
+        // Carry reveal progress across that rename, then discard progress for
+        // entries that genuinely left the transcript.
+        for (old, new) in self.messages.iter().zip(&messages) {
+            let same_stream = old.role == new.role
+                && old.streaming
+                && new.streaming
+                && (old.full_text.starts_with(&new.full_text)
+                    || new.full_text.starts_with(&old.full_text));
+            if old.id != new.id && same_stream {
+                self.typewriter.rekey(&old.id, &new.id);
+            }
+        }
+        let next_ids: HashSet<_> = messages.iter().map(|message| message.id.as_str()).collect();
+        for old in &self.messages {
+            if !next_ids.contains(old.id.as_str()) {
+                self.typewriter.forget(&old.id);
+            }
+        }
         self.messages = messages;
 
         if next >= previous {
@@ -88,12 +127,13 @@ impl Conversation {
             self.list.splice(previous..previous, next - previous);
             if previous > 0 {
                 // The last existing entry may have grown while streaming.
-                self.list.splice(previous - 1..previous, 1);
+                self.list.remeasure_items(previous - 1..previous);
             }
         } else {
             // Entries went away, which only happens on a reset.
             self.list.reset(next);
         }
+        self.start_typewriter(cx);
         cx.notify();
     }
 
@@ -103,6 +143,7 @@ impl Conversation {
         self.expanded.clear();
         self.typewriter.clear();
         self.list.reset(0);
+        self.list.set_follow_mode(FollowMode::Tail);
         cx.notify();
     }
 
@@ -126,21 +167,92 @@ impl Conversation {
         }
     }
 
+    pub fn set_generating(&mut self, generating: bool, cx: &mut Context<Self>) {
+        if self.generating != generating {
+            self.generating = generating;
+            cx.notify();
+        }
+    }
+
     /// Advance the typewriter, reporting whether anything became visible.
     pub fn advance_typewriter(&mut self, elapsed_seconds: f32, cx: &mut Context<Self>) -> bool {
         let changed = self.typewriter.advance(&self.messages, elapsed_seconds);
         if changed {
+            // The visible prefix can wrap onto another line, so its cached height
+            // is no longer valid even though the domain message did not change.
+            for (index, message) in self.messages.iter().enumerate() {
+                if message.streaming {
+                    self.list.remeasure_items(index..index + 1);
+                }
+            }
             cx.notify();
         }
         changed
     }
 
+    /// Start the reveal loop when a stream has text the reader cannot see yet.
+    fn start_typewriter(&mut self, cx: &mut Context<Self>) {
+        if self.typewriter_running || !self.has_unrevealed_streaming() {
+            return;
+        }
+        self.typewriter_running = true;
+        cx.spawn(async move |conversation, cx| {
+            loop {
+                cx.background_executor().timer(TYPEWRITER_FRAME).await;
+                let Ok(keep_running) = conversation.update(cx, |conversation, cx| {
+                    conversation.advance_typewriter(TYPEWRITER_FRAME.as_secs_f32(), cx);
+                    let keep_running = conversation.has_unrevealed_streaming();
+                    if !keep_running {
+                        conversation.typewriter_running = false;
+                    }
+                    keep_running
+                }) else {
+                    return;
+                };
+                if !keep_running {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn has_unrevealed_streaming(&self) -> bool {
+        self.messages.iter().any(|message| {
+            message.streaming && self.typewriter.visible_text(message) != message.full_text
+        })
+    }
+
     /// Reveal a streaming entry in full.
     pub fn reveal_all(&mut self, id: &str, cx: &mut Context<Self>) {
-        if let Some(message) = self.messages.iter().find(|message| message.id == id) {
+        if let Some((index, message)) = self
+            .messages
+            .iter()
+            .enumerate()
+            .find(|(_, message)| message.id == id)
+        {
             self.typewriter.reveal_all(message);
+            self.list.remeasure_items(index..index + 1);
+            self.scroll_to_latest();
             cx.notify();
         }
+    }
+
+    /// Reveal the newest streaming reply, which is what Escape acts on.
+    pub fn reveal_latest(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(id) = self
+            .messages
+            .iter()
+            .rev()
+            .find(|message| {
+                message.streaming && self.typewriter.visible_text(message) != message.full_text
+            })
+            .map(|message| message.id.clone())
+        else {
+            return false;
+        };
+        self.reveal_all(&id, cx);
+        true
     }
 
     /// Whether a tool entry's diagnostic detail is showing.
@@ -153,13 +265,16 @@ impl Conversation {
         if !self.expanded.remove(id) {
             self.expanded.insert(id.to_owned());
         }
+        if let Some(index) = self.messages.iter().position(|message| message.id == id) {
+            self.list.remeasure_items(index..index + 1);
+        }
         cx.notify();
     }
 
     /// Scroll so the newest entry is in view.
     pub fn scroll_to_latest(&mut self) {
-        if let Some(last) = self.messages.len().checked_sub(1) {
-            self.list.scroll_to_reveal_item(last);
+        if !self.messages.is_empty() {
+            self.list.set_follow_mode(FollowMode::Tail);
         }
     }
 
@@ -197,7 +312,7 @@ impl Conversation {
             .into_any_element()
     }
 
-    fn render_entry(&self, index: usize) -> AnyElement {
+    fn render_entry(&self, index: usize, owner: gpui::Entity<Self>) -> AnyElement {
         let Some(message) = self.messages.get(index) else {
             return div().into_any_element();
         };
@@ -208,7 +323,24 @@ impl Conversation {
             self.expanded.contains(&message.id),
             self.tokens,
         )
+        .language(self.language)
+        .events(owner)
         .into_any_element()
+    }
+
+    fn render_generating(&self) -> AnyElement {
+        let tokens = self.tokens;
+        div()
+            .flex()
+            .items_center()
+            .gap(px(7.0))
+            .px(px(18.0))
+            .py(px(5.0))
+            .text_size(px(text::LABEL_SIZE))
+            .text_color(tokens.muted.hsla())
+            .child(div().w(px(6.0)).h(px(6.0)).bg(tokens.accent.hsla()))
+            .child(translate("generating", self.language))
+            .into_any_element()
     }
 }
 
@@ -223,6 +355,7 @@ pub fn visible_messages(state: &AppState) -> Vec<ConversationItem> {
         .filter(|message| {
             !message.full_text.trim().is_empty()
                 || message.tool_report.is_some()
+                || !message.attachments.is_empty()
                 || matches!(message.role, ConversationRole::Tool)
         })
         .cloned()
@@ -253,10 +386,11 @@ impl Render for Conversation {
             .when(!self.messages.is_empty(), |this| {
                 this.child(
                     list(self.list.clone(), move |index, _window, cx| {
-                        entity.read(cx).render_entry(index)
+                        entity.read(cx).render_entry(index, entity.clone())
                     })
                     .flex_1(),
                 )
+                .when(self.generating, |this| this.child(self.render_generating()))
             })
     }
 }
@@ -264,6 +398,7 @@ impl Render for Conversation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::AppContext;
     use pi_whim_core::Action;
 
     fn message(id: &str, role: ConversationRole, text: &str) -> ConversationItem {
@@ -321,6 +456,102 @@ mod tests {
         state.dispatch(Action::UpsertConversation(item));
 
         assert_eq!(visible_messages(&state).len(), 1);
+    }
+
+    #[test]
+    fn an_attachment_only_prompt_still_shows() {
+        use pi_whim_core::{Attachment, AttachmentKind};
+
+        let mut state = AppState::default();
+        let mut item = message("a", ConversationRole::User, "");
+        item.attachments.push(Attachment {
+            name: "notes.txt".into(),
+            path: "/tmp/notes.txt".into(),
+            kind: AttachmentKind::File,
+            generated_by_app: false,
+        });
+        state.dispatch(Action::UpsertConversation(item));
+
+        assert_eq!(visible_messages(&state).len(), 1);
+    }
+
+    #[gpui::test]
+    async fn streaming_text_is_advanced_without_a_window_frame_loop(cx: &mut gpui::TestAppContext) {
+        let conversation = cx.update(|cx| cx.new(|_| Conversation::new(Tokens::light())));
+        let mut item = message("stream", ConversationRole::Assistant, "hello");
+        item.streaming = true;
+        cx.update(|cx| {
+            conversation.update(cx, |conversation, cx| {
+                conversation.set_messages(vec![item], cx);
+            });
+        });
+
+        let visible = |cx: &gpui::App| {
+            let conversation = conversation.read(cx);
+            conversation
+                .typewriter
+                .visible_text(&conversation.messages[0])
+                .to_owned()
+        };
+        assert!(cx.read(visible).is_empty());
+
+        // Poll once to arm the timer, then move the test clock through one tick.
+        cx.run_until_parked();
+        for _ in 0..4 {
+            cx.executor().advance_clock(TYPEWRITER_FRAME);
+            cx.run_until_parked();
+        }
+
+        assert!(!cx.read(visible).is_empty());
+    }
+
+    #[gpui::test]
+    async fn a_stream_rekey_keeps_the_visible_prefix(cx: &mut gpui::TestAppContext) {
+        let conversation = cx.update(|cx| cx.new(|_| Conversation::new(Tokens::light())));
+        let mut draft = message("draft", ConversationRole::Assistant, "hello");
+        draft.streaming = true;
+        cx.update(|cx| {
+            conversation.update(cx, |conversation, cx| {
+                conversation.set_messages(vec![draft], cx);
+                conversation.reveal_all("draft", cx);
+            });
+        });
+
+        let mut persisted = message("entry-1", ConversationRole::Assistant, "hello world");
+        persisted.streaming = true;
+        cx.update(|cx| {
+            conversation.update(cx, |conversation, cx| {
+                conversation.set_messages(vec![persisted], cx);
+                assert_eq!(
+                    conversation
+                        .typewriter
+                        .visible_text(&conversation.messages[0]),
+                    "hello"
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn streaming_does_not_reengage_tail_after_the_reader_scrolls_up(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let conversation = cx.update(|cx| cx.new(|_| Conversation::new(Tokens::light())));
+        let mut stream = message("stream", ConversationRole::Assistant, "first");
+        stream.streaming = true;
+        cx.update(|cx| {
+            conversation.update(cx, |conversation, cx| {
+                conversation.set_messages(vec![stream.clone()], cx);
+                conversation.list.scroll_by(px(-1.0));
+                assert!(!conversation.list.is_following_tail());
+
+                stream.full_text.push_str(" second");
+                conversation.set_messages(vec![stream], cx);
+                conversation.advance_typewriter(TYPEWRITER_FRAME.as_secs_f32(), cx);
+
+                assert!(!conversation.list.is_following_tail());
+            });
+        });
     }
 
     // Zero overdraw would mean scrolling reveals blank space before it fills in.

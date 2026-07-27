@@ -25,7 +25,7 @@ use pi_whim_theme::{ThemeMode, ThemePreference, Tokens, text};
 use crate::{
     chat::{
         self, Composer, ComposerEvent, Controls, ControlsEvent, Conversation, ConversationEvent,
-        Palette, PaletteEvent, Paste, Sidebar, SidebarEvent,
+        Palette, PaletteEvent, Paste, QueueStatus, Sidebar, SidebarEvent,
     },
     chrome::{Banner, TopBar},
     dialogs::{PromptEvent, Prompts, Rename, RenameEvent},
@@ -108,9 +108,8 @@ pub enum Request {
     DiscardAttachment(String),
     /// Send the drafted prompt to the agent.
     ///
-    /// The shell has already put it in the conversation, because a prompt should
-    /// appear the moment it is sent rather than when Pi acknowledges it. What is
-    /// left is the RPC.
+    /// The application owns both the optimistic transcript entry and the RPC so
+    /// the visible message cannot diverge from the accepted submission.
     SubmitPrompt {
         content: String,
         attachments: Vec<Attachment>,
@@ -193,6 +192,8 @@ pub struct Workspace {
     /// reachable without one — the app can report a failure before the first
     /// render — and because the notification stack lives on the window, not here.
     notices: Outbox,
+    /// The failure banner the reader dismissed, until the status changes.
+    dismissed_error: Option<String>,
     /// Projects whose sessions are listed. View-local: which projects a reader
     /// has open says nothing about the session.
     expanded_projects: BTreeSet<ProjectId>,
@@ -213,20 +214,43 @@ impl Workspace {
         // These subscribe with `subscribe_in` rather than `subscribe` so the
         // handlers receive a window: reseeding the runtime pickers needs one, and
         // every state change can change what they offer.
-        let sidebar = cx.new(|_| Sidebar::new(tokens));
+        let sidebar = cx.new(|cx| Sidebar::new(tokens, window, cx));
         cx.subscribe_in(&sidebar, window, |workspace, _, event, window, cx| {
             workspace.handle_sidebar_event(event.clone(), window, cx);
         })
         .detach();
 
         let conversation = cx.new(|_| Conversation::new(tokens));
-        cx.subscribe(&conversation, |_, conversation, event, cx| {
+        cx.subscribe(&conversation, |workspace, conversation, event, cx| {
             match event {
                 ConversationEvent::ToggleToolDetails(id) => {
                     let id = id.clone();
                     conversation.update(cx, |conversation, cx| {
                         conversation.toggle_details(&id, cx);
                     });
+                }
+                ConversationEvent::RevealAll(id) => {
+                    let id = id.clone();
+                    conversation.update(cx, |conversation, cx| {
+                        conversation.reveal_all(&id, cx);
+                    });
+                }
+                ConversationEvent::ForkAt(id) => {
+                    // The backend owns the transcript and Pi's `fork` request.
+                    // Routing through the existing slash command keeps session
+                    // re-keying and indexing in one place.
+                    workspace.request(Request::RunCommand(SlashCommand::Fork(id.clone())), cx);
+                }
+                ConversationEvent::CopyAssistant(id) => {
+                    let text = conversation
+                        .read(cx)
+                        .messages()
+                        .iter()
+                        .find(|message| message.id == *id)
+                        .map(|message| message.full_text.clone());
+                    if let Some(text) = text {
+                        workspace.request(Request::CopyToClipboard(text), cx);
+                    }
                 }
             }
             cx.notify();
@@ -294,6 +318,7 @@ impl Workspace {
             settings,
             showing_settings: false,
             notices: Outbox::new(),
+            dismissed_error: None,
             expanded_projects: BTreeSet::new(),
             requests: Vec::new(),
         }
@@ -350,6 +375,19 @@ impl Workspace {
         self.requests.push(request);
         cx.emit(RequestsRaised);
         cx.notify();
+    }
+
+    /// Put a rejected submission back into the prompt instead of losing it.
+    pub fn restore_submission(
+        &mut self,
+        content: String,
+        attachments: Vec<Attachment>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.composer.update(cx, |composer, cx| {
+            composer.restore_draft(content, attachments, window, cx);
+        });
     }
 
     /// Take the requests the views have raised since the last drain.
@@ -419,9 +457,9 @@ impl Workspace {
 
     /// Act on what the composer reported.
     ///
-    /// A submitted prompt goes into the conversation here and to the agent as a
-    /// request: it should appear the moment it is sent, not when Pi acknowledges
-    /// it, and the RPC needs the runtime this crate has no handle on.
+    /// A submitted prompt crosses the boundary as one request. The application
+    /// adds the optimistic transcript entry and sends it to Pi only after the
+    /// active session is revalidated.
     fn handle_composer_event(&mut self, event: ComposerEvent, cx: &mut Context<Self>) {
         match event {
             ComposerEvent::Submit {
@@ -430,9 +468,8 @@ impl Workspace {
                 mode,
             } => {
                 // Composer::add_attachment already keeps paths unique, so the
-                // list arrives deduplicated. Showing it is the host's too: it
-                // puts the prompt in the conversation before sending, so the
-                // sent and the shown text cannot diverge.
+                // list arrives deduplicated. The application owns transcript
+                // insertion so the sent and shown messages cannot diverge.
                 self.request(
                     Request::SubmitPrompt {
                         content,
@@ -666,8 +703,7 @@ impl Workspace {
                 // so a pass means the saved instance works, not just the typing.
                 let draft = self.settings.read(cx).search_engine_draft().clone();
                 let position = self.state.search_engine_profiles.len() as u32;
-                self.requests
-                    .push(Request::TestSearchEngine(draft.to_profile(position)));
+                self.request(Request::TestSearchEngine(draft.to_profile(position)), cx);
             }
             SettingsEvent::RemoveSearchEngine(index) => {
                 let profiles = self.settings.read(cx).search_engines_without(index);
@@ -694,14 +730,15 @@ impl Workspace {
     }
 
     /// Push the current rows into the sidebar.
-    fn sync_sidebar(&mut self, cx: &mut Context<Self>) {
+    fn sync_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let rows = chat::rows(&self.state, &self.expanded_projects);
+        let search_rows = chat::searchable_rows(&self.state, &self.expanded_projects);
         let tokens = self.tokens;
         let language = self.state.language;
         self.sidebar.update(cx, |sidebar, cx| {
             sidebar.set_tokens(tokens, cx);
-            sidebar.set_language(language, cx);
-            sidebar.set_rows(rows, cx);
+            sidebar.set_language(language, window, cx);
+            sidebar.set_rows(rows, search_rows, cx);
         });
     }
 
@@ -711,17 +748,19 @@ impl Workspace {
         let tokens = self.tokens;
         let language = self.state.language;
         let has_project = self.state.selected_project.is_some();
+        let generating = matches!(self.state.session_status, SessionStatus::Streaming);
         self.conversation.update(cx, |conversation, cx| {
             conversation.set_tokens(tokens, cx);
             conversation.set_language(language, cx);
             conversation.set_has_project(has_project, cx);
+            conversation.set_generating(generating, cx);
             conversation.set_messages(messages, cx);
         });
     }
 
     /// Refresh the panes after state changed.
     fn sync_views(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.sync_sidebar(cx);
+        self.sync_sidebar(window, cx);
         self.sync_conversation(cx);
 
         let tokens = self.tokens;
@@ -729,11 +768,17 @@ impl Workspace {
             self.state.session_status,
             SessionStatus::Streaming | SessionStatus::Compacting
         );
+        let ready = self.state.selected_project.is_some()
+            && matches!(
+                self.state.session_status,
+                SessionStatus::Ready | SessionStatus::Streaming | SessionStatus::Compacting
+            );
         let language = self.state.language;
         self.composer.update(cx, |composer, cx| {
             composer.set_tokens(tokens, cx);
             composer.set_language(language, window, cx);
             composer.set_busy(busy, cx);
+            composer.set_ready(ready, cx);
         });
 
         // The controls reseed from state wholesale: which models exist, which
@@ -829,9 +874,13 @@ impl Workspace {
         let previous = &self.state;
         let switched = previous.selected_session != state.selected_session;
         let cleared = state.conversation.is_empty() && !previous.conversation.is_empty();
+        let status_changed = previous.session_status != state.session_status;
         if switched || cleared {
             self.conversation
                 .update(cx, |conversation, cx| conversation.clear(cx));
+        }
+        if status_changed {
+            self.dismissed_error = None;
         }
         self.state = state;
         self.sync_views(window, cx);
@@ -909,6 +958,8 @@ impl Workspace {
             .child(div().flex_none().child(self.controls.clone()))
             .child(send);
 
+        let queue_status = QueueStatus::from_state(&self.state, tokens);
+
         div()
             // The containing block the palette anchors against.
             .relative()
@@ -949,6 +1000,7 @@ impl Workspace {
                     .border_1()
                     .border_color(tokens.line.hsla())
                     .child(self.composer.clone())
+                    .when_some(queue_status, |this, status| this.child(status))
                     .child(footer),
             )
     }
@@ -1016,6 +1068,15 @@ fn toggle_expanded(expanded: &mut BTreeSet<ProjectId>, id: ProjectId) -> bool {
     }
 }
 
+fn is_bare_escape(keystroke: &gpui::Keystroke) -> bool {
+    let modifiers = &keystroke.modifiers;
+    keystroke.key.as_str() == "escape"
+        && !modifiers.shift
+        && !modifiers.control
+        && !modifiers.alt
+        && !modifiers.platform
+}
+
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = self.tokens;
@@ -1025,8 +1086,52 @@ impl Render for Workspace {
         if !self.notices.is_empty() {
             crate::dialogs::show_notices(&mut self.notices, window, cx);
         }
+        let language = self.state.language;
+        let status = self.state.session_status.clone();
+        let banner = match &status {
+            SessionStatus::Failed(error)
+                if self.dismissed_error.as_deref() == Some(error.as_str()) =>
+            {
+                None
+            }
+            SessionStatus::Failed(error) => {
+                let copy = error.clone();
+                let dismiss = error.clone();
+                Some(
+                    Banner::error(error.clone(), tokens)
+                        .on_copy(
+                            translate("copy-error", language),
+                            cx.listener(move |workspace, _, _, cx| {
+                                workspace.request(Request::CopyToClipboard(copy.clone()), cx);
+                            }),
+                        )
+                        .on_dismiss(
+                            translate("dismiss", language),
+                            cx.listener(move |workspace, _, _, cx| {
+                                workspace.dismissed_error = Some(dismiss.clone());
+                                cx.notify();
+                            }),
+                        ),
+                )
+            }
+            _ => banner_for(&status, language, tokens),
+        };
         let state = &self.state;
-        let status = state.session_status.clone();
+        let project_name = state.selected_project.and_then(|id| {
+            state
+                .projects
+                .iter()
+                .find(|project| project.id == id)
+                .map(|project| project.name.as_str())
+        });
+        let session_title = state.selected_project.and_then(|project_id| {
+            state.sessions.get(&project_id).and_then(|sessions| {
+                sessions
+                    .iter()
+                    .find(|session| Some(session.id) == state.selected_session)
+                    .map(|session| chat::session_title_or_default(&session.title, language))
+            })
+        });
 
         div()
             .size_full()
@@ -1045,6 +1150,14 @@ impl Render for Workspace {
                     .update(cx, |palette, cx| palette.handle_key(event, cx));
                 if consumed {
                     cx.stop_propagation();
+                    return;
+                }
+                if is_bare_escape(&event.keystroke)
+                    && workspace
+                        .conversation
+                        .update(cx, |conversation, cx| conversation.reveal_latest(cx))
+                {
+                    cx.stop_propagation();
                 }
             }))
             .bg(tokens.bg_canvas.hsla())
@@ -1059,6 +1172,7 @@ impl Render for Workspace {
                     .text_size(px(text::BODY_SIZE))
                     .child(
                         TopBar::new(status.clone(), tokens.mode, state.language, tokens)
+                            .location(project_name, session_title.as_deref())
                             .metrics(state.session_metrics.as_ref())
                             .on_toggle_theme(cx.listener(|workspace, _, window, cx| {
                                 workspace.toggle_theme(window, cx);
@@ -1075,28 +1189,25 @@ impl Render for Workspace {
                         this.child(div().flex_1().min_h(px(0.0)).child(self.settings.clone()))
                     })
                     .when(!self.showing_settings, |this| {
-                        this.when_some(
-                            banner_for(&status, state.language, tokens),
-                            |this, banner| this.child(banner),
-                        )
-                        // The conversation and sidebar fill whatever the
-                        // chrome leaves.
-                        .child(
-                            div()
-                                .flex_1()
-                                .flex()
-                                .min_h(px(0.0))
-                                .child(self.sidebar.clone())
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .flex()
-                                        .flex_col()
-                                        .min_w(px(0.0))
-                                        .child(self.conversation.clone())
-                                        .child(self.prompt_area(tokens, cx)),
-                                ),
-                        )
+                        this.when_some(banner, |this, banner| this.child(banner))
+                            // The conversation and sidebar fill whatever the
+                            // chrome leaves.
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .flex()
+                                    .min_h(px(0.0))
+                                    .child(self.sidebar.clone())
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .flex()
+                                            .flex_col()
+                                            .min_w(px(0.0))
+                                            .child(self.conversation.clone())
+                                            .child(self.prompt_area(tokens, cx)),
+                                    ),
+                            )
                     }),
             )
             // Modals last, so they paint over the panes. Each renders nothing
@@ -1108,6 +1219,8 @@ impl Render for Workspace {
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::Cell, rc::Rc};
+
     use gpui::{KeyDownEvent, Keystroke};
     use pi_whim_core::{ConversationItem, ConversationRole, stable_session_id};
 
@@ -1211,6 +1324,13 @@ mod tests {
         assert!(expanded.contains(&second));
     }
 
+    #[test]
+    fn only_a_bare_escape_is_the_stream_reveal_shortcut() {
+        assert!(is_bare_escape(&Keystroke::parse("escape").unwrap()));
+        assert!(!is_bare_escape(&Keystroke::parse("shift-escape").unwrap()));
+        assert!(!is_bare_escape(&Keystroke::parse("enter").unwrap()));
+    }
+
     /// A state with one project selected, so the palette has commands to offer.
     fn state_with_a_project() -> AppState {
         AppState {
@@ -1288,11 +1408,40 @@ mod tests {
         cx.add_window(|window, cx| Workspace::new(preference, window, cx))
     }
 
+    struct RequestProbe;
+
+    #[gpui::test]
+    async fn testing_web_search_wakes_the_request_host(cx: &mut gpui::TestAppContext) {
+        let shell = shell(cx);
+        let workspace = shell
+            .update(cx, |_, _, cx| cx.entity())
+            .expect("the workspace window is open");
+        let raised = Rc::new(Cell::new(0));
+        let observed = raised.clone();
+        let _probe = cx.update(|cx| {
+            cx.new(|cx| {
+                cx.subscribe(&workspace, move |_, _, _: &RequestsRaised, _| {
+                    observed.set(observed.get() + 1);
+                })
+                .detach();
+                RequestProbe
+            })
+        });
+
+        shell
+            .update(cx, |workspace, window, cx| {
+                workspace.handle_settings_event(SettingsEvent::TestSearchEngine, window, cx);
+            })
+            .expect("the workspace window is open");
+
+        assert_eq!(raised.get(), 1);
+    }
+
     #[gpui::test]
     async fn a_submitted_prompt_is_sent_and_not_shown_locally(cx: &mut gpui::TestAppContext) {
-        // The host puts the prompt in the conversation as it sends it. Showing it
-        // here as well would render it twice — once from the local copy and again
-        // from the snapshot that comes back.
+        // The application puts the prompt in the conversation as it sends it.
+        // Showing it here as well would render it twice: once from the local copy
+        // and again from the snapshot that comes back.
         let shell = shell(cx);
 
         shell

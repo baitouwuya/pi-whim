@@ -159,57 +159,6 @@ impl Settings {
                 .new(|cx| InputState::new(window, cx).placeholder("https://search.example")),
         };
 
-        // The blocked-pattern field has no Save button of its own: it belongs to a
-        // section of toggles that each apply immediately, and one field that
-        // needed confirming would be the odd one out.
-        cx.subscribe_in(
-            &general_fields.blocked_patterns,
-            window,
-            |_, input, event: &InputEvent, _, cx| {
-                if matches!(event, InputEvent::Change) {
-                    let patterns = general::parse_blocked_patterns(&input.read(cx).value());
-                    cx.emit(SettingsEvent::SetBlockedPatterns(patterns));
-                }
-            },
-        )
-        .detach();
-
-        // The two numeric fields fold into one domain value, so each reports the
-        // whole config with its own component replaced. `normalized` clamps, which
-        // matters for the moment mid-edit when the field is empty or out of range.
-        cx.subscribe_in(
-            &general_fields.max_depth,
-            window,
-            |settings, input, event: &InputEvent, _, cx| {
-                if matches!(event, InputEvent::Change)
-                    && let Ok(depth) = input.read(cx).value().parse::<u8>()
-                {
-                    let config = AgentTeamConfig {
-                        max_depth: depth,
-                        ..settings.state.agent_team_config.clone()
-                    };
-                    cx.emit(SettingsEvent::SetAgentTeamConfig(config.normalized()));
-                }
-            },
-        )
-        .detach();
-        cx.subscribe_in(
-            &general_fields.max_agents_per_level,
-            window,
-            |settings, input, event: &InputEvent, _, cx| {
-                if matches!(event, InputEvent::Change)
-                    && let Ok(agents) = input.read(cx).value().parse::<u16>()
-                {
-                    let config = AgentTeamConfig {
-                        max_agents_per_level: agents,
-                        ..settings.state.agent_team_config.clone()
-                    };
-                    cx.emit(SettingsEvent::SetAgentTeamConfig(config.normalized()));
-                }
-            },
-        )
-        .detach();
-
         // The provider and search-engine drafts are edited into, then saved, so
         // their fields write into the draft rather than emitting.
         Self::watch_draft_fields(&provider_fields, &search_fields, window, cx);
@@ -319,12 +268,11 @@ impl Settings {
 
     /// Refresh from state, and re-seed the fields whose value it owns.
     pub fn sync(&mut self, state: &AppState, window: &mut Window, cx: &mut Context<Self>) {
-        let language_changed = self.state.language != state.language;
         let patterns_changed = self.state.bash_blocked_patterns != state.bash_blocked_patterns;
         let team_changed = self.state.agent_team_config != state.agent_team_config;
         self.state = state.clone();
 
-        if patterns_changed || team_changed || language_changed {
+        if patterns_changed || team_changed {
             self.seed_general_fields(window, cx);
         }
         cx.notify();
@@ -627,6 +575,7 @@ impl Render for Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pi_whim_theme::ThemePreference;
 
     #[test]
     fn the_nav_matches_the_sidebar_so_the_left_edge_does_not_shift() {
@@ -640,5 +589,38 @@ mod tests {
         // Both come from the same column of buttons, so conflating them would make
         // Back land on a section.
         assert_ne!(SettingsEvent::Close, SettingsEvent::Show(Section::General));
+    }
+
+    #[gpui::test]
+    async fn changing_language_keeps_unapplied_launch_drafts(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| crate::init(ThemePreference::default(), cx).unwrap());
+        let settings = cx.add_window(|window, cx| {
+            Settings::new(Tokens::light(), AppState::default(), window, cx)
+        });
+
+        settings
+            .update(cx, |settings, window, cx| {
+                settings
+                    .general_fields
+                    .blocked_patterns
+                    .update(cx, |input, cx| {
+                        input.set_value("custom command", window, cx)
+                    });
+                settings
+                    .general_fields
+                    .max_depth
+                    .update(cx, |input, cx| input.set_value("3", window, cx));
+
+                let mut state = settings.state.clone();
+                state.language = Language::SimplifiedChinese;
+                settings.sync(&state, window, cx);
+
+                assert_eq!(
+                    settings.general_fields.blocked_patterns.read(cx).value(),
+                    "custom command"
+                );
+                assert_eq!(settings.general_fields.max_depth.read(cx).value(), "3");
+            })
+            .expect("the settings window is open");
     }
 }

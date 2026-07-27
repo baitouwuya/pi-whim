@@ -38,6 +38,23 @@ pub fn copy() -> IconName {
     IconName::Copy
 }
 
+/// Reveal or hide secondary diagnostic content.
+pub fn details(expanded: bool) -> IconName {
+    if expanded {
+        IconName::EyeOff
+    } else {
+        IconName::Eye
+    }
+}
+
+pub fn move_up() -> IconName {
+    IconName::ArrowUp
+}
+
+pub fn move_down() -> IconName {
+    IconName::ArrowDown
+}
+
 pub fn search() -> IconName {
     IconName::Search
 }
@@ -266,6 +283,9 @@ mod tests {
             add(),
             close(),
             copy(),
+            details(false),
+            move_up(),
+            move_down(),
             search(),
             send(),
             stop(),

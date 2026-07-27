@@ -4,14 +4,17 @@
 //! visible span, which is the native answer to the hand-rolled viewport clipping
 //! the egui build needed.
 
+use std::collections::BTreeSet;
+
 use gpui::{
-    AnyElement, Context, EventEmitter, InteractiveElement, IntoElement, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
-    uniform_list,
+    AnyElement, AppContext, Context, Entity, EventEmitter, InteractiveElement, IntoElement,
+    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window, div,
+    prelude::FluentBuilder, px, uniform_list,
 };
 use gpui_component::{
     Icon, Sizable,
     button::{Button, ButtonVariants},
+    input::{Input, InputEvent, InputState},
     menu::{ContextMenuExt, PopupMenuItem},
 };
 use pi_whim_core::{Language, ProjectId, SessionId, strings::text as translate};
@@ -96,6 +99,11 @@ fn row_actions(row: &Row, language: Language) -> Vec<(&'static str, SidebarEvent
 /// The project and session list.
 pub struct Sidebar {
     rows: Vec<Row>,
+    /// Rows shown when no query is active, with collapsed sessions omitted.
+    default_rows: Vec<Row>,
+    /// The complete tree searched, including sessions under collapsed projects.
+    search_rows: Vec<Row>,
+    search: Entity<InputState>,
     /// The language the column's headings, menus, and empty state are read in.
     language: Language,
     tokens: Tokens,
@@ -104,17 +112,38 @@ pub struct Sidebar {
 impl EventEmitter<SidebarEvent> for Sidebar {}
 
 impl Sidebar {
-    pub fn new(tokens: Tokens) -> Self {
+    pub fn new(tokens: Tokens, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let search = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(translate("search-projects", Language::default()))
+        });
+        cx.subscribe_in(&search, window, |sidebar, input, event, _, cx| {
+            if matches!(event, InputEvent::Change) {
+                sidebar.filter_rows(&input.read(cx).value(), cx);
+            }
+        })
+        .detach();
         Self {
             rows: Vec::new(),
+            default_rows: Vec::new(),
+            search_rows: Vec::new(),
+            search,
             language: Language::default(),
             tokens,
         }
     }
 
-    pub fn set_language(&mut self, language: Language, cx: &mut Context<Self>) {
+    pub fn set_language(
+        &mut self,
+        language: Language,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.language != language {
             self.language = language;
+            self.search.update(cx, |search, cx| {
+                search.set_placeholder(translate("search-projects", language), window, cx);
+            });
             cx.notify();
         }
     }
@@ -123,7 +152,24 @@ impl Sidebar {
     ///
     /// The shell calls this rather than the sidebar reading state itself, so
     /// there is one owner of the expansion set.
-    pub fn set_rows(&mut self, rows: Vec<Row>, cx: &mut Context<Self>) {
+    pub fn set_rows(
+        &mut self,
+        default_rows: Vec<Row>,
+        search_rows: Vec<Row>,
+        cx: &mut Context<Self>,
+    ) {
+        self.default_rows = default_rows;
+        self.search_rows = search_rows;
+        let query = self.search.read(cx).value().to_string();
+        self.filter_rows(&query, cx);
+    }
+
+    fn filter_rows(&mut self, query: &str, cx: &mut Context<Self>) {
+        let rows = if query.trim().is_empty() {
+            self.default_rows.clone()
+        } else {
+            filtered_rows(&self.search_rows, query)
+        };
         if self.rows != rows {
             self.rows = rows;
             cx.notify();
@@ -333,6 +379,10 @@ impl Render for Sidebar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = self.tokens;
         let count = self.rows.len();
+        let has_projects = self
+            .search_rows
+            .iter()
+            .any(|row| matches!(row, Row::Project { .. }));
         let entity = cx.entity();
 
         div()
@@ -345,6 +395,13 @@ impl Render for Sidebar {
             .border_color(tokens.line.hsla())
             .child(self.render_header(cx))
             .child(
+                div().px(px(8.0)).py(px(6.0)).child(
+                    Input::new(&self.search)
+                        .prefix(Icon::new(icons::search()).size(px(12.0)))
+                        .bordered(false),
+                ),
+            )
+            .child(
                 uniform_list("sidebar", count, {
                     move |range, _window, cx| {
                         entity.update(cx, |sidebar, cx| {
@@ -356,7 +413,7 @@ impl Render for Sidebar {
             )
             // With no projects there is nothing to click but the plus, so say so
             // rather than leaving an empty column.
-            .when(count == 0, |this| {
+            .when(count == 0 && !has_projects, |this| {
                 this.child(
                     div()
                         .px(px(10.0))
@@ -366,7 +423,53 @@ impl Render for Sidebar {
                         .child(translate("empty-projects", self.language)),
                 )
             })
+            .when(count == 0 && has_projects, |this| {
+                this.child(
+                    div()
+                        .px(px(10.0))
+                        .pb(px(10.0))
+                        .text_size(px(text::LABEL_SIZE))
+                        .text_color(tokens.muted.hsla())
+                        .child(translate("no-search-results", self.language)),
+                )
+            })
     }
+}
+
+/// Search a flattened tree without losing the project parent of a matching
+/// session. Matching a project keeps all of its currently expanded sessions.
+fn filtered_rows(rows: &[Row], query: &str) -> Vec<Row> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return rows.to_vec();
+    }
+
+    let project_matches: BTreeSet<_> = rows
+        .iter()
+        .filter_map(|row| match row {
+            Row::Project { id, name, .. } if name.to_lowercase().contains(&query) => Some(*id),
+            _ => None,
+        })
+        .collect();
+    let session_matches: BTreeSet<_> = rows
+        .iter()
+        .filter_map(|row| match row {
+            Row::Session {
+                project_id, title, ..
+            } if title.to_lowercase().contains(&query) => Some(*project_id),
+            _ => None,
+        })
+        .collect();
+
+    rows.iter()
+        .filter(|row| match row {
+            Row::Project { id, .. } => project_matches.contains(id) || session_matches.contains(id),
+            Row::Session {
+                project_id, title, ..
+            } => project_matches.contains(project_id) || title.to_lowercase().contains(&query),
+        })
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]
@@ -428,6 +531,54 @@ mod tests {
             running: false,
             selected: false,
         }
+    }
+
+    fn session_row_for(project_id: ProjectId, title: &str) -> Row {
+        Row::Session {
+            id: uuid::Uuid::new_v4(),
+            project_id,
+            pi_path: format!("/tmp/{title}.jsonl"),
+            title: title.into(),
+            running: false,
+            selected: false,
+        }
+    }
+
+    #[test]
+    fn search_keeps_the_parent_of_a_matching_session() {
+        let project_id = uuid::Uuid::new_v4();
+        let rows = vec![
+            Row::Project {
+                id: project_id,
+                name: "alpha".into(),
+                expanded: false,
+                running: false,
+                selected: false,
+            },
+            session_row_for(project_id, "Migrate GPUI"),
+        ];
+
+        let filtered = filtered_rows(&rows, "gpui");
+        assert_eq!(filtered.len(), 2);
+        assert!(matches!(filtered[0], Row::Project { .. }));
+        assert!(matches!(filtered[1], Row::Session { .. }));
+    }
+
+    #[test]
+    fn matching_a_project_keeps_its_expanded_sessions() {
+        let project_id = uuid::Uuid::new_v4();
+        let rows = vec![
+            Row::Project {
+                id: project_id,
+                name: "alpha".into(),
+                expanded: true,
+                running: false,
+                selected: false,
+            },
+            session_row_for(project_id, "Unrelated title"),
+        ];
+
+        assert_eq!(filtered_rows(&rows, "alpha"), rows);
     }
 
     #[test]
