@@ -201,23 +201,18 @@ impl<R: AgentRuntime + 'static> Host<R> {
             Request::CopyToClipboard(text) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
             }
-            Request::PickAttachments { directories } => {
-                let picker = if directories {
-                    Picker::AttachmentFolder
-                } else {
-                    Picker::Attachments
-                };
-                self.open_picker(picker, window, cx);
-            }
+            Request::PickAttachments => self.open_picker(Picker::Attachments, window, cx),
             other => self.application.handle(other),
         }
     }
 
     /// Open a picker on the orchestration's behalf, and hand back what was chosen.
     ///
-    /// Files and folders are separate pickers rather than one that accepts both: a
-    /// folder is attached whole, and a picker that took either would make "this
-    /// file" and "the folder it is in" the same gesture.
+    /// Attaching accepts files and folders in the same dialog. A menu used to ask
+    /// which of the two first, which only added a click before the same window
+    /// opened — the platform picker already lets the reader walk into a folder and
+    /// take either. Adding a project is the narrower case: one folder, since that is
+    /// what a project is.
     ///
     /// Asynchronous, and that is load-bearing rather than incidental. `rfd`'s
     /// blocking dialogs ran a nested native event loop on the main thread, which
@@ -225,12 +220,13 @@ impl<R: AgentRuntime + 'static> Host<R> {
     /// inside gpui's `RefCell`, reached without any panic of ours. Awaiting the
     /// paths means the borrow is taken once, after the answer.
     fn open_picker(&mut self, picker: Picker, window: &Window, cx: &mut Context<Self>) {
-        let directories = picker.wants_directories();
+        let attaching = picker == Picker::Attachments;
         let paths = cx.prompt_for_paths(PathPromptOptions {
-            files: !directories,
-            directories,
+            // A project is a folder, so its picker offers only those.
+            files: attaching,
+            directories: true,
             // Only attachments come in batches; a project is one folder.
-            multiple: picker == Picker::Attachments,
+            multiple: attaching,
             prompt: None,
         });
         cx.spawn_in(window, async move |host, cx| {

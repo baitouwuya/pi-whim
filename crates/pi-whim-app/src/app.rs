@@ -50,19 +50,14 @@ use pi_whim_gpui::Request;
 /// it out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Picker {
-    /// Files to attach to the draft.
+    /// Things to attach to the draft: files, folders, or a mix of both.
+    ///
+    /// One picker rather than one per kind. There used to be a menu asking which,
+    /// but the platform dialog already lets the reader walk into a folder and pick
+    /// either, so the menu only added a click before the same window opened.
     Attachments,
-    /// A folder to attach whole.
-    AttachmentFolder,
     /// A folder to register as a project.
     Project,
-}
-
-impl Picker {
-    /// Whether this picker chooses folders rather than files.
-    pub(crate) fn wants_directories(self) -> bool {
-        matches!(self, Self::AttachmentFolder | Self::Project)
-    }
 }
 
 pub struct PiWhimApplication<R: AgentRuntime = PiRpcRuntime> {
@@ -250,7 +245,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     /// Act on what a picker returned.
     pub(crate) fn picked(&mut self, picker: Picker, paths: Vec<PathBuf>) {
         match picker {
-            Picker::Attachments | Picker::AttachmentFolder => self.attach_paths(paths),
+            Picker::Attachments => self.attach_paths(paths),
             // One folder, so the picker was opened without `multiple`.
             Picker::Project => {
                 if let Some(path) = paths.first() {
@@ -328,7 +323,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 }
             }
             // Opened by the host, which has the window the platform picker needs.
-            Request::PickAttachments { .. } => {
+            Request::PickAttachments => {
                 debug_assert!(false, "the host opens the picker");
             }
             Request::SetAutoCompaction(enabled) => self.set_auto_compaction(enabled),

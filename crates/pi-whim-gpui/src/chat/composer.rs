@@ -18,7 +18,6 @@ use gpui_component::{
     // Aliased because this module's own `Paste` is the classification, and the
     // action is the keystroke that produces one.
     input::{Input, InputEvent, InputState, Paste as PasteAction},
-    menu::{DropdownMenu, PopupMenuItem},
 };
 use pi_whim_core::{Attachment, SubmitMode};
 use pi_whim_engine::composer::Composer as Draft;
@@ -66,12 +65,12 @@ pub enum ComposerEvent {
     /// Reported rather than handled: writing it needs the attachment store, which
     /// this crate does not own.
     AttachPaste(Paste),
-    /// Ask for something on disk to attach.
+    /// Ask for things on disk to attach.
     ///
-    /// Two kinds because a folder is attached whole — the model is handed the
-    /// directory and reads what it needs — and a file picker that also accepted
-    /// directories would make "one file inside" and "the folder" the same gesture.
-    PickAttachments { directories: bool },
+    /// Files and folders both, in one dialog. A folder is attached whole — the model
+    /// is handed the directory and reads what it needs — but the reader does not
+    /// have to say which kind they want before the browser opens.
+    PickAttachments,
 }
 
 /// The prompt input and its attachments.
@@ -205,29 +204,17 @@ impl Composer {
     /// The only way to attach from disk.
     ///
     /// A paste covers the common case, but a file the reader has not copied still
-    /// has to be reachable, and the egui build's menu on the same "+" is where
-    /// they will look for it.
+    /// has to be reachable.
+    ///
+    /// Opens the browser on the first click. There used to be a menu asking files
+    /// or folder, which meant two clicks to reach a window that can do both.
     pub fn attach_button(&self, cx: &mut Context<Self>) -> AnyElement {
         Button::new("attach")
             .ghost()
             .icon(icons::add())
             .xsmall()
-            .tooltip("Attach files or a folder")
-            .dropdown_menu({
-                let composer = cx.entity();
-                move |menu, _, _| {
-                    [("Choose files…", false), ("Choose folder…", true)]
-                        .into_iter()
-                        .fold(menu, |menu, (label, directories)| {
-                            let composer = composer.clone();
-                            menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
-                                composer.update(cx, |_, cx| {
-                                    cx.emit(ComposerEvent::PickAttachments { directories });
-                                });
-                            }))
-                        })
-                }
-            })
+            .tooltip("Attach files or folders")
+            .on_click(cx.listener(|_, _, _, cx| cx.emit(ComposerEvent::PickAttachments)))
             .into_any_element()
     }
 

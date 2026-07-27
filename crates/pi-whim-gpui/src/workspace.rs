@@ -95,13 +95,11 @@ pub enum Request {
     /// Turn a paste into an attachment. Copied files need canonicalizing and
     /// pasted bytes need writing, both of which need the attachment store.
     AttachPaste(Paste),
-    /// Ask for files, or a folder, to attach.
+    /// Ask for things on disk to attach — files, folders, or both.
     ///
-    /// The picker is the platform's and blocks until it is answered, so it cannot
-    /// run where a view is being rendered.
-    PickAttachments {
-        directories: bool,
-    },
+    /// The picker is the platform's, and opening one needs the window, so this
+    /// crosses the boundary rather than happening where a view is rendered.
+    PickAttachments,
     /// Delete an attachment the app wrote, now that the draft has dropped it.
     ///
     /// Only for the generated ones — a pasted image, a long paste saved to a file.
@@ -481,8 +479,8 @@ impl Workspace {
                 // need the store.
                 self.request(Request::AttachPaste(paste), cx);
             }
-            ComposerEvent::PickAttachments { directories } => {
-                self.request(Request::PickAttachments { directories }, cx);
+            ComposerEvent::PickAttachments => {
+                self.request(Request::PickAttachments, cx);
             }
         }
     }
@@ -1291,29 +1289,16 @@ mod tests {
 
     #[gpui::test]
     async fn attaching_from_disk_asks_for_the_picker(cx: &mut gpui::TestAppContext) {
-        // The platform picker blocks until it is answered, so it cannot open from
-        // a view. Files and folders travel as separate asks because a folder is
-        // attached whole rather than as the files inside it.
+        // Opening the platform picker needs the window, so the shell asks rather
+        // than doing it. One ask, not one per kind: the dialog takes files and
+        // folders together, and a menu choosing between them only delayed it.
         let shell = shell(cx);
 
         shell
             .update(cx, |workspace, _, cx| {
-                workspace.handle_composer_event(
-                    ComposerEvent::PickAttachments { directories: false },
-                    cx,
-                );
-                workspace.handle_composer_event(
-                    ComposerEvent::PickAttachments { directories: true },
-                    cx,
-                );
+                workspace.handle_composer_event(ComposerEvent::PickAttachments, cx);
 
-                assert_eq!(
-                    workspace.take_requests(),
-                    vec![
-                        Request::PickAttachments { directories: false },
-                        Request::PickAttachments { directories: true },
-                    ]
-                );
+                assert_eq!(workspace.take_requests(), vec![Request::PickAttachments]);
             })
             .expect("the window is open");
     }
