@@ -16,6 +16,8 @@ use std::collections::HashMap;
 use pi_whim_core::{ConversationItem, grapheme_prefix};
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::thinking::trim_incomplete_tag;
+
 /// Graphemes per second once the backlog is large enough that the reveal would
 /// otherwise fall visibly behind the stream.
 const CATCH_UP_SPEED: f32 = 240.0;
@@ -58,7 +60,10 @@ impl Typewriter {
             .progress
             .get(&message.id)
             .map_or(0, |progress| progress.revealed);
-        grapheme_prefix(&message.full_text, revealed)
+        trim_incomplete_tag(
+            grapheme_prefix(&message.full_text, revealed),
+            &message.full_text,
+        )
     }
 
     /// Advance every streaming message by `elapsed_seconds`.
@@ -255,5 +260,26 @@ mod tests {
 
         let mut typewriter = Typewriter::new();
         assert!(!typewriter.advance(std::slice::from_ref(&finished), 0.1));
+    }
+
+    #[test]
+    fn thinking_tags_appear_atomically_while_streaming() {
+        let message = streaming("a", "<thinking>reason</thinking>answer");
+        let mut typewriter = Typewriter::new();
+
+        typewriter.progress.insert(
+            message.id.clone(),
+            Progress {
+                revealed: 4,
+                credit: 0.0,
+            },
+        );
+        assert_eq!(typewriter.visible_text(&message), "");
+
+        typewriter.progress.get_mut(&message.id).unwrap().revealed = 10;
+        assert_eq!(typewriter.visible_text(&message), "<thinking>");
+
+        typewriter.progress.get_mut(&message.id).unwrap().revealed = 22;
+        assert_eq!(typewriter.visible_text(&message), "<thinking>reason");
     }
 }

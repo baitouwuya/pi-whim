@@ -83,6 +83,7 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ("switch-to-dark", "Switch to dark", "切换到深色"),
     ("switch-to-light", "Switch to light", "切换到浅色"),
     ("general", "General", "通用"),
+    ("execution", "Execution", "执行"),
     ("providers", "Providers", "模型提供商"),
     ("web-search", "Web Search", "网页搜索"),
     (
@@ -300,6 +301,7 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ("dismiss", "Dismiss", "关闭"),
     ("move-up", "Move up", "上移"),
     ("move-down", "Move down", "下移"),
+    ("thinking-process", "Thinking process", "思考过程"),
     ("raw-tool-details", "Raw tool details", "原始工具详情"),
     ("show-all", "Show all", "显示完整内容"),
     ("generating", "Generating", "正在生成"),

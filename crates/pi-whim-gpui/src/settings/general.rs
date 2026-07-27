@@ -1,4 +1,4 @@
-//! General settings: language, context, shell policy, agent team, queue modes.
+//! General and execution settings over one shared set of persistent fields.
 //!
 //! Every row reads from `AppState`. Values that restart Pi stay in their input
 //! fields until an explicit Apply, so editing cannot abort a turn in flight.
@@ -7,7 +7,6 @@ use gpui::{AnyElement, Entity, IntoElement, ParentElement, Styled, Window, div, 
 use gpui_component::{
     Sizable,
     button::{Button, ButtonVariants},
-    checkbox::Checkbox,
     input::{Input, InputState, NumberInput},
 };
 use pi_whim_core::{
@@ -17,8 +16,9 @@ use pi_whim_core::{
 use pi_whim_theme::Tokens;
 
 use crate::settings::{
-    Emit, SettingsEvent, form,
-    segmented::{Segment, segmented},
+    Emit, SettingsEvent,
+    dropdown::{self, Choice, ChoiceState},
+    form, toggle,
 };
 
 /// The typed fields on this page.
@@ -30,51 +30,91 @@ pub struct Fields {
     pub blocked_patterns: Entity<InputState>,
     pub max_depth: Entity<InputState>,
     pub max_agents_per_level: Entity<InputState>,
+    pub language: Entity<ChoiceState<Language>>,
+    pub bash_policy: Entity<ChoiceState<BashPolicy>>,
+    pub steering_mode: Entity<ChoiceState<QueueMode>>,
+    pub follow_up_mode: Entity<ChoiceState<QueueMode>>,
 }
 
-/// Build the General page.
-pub fn render(state: &AppState, fields: &Fields, tokens: Tokens, emit: Emit) -> AnyElement {
+/// Build the General page: app-wide presentation and conversation behavior.
+pub fn render_general(state: &AppState, fields: &Fields, tokens: Tokens, emit: Emit) -> AnyElement {
     div()
         .flex()
         .flex_col()
         .child(form::page_header(tr(state, "general"), None, tokens))
-        .child(form::section_header(tr(state, "appearance"), None, tokens))
-        .child(language_row(state, tokens, emit.clone()))
-        .child(form::section_header(
-            tr(state, "context"),
-            Some(tr(state, "context-help")),
-            tokens,
-        ))
-        .child(auto_compaction_row(state, tokens, emit.clone()))
-        .child(form::section_header(tr(state, "shell"), None, tokens))
-        .child(bash_policy_row(state, tokens, emit.clone()))
-        .child(form::row(
-            tr(state, "blocked-patterns"),
-            Some(tr(state, "blocked-patterns-help")),
-            tokens,
-            blocked_patterns_control(fields, emit.clone(), state.language),
-        ))
-        .child(form::section_header(
-            tr(state, "agent-team"),
-            Some(tr(state, "agent-team-help")),
-            tokens,
-        ))
-        .child(form::row(
-            tr(state, "max-agent-depth"),
-            None,
-            tokens,
-            numeric(&fields.max_depth),
-        ))
-        .child(form::row(
-            tr(state, "max-agents-per-level"),
-            None,
-            tokens,
-            numeric(&fields.max_agents_per_level),
-        ))
-        .child(agent_team_apply(fields, state, emit.clone()))
-        .child(form::section_header(tr(state, "queue-mode"), None, tokens))
-        .child(steering_row(state, tokens, emit.clone()))
-        .child(follow_up_row(state, tokens, emit))
+        .child(form::group_stack(vec![
+            form::group(
+                tr(state, "appearance"),
+                None,
+                tokens,
+                vec![language_row(state, fields, tokens)],
+            ),
+            form::group(
+                tr(state, "context"),
+                Some(tr(state, "context-help")),
+                tokens,
+                vec![auto_compaction_row(state, tokens, emit)],
+            ),
+            form::group(
+                tr(state, "queue-mode"),
+                None,
+                tokens,
+                vec![
+                    steering_row(state, fields, tokens),
+                    follow_up_row(state, fields, tokens),
+                ],
+            ),
+        ]))
+        .into_any_element()
+}
+
+/// Build the Execution page: local tool policy and agent-team limits.
+pub fn render_execution(
+    state: &AppState,
+    fields: &Fields,
+    tokens: Tokens,
+    emit: Emit,
+) -> AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .child(form::page_header(tr(state, "execution"), None, tokens))
+        .child(form::group_stack(vec![
+            form::group(
+                tr(state, "shell"),
+                None,
+                tokens,
+                vec![
+                    bash_policy_row(state, fields, tokens),
+                    form::row(
+                        tr(state, "blocked-patterns"),
+                        Some(tr(state, "blocked-patterns-help")),
+                        tokens,
+                        blocked_patterns_control(fields, emit.clone(), state.language),
+                    ),
+                ],
+            ),
+            form::group(
+                tr(state, "agent-team"),
+                Some(tr(state, "agent-team-help")),
+                tokens,
+                vec![
+                    form::row(
+                        tr(state, "max-agent-depth"),
+                        None,
+                        tokens,
+                        numeric(&fields.max_depth),
+                    ),
+                    form::row(
+                        tr(state, "max-agents-per-level"),
+                        None,
+                        tokens,
+                        numeric(&fields.max_agents_per_level),
+                    ),
+                    agent_team_apply(fields, state, emit),
+                ],
+            ),
+        ]))
         .into_any_element()
 }
 
@@ -85,10 +125,11 @@ pub fn render(state: &AppState, fields: &Fields, tokens: Tokens, emit: Emit) -> 
 fn blocked_patterns_control(fields: &Fields, emit: Emit, language: Language) -> AnyElement {
     let field = fields.blocked_patterns.clone();
     div()
+        .w_full()
         .flex()
         .flex_col()
         .gap(px(6.0))
-        .child(Input::new(&field))
+        .child(Input::new(&field).w_full().h(px(72.0)))
         .child(
             div().flex().justify_end().child(
                 Button::new("apply-blocked-patterns")
@@ -145,23 +186,12 @@ fn numeric(state: &Entity<InputState>) -> AnyElement {
         .into_any_element()
 }
 
-fn language_row(state: &AppState, tokens: Tokens, emit: Emit) -> AnyElement {
+fn language_row(state: &AppState, fields: &Fields, tokens: Tokens) -> AnyElement {
     form::row(
         tr(state, "language"),
         None,
         tokens,
-        segmented(
-            "language",
-            state.language,
-            vec![
-                Segment::new(Language::English, "English"),
-                // Named in its own language: a reader who cannot read the current
-                // one still has to be able to find their own.
-                Segment::new(Language::SimplifiedChinese, "简体中文"),
-            ],
-            tokens,
-            move |language, window, cx| emit(SettingsEvent::SetLanguage(language), window, cx),
-        ),
+        dropdown::dropdown(&fields.language),
     )
 }
 
@@ -171,103 +201,65 @@ fn auto_compaction_row(state: &AppState, tokens: Tokens, emit: Emit) -> AnyEleme
         tr(state, "auto-compaction"),
         Some(tr(state, "auto-compaction-help")),
         tokens,
-        Checkbox::new("auto-compaction")
-            .label(tr(state, "auto-compaction"))
-            .checked(enabled)
-            .on_click(move |_, window, cx| {
-                emit(SettingsEvent::SetAutoCompaction(!enabled), window, cx)
-            }),
+        toggle::toggle(
+            "auto-compaction",
+            tr(state, "auto-compaction"),
+            enabled,
+            tokens,
+            move |checked, window, cx| emit(SettingsEvent::SetAutoCompaction(checked), window, cx),
+        ),
     )
 }
 
-fn bash_policy_row(state: &AppState, tokens: Tokens, emit: Emit) -> AnyElement {
+fn bash_policy_row(state: &AppState, fields: &Fields, tokens: Tokens) -> AnyElement {
     form::row(
         tr(state, "bash-policy"),
         Some(tr(state, "bash-help")),
         tokens,
-        segmented(
-            "bash-policy",
-            state.bash_policy,
-            vec![
-                Segment::new(BashPolicy::Ask, tr(state, "bash-ask")),
-                Segment::new(BashPolicy::Allow, tr(state, "bash-allow")),
-                Segment::new(BashPolicy::Deny, tr(state, "bash-deny")),
-            ],
-            tokens,
-            move |policy, window, cx| emit(SettingsEvent::SetBashPolicy(policy), window, cx),
-        ),
+        dropdown::dropdown(&fields.bash_policy),
     )
 }
 
-/// The two queue-mode rows are one control each, but each carries the other's
-/// current value: the domain action sets both at once.
-fn steering_row(state: &AppState, tokens: Tokens, emit: Emit) -> AnyElement {
-    let follow_up = state.follow_up_mode;
+fn steering_row(state: &AppState, fields: &Fields, tokens: Tokens) -> AnyElement {
     form::row(
         tr(state, "steer-mode"),
         None,
         tokens,
-        queue_segments(
-            "steering-mode",
-            state,
-            state.steering_mode,
-            tokens,
-            move |steering, window, cx| {
-                emit(
-                    SettingsEvent::SetQueueModes {
-                        steering,
-                        follow_up,
-                    },
-                    window,
-                    cx,
-                )
-            },
-        ),
+        dropdown::dropdown(&fields.steering_mode),
     )
 }
 
-fn follow_up_row(state: &AppState, tokens: Tokens, emit: Emit) -> AnyElement {
-    let steering = state.steering_mode;
+fn follow_up_row(state: &AppState, fields: &Fields, tokens: Tokens) -> AnyElement {
     form::row(
         tr(state, "follow-up-mode"),
         None,
         tokens,
-        queue_segments(
-            "follow-up-mode",
-            state,
-            state.follow_up_mode,
-            tokens,
-            move |follow_up, window, cx| {
-                emit(
-                    SettingsEvent::SetQueueModes {
-                        steering,
-                        follow_up,
-                    },
-                    window,
-                    cx,
-                )
-            },
-        ),
+        dropdown::dropdown(&fields.follow_up_mode),
     )
 }
 
-fn queue_segments(
-    id: &'static str,
-    state: &AppState,
-    current: QueueMode,
-    tokens: Tokens,
-    on_pick: impl Fn(QueueMode, &mut gpui::Window, &mut gpui::App) + Clone + 'static,
-) -> AnyElement {
-    segmented(
-        id,
-        current,
-        vec![
-            Segment::new(QueueMode::OneAtATime, tr(state, "one-at-a-time")),
-            Segment::new(QueueMode::All, tr(state, "all")),
-        ],
-        tokens,
-        on_pick,
-    )
+pub fn language_choices() -> Vec<Choice<Language>> {
+    vec![
+        Choice::new(Language::English, "English"),
+        // Named in its own language so the picker stays usable after an
+        // accidental language change.
+        Choice::new(Language::SimplifiedChinese, "简体中文"),
+    ]
+}
+
+pub fn bash_policy_choices(state: &AppState) -> Vec<Choice<BashPolicy>> {
+    vec![
+        Choice::new(BashPolicy::Ask, tr(state, "bash-ask")),
+        Choice::new(BashPolicy::Allow, tr(state, "bash-allow")),
+        Choice::new(BashPolicy::Deny, tr(state, "bash-deny")),
+    ]
+}
+
+pub fn queue_mode_choices(state: &AppState) -> Vec<Choice<QueueMode>> {
+    vec![
+        Choice::new(QueueMode::OneAtATime, tr(state, "one-at-a-time")),
+        Choice::new(QueueMode::All, tr(state, "all")),
+    ]
 }
 
 /// Split the blocked-pattern field's text into patterns.

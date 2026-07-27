@@ -9,7 +9,7 @@
 //! Strings here face the user, so they belong on this side of the boundary
 //! rather than in agent-team, whose text is written for the model.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, path::Path};
 
 use pi_whim_core::{ModelOption, QueueMode, SessionMetrics};
 use pi_whim_persistence::content_text;
@@ -494,6 +494,121 @@ pub(crate) fn tool_event_details(event: &Value, previous_details: Option<&str>) 
     serde_json::to_string_pretty(&details).unwrap_or_else(|_| details.to_string())
 }
 
+/// A compact, single-line description for a collapsed tool row.
+///
+/// Live events keep call arguments under `args` or `input`; replayed transcript
+/// entries keep result metadata under `details`. Reading both shapes here keeps
+/// the UI free of protocol parsing and gives live and restored sessions the same
+/// label.
+pub fn tool_header_summary(name: &str, raw_details: Option<&str>) -> Option<String> {
+    let root: Value = serde_json::from_str(raw_details?).ok()?;
+    let input = root
+        .get("input")
+        .or_else(|| root.get("args"))
+        .unwrap_or(&root);
+    let output = root
+        .pointer("/result/details")
+        .or_else(|| root.get("details"));
+
+    let path =
+        first_string([output, Some(input)], &["path", "file_path", "file"]).map(compact_tool_path);
+    let query = first_string(
+        [Some(input), output],
+        &["pattern", "query", "search", "needle"],
+    )
+    .map(compact_tool_text);
+    let command = first_string([Some(input)], &["command", "cmd"]).map(compact_tool_text);
+    let url = first_string([Some(input), output], &["url"]).map(compact_tool_text);
+
+    let parts = match name {
+        "read" | "read_file" => vec![path, read_line_range(input, output)],
+        "write" | "write_file" => vec![path],
+        "edit" | "apply_patch" => vec![
+            path,
+            first_string([output], &["changed_lines"])
+                .map(compact_tool_text)
+                .filter(|value| !value.is_empty()),
+        ],
+        "grep" | "search" | "web_search" | "search_sessions" => {
+            vec![query.map(|value| format!("\"{value}\"")), path]
+        }
+        "find" => vec![query.map(|value| format!("\"{value}\"")), path],
+        "ls" | "list_files" | "list_sessions" => vec![path],
+        "bash" | "shell" | "exec" => vec![command],
+        "fetch" | "browser" | "web" => vec![url],
+        "spawn_agent" => vec![
+            first_string([Some(input)], &["name", "task_name"])
+                .map(compact_tool_text)
+                .filter(|value| !value.is_empty()),
+        ],
+        "send_message" | "wait_agent" | "interrupt_agent" => vec![
+            first_string([Some(input)], &["target"])
+                .map(compact_tool_text)
+                .filter(|value| !value.is_empty()),
+        ],
+        "read_session" => vec![
+            first_string([Some(input)], &["session_id", "target"])
+                .map(compact_tool_text)
+                .filter(|value| !value.is_empty()),
+        ],
+        _ => vec![path, query, command, url],
+    };
+
+    let summary = parts.into_iter().flatten().collect::<Vec<_>>().join(" · ");
+    (!summary.is_empty()).then(|| compact_tool_text(&summary))
+}
+
+fn first_string<'a, const N: usize>(
+    objects: [Option<&'a Value>; N],
+    keys: &[&str],
+) -> Option<&'a str> {
+    objects.into_iter().flatten().find_map(|object| {
+        keys.iter()
+            .find_map(|key| object.get(*key).and_then(Value::as_str))
+    })
+}
+
+fn first_u64<const N: usize>(objects: [Option<&Value>; N], keys: &[&str]) -> Option<u64> {
+    objects.into_iter().flatten().find_map(|object| {
+        keys.iter()
+            .find_map(|key| object.get(*key).and_then(Value::as_u64))
+    })
+}
+
+fn read_line_range(input: &Value, output: Option<&Value>) -> Option<String> {
+    let selected_start = first_u64([output], &["selected_start_line"]);
+    let selected_end = first_u64([output], &["selected_end_line"]);
+    let (start, end) = match (selected_start, selected_end) {
+        (Some(start), Some(end)) => (start, end),
+        _ => {
+            let start = first_u64([Some(input)], &["offset"]).unwrap_or(1);
+            let limit = first_u64([Some(input)], &["limit"])?;
+            (start, start.saturating_add(limit.saturating_sub(1)))
+        }
+    };
+    Some(if start == end {
+        format!("L{start}")
+    } else {
+        format!("L{start}-{end}")
+    })
+}
+
+fn compact_tool_path(path: &str) -> String {
+    const SUFFIX_COMPONENTS: usize = 4;
+    let components = Path::new(path)
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .filter(|component| !component.is_empty() && *component != "/")
+        .collect::<Vec<_>>();
+    if components.len() <= SUFFIX_COMPONENTS {
+        return path.to_owned();
+    }
+    format!(
+        "…/{}",
+        components[components.len() - SUFFIX_COMPONENTS..].join("/")
+    )
+}
+
 fn agent_team_tool_summary(name: &str, text: &str) -> Option<String> {
     if name == "bash" {
         let result = compact_tool_text(text);
@@ -728,5 +843,64 @@ mod tests {
             "first second third"
         );
         assert!(compact_tool_text(&"x ".repeat(200)).ends_with('…'));
+    }
+
+    #[test]
+    fn tool_headers_show_a_compact_file_and_line_range() {
+        let details = json!({
+            "type": "tool_execution_start",
+            "args": {
+                "path": "/Users/example/pi-whim/crates/pi-whim-engine/src/protocol.rs",
+                "offset": 42,
+                "limit": 9
+            }
+        })
+        .to_string();
+
+        assert_eq!(
+            tool_header_summary("read", Some(&details)).as_deref(),
+            Some("…/crates/pi-whim-engine/src/protocol.rs · L42-50")
+        );
+    }
+
+    #[test]
+    fn finished_tool_headers_prefer_result_metadata() {
+        let details = json!({
+            "input": { "path": "src/lib.rs", "offset": 1, "limit": 200 },
+            "result": {
+                "details": {
+                    "path": "/tmp/project/src/lib.rs",
+                    "selected_start_line": 12,
+                    "selected_end_line": 18
+                }
+            }
+        })
+        .to_string();
+
+        assert_eq!(
+            tool_header_summary("read", Some(&details)).as_deref(),
+            Some("/tmp/project/src/lib.rs · L12-18")
+        );
+    }
+
+    #[test]
+    fn search_and_shell_tool_headers_stay_on_one_bounded_line() {
+        let search = json!({
+            "args": {
+                "pattern": "MessageCard\\s+render",
+                "path": "/Users/example/pi-whim/crates/pi-whim-gpui/src"
+            }
+        })
+        .to_string();
+        assert_eq!(
+            tool_header_summary("grep", Some(&search)).as_deref(),
+            Some("\"MessageCard\\s+render\" · …/pi-whim/crates/pi-whim-gpui/src")
+        );
+
+        let shell = json!({ "args": { "command": "cargo test\n--workspace" } }).to_string();
+        assert_eq!(
+            tool_header_summary("bash", Some(&shell)).as_deref(),
+            Some("cargo test --workspace")
+        );
     }
 }

@@ -20,7 +20,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
     sync::{
-        Arc, Condvar, Mutex,
+        Arc, Condvar, Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
@@ -124,6 +124,12 @@ pub enum SupervisorError {
 pub(crate) struct HostContext {
     shared: SharedState,
     launch: Arc<AgentLaunchConfig>,
+    /// Policy used for agents created after the supervisor started.
+    ///
+    /// Existing agents retain the policy they were launched with. The prompt
+    /// permission control updates this value for future children without
+    /// restarting their root Pi process.
+    team_config: Arc<RwLock<AgentTeamConfig>>,
     endpoint: String,
     files: Arc<file_dispatch::FileCoordinator>,
     interactions: Arc<Mutex<HashMap<Uuid, PendingInteraction>>>,
@@ -202,6 +208,7 @@ impl AgentSupervisor {
         let (interaction_sender, interaction_receiver) = std::sync::mpsc::channel();
         let host = HostContext {
             shared,
+            team_config: Arc::new(RwLock::new(launch.team_config.clone())),
             launch: Arc::new(launch),
             endpoint,
             files,
@@ -227,6 +234,21 @@ impl AgentSupervisor {
             (AGENT_ID_ENV.into(), self.root_id.to_string()),
             (AGENT_LEVEL_ENV.into(), "0".into()),
         ]
+    }
+
+    /// Update the default policy used by subsequently spawned agents.
+    pub fn set_default_permission_level(
+        &self,
+        level: AgentPermissionLevel,
+    ) -> Result<(), SupervisorError> {
+        let mut config = self
+            .host
+            .team_config
+            .write()
+            .map_err(|_| SupervisorError::Poisoned)?;
+        config.default_policy.level = level;
+        *config = config.clone().normalized();
+        Ok(())
     }
 
     /// Root-owned interactions are delivered to the native UI, never to the
@@ -806,21 +828,26 @@ fn reserve_child(
     ),
     HostError,
 > {
+    let config = host
+        .team_config
+        .read()
+        .map_err(|_| HostError::new("internal", "agent configuration is unavailable"))?
+        .clone();
     let agent_id = AgentId::new_v4();
     let capability = Uuid::new_v4().to_string();
     let (lock, _) = &*host.shared;
     let mut state = lock
         .lock()
         .map_err(|_| HostError::new("internal", "agent state is unavailable"))?;
-    let level = validate_child(&state, &host.launch.team_config, parent_id, &arguments.name)
-        .map_err(routing_error)?;
+    let level =
+        validate_child(&state, &config, parent_id, &arguments.name).map_err(routing_error)?;
     let parent = state
         .actors
         .get(&parent_id)
         .ok_or_else(|| HostError::new("target_unavailable", "parent agent is unavailable"))?;
     let team_id = parent.descriptor.team_id;
     let parent_session_id = parent.descriptor.session_id;
-    let policy = effective_child_policy(&host.launch.team_config, parent, arguments)?;
+    let policy = effective_child_policy(&config, parent, arguments)?;
     let delegated_models = delegated_models(parent, &policy, arguments)?;
     let mut node = AgentNode {
         descriptor: AgentDescriptor {
@@ -3329,6 +3356,62 @@ mod tests {
 
         assert!(policy.enabled_tools.iter().any(|tool| tool == "grep"));
         assert!(policy.enabled_tools.iter().any(|tool| tool == "find"));
+        supervisor.stop().unwrap();
+    }
+
+    #[test]
+    fn permission_updates_apply_to_future_children_without_restarting_the_supervisor() {
+        let (mut supervisor, _) = test_host(AgentTeamConfig::default());
+        supervisor
+            .set_default_permission_level(AgentPermissionLevel::ReadOnly)
+            .unwrap();
+
+        let (first_id, _, _, first_policy, _) = reserve_child(
+            &supervisor.host,
+            supervisor.root_id,
+            &SpawnAgentArguments {
+                name: "reader".into(),
+                role: String::new(),
+                task: "inspect".into(),
+                provider: None,
+                model: None,
+                permission_level: None,
+                enabled_tools: None,
+                trusted_extensions: None,
+                preset: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(first_policy.level, AgentPermissionLevel::ReadOnly);
+
+        supervisor
+            .set_default_permission_level(AgentPermissionLevel::Full)
+            .unwrap();
+        let (_, _, _, second_policy, _) = reserve_child(
+            &supervisor.host,
+            supervisor.root_id,
+            &SpawnAgentArguments {
+                name: "operator".into(),
+                role: String::new(),
+                task: "change files".into(),
+                provider: None,
+                model: None,
+                permission_level: None,
+                enabled_tools: None,
+                trusted_extensions: None,
+                preset: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(second_policy.level, AgentPermissionLevel::Full);
+
+        let state = supervisor.host.shared.0.lock().unwrap();
+        assert_eq!(
+            state.actors[&first_id].policy.level,
+            AgentPermissionLevel::ReadOnly,
+            "an already-running child keeps the policy it started with"
+        );
+        drop(state);
         supervisor.stop().unwrap();
     }
 

@@ -12,9 +12,9 @@ use gpui::{
 };
 use gpui_component::theme::{Theme as ComponentTheme, ThemeMode as ComponentMode};
 use pi_whim_core::{
-    AgentPermissionPolicy, AgentTeamConfig, AppState, Attachment, BashPolicy, Language,
-    ModelOption, ProjectId, ProviderId, ProviderProfile, ProviderProtocol, QueueMode,
-    SearchEngineProfile, SessionStatus, SubmitMode, ThinkingLevel, strings::text as translate,
+    AgentPermissionLevel, AgentTeamConfig, AppState, Attachment, BashPolicy, Language, ModelOption,
+    ProjectId, ProviderId, ProviderProfile, ProviderProtocol, QueueMode, SearchEngineProfile,
+    SessionStatus, SubmitMode, ThinkingLevel, strings::text as translate,
 };
 use pi_whim_engine::dialogs::{Answer, Prompt};
 use pi_whim_engine::notice::Outbox;
@@ -132,6 +132,11 @@ pub enum Request {
     SetLanguage(Language),
     SetBashPolicy(BashPolicy),
     SetBlockedPatterns(Vec<String>),
+    /// Change the default permission for agents spawned from live sessions.
+    ///
+    /// Kept separate from `SetAgentTeamConfig`: this setting can be applied to
+    /// running supervisors without restarting Pi or disturbing a turn.
+    SetPermissionLevel(AgentPermissionLevel),
     SetAgentTeamConfig(AgentTeamConfig),
     SetAutoCompaction(bool),
     /// Store a provider, and its key if one was typed.
@@ -223,10 +228,23 @@ impl Workspace {
         let conversation = cx.new(|_| Conversation::new(tokens));
         cx.subscribe(&conversation, |workspace, conversation, event, cx| {
             match event {
+                ConversationEvent::ToggleToolReport(id) => {
+                    let id = id.clone();
+                    conversation.update(cx, |conversation, cx| {
+                        conversation.toggle_tool_report(&id, cx);
+                    });
+                }
                 ConversationEvent::ToggleToolDetails(id) => {
                     let id = id.clone();
                     conversation.update(cx, |conversation, cx| {
-                        conversation.toggle_details(&id, cx);
+                        conversation.toggle_tool_details(&id, cx);
+                    });
+                }
+                ConversationEvent::ToggleThinking { id, segment } => {
+                    let id = id.clone();
+                    let segment = *segment;
+                    conversation.update(cx, |conversation, cx| {
+                        conversation.toggle_thinking(&id, segment, cx);
                     });
                 }
                 ConversationEvent::RevealAll(id) => {
@@ -556,8 +574,9 @@ impl Workspace {
 
     /// Act on what the runtime controls reported.
     ///
-    /// All three reach the agent over RPC, which lives behind `AgentRuntime`, so
-    /// they queue as requests the same way the sidebar's do.
+    /// All three cross the runtime boundary: model and thinking use Pi RPC while
+    /// permission updates the live agent supervisor. They queue as requests the
+    /// same way the sidebar's do.
     fn handle_controls_event(&mut self, event: ControlsEvent, cx: &mut Context<Self>) {
         // No `cx.notify()` at the end: every arm here is a request, and `request`
         // notifies. The picker keeps showing the old value until the snapshot
@@ -570,17 +589,7 @@ impl Workspace {
                 self.request(Request::SetModel(model), cx);
             }
             ControlsEvent::SetPermissionLevel(level) => {
-                // The level lives inside the agent-team config, so the whole
-                // config travels: the request stores it as one document, and a
-                // partial one would blank the rest of it.
-                let config = AgentTeamConfig {
-                    default_policy: AgentPermissionPolicy {
-                        level,
-                        ..self.state.agent_team_config.default_policy.clone()
-                    },
-                    ..self.state.agent_team_config.clone()
-                };
-                self.request(Request::SetAgentTeamConfig(config), cx);
+                self.request(Request::SetPermissionLevel(level), cx);
             }
             ControlsEvent::SetThinkingLevel(level) => {
                 self.request(Request::SetThinkingLevel(level), cx);
@@ -781,9 +790,9 @@ impl Workspace {
             composer.set_ready(ready, cx);
         });
 
-        // The controls reseed from state wholesale: which models exist, which
-        // thinking levels this one offers, and what is selected all change
-        // together when the agent reports back.
+        // The controls compare this snapshot with the values already applied.
+        // That lets an open model menu preserve its search and scroll position
+        // across unrelated transcript/status snapshots.
         let state = self.state.clone();
         self.controls.update(cx, |controls, cx| {
             controls.set_tokens(tokens, cx);
@@ -811,6 +820,10 @@ impl Workspace {
 
     /// Show or hide the settings page.
     pub fn show_settings(&mut self, showing: bool, cx: &mut Context<Self>) {
+        if showing {
+            self.settings
+                .update(cx, |settings, cx| settings.reset_scroll(cx));
+        }
         self.showing_settings = showing;
         cx.notify();
     }
@@ -1178,8 +1191,7 @@ impl Render for Workspace {
                                 workspace.toggle_theme(window, cx);
                             }))
                             .on_open_settings(cx.listener(|workspace, _, _, cx| {
-                                workspace.showing_settings = true;
-                                cx.notify();
+                                workspace.show_settings(true, cx);
                             })),
                     )
                     // Settings replaces everything below the top bar, including
@@ -1639,7 +1651,9 @@ mod tests {
                     cx,
                 );
                 workspace.conversation.update(cx, |conversation, cx| {
-                    conversation.toggle_details("m1", cx);
+                    conversation.toggle_tool_report("m1", cx);
+                    conversation.toggle_tool_details("m1", cx);
+                    conversation.toggle_thinking("m1", 0, cx);
                 });
 
                 workspace.set_state(
@@ -1652,7 +1666,10 @@ mod tests {
                     cx,
                 );
 
-                assert!(!workspace.conversation.read(cx).is_expanded("m1"));
+                let conversation = workspace.conversation.read(cx);
+                assert!(!conversation.is_tool_report_expanded("m1"));
+                assert!(!conversation.is_tool_details_expanded("m1"));
+                assert!(!conversation.is_thinking_expanded("m1", 0));
             })
             .expect("the window is open");
     }

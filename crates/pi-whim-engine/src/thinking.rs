@@ -72,6 +72,31 @@ pub fn split_thinking_segments(source: &str) -> Vec<Segment> {
     segments
 }
 
+/// Keep a streaming prefix from exposing a half-written thinking tag.
+///
+/// The typewriter reveals graphemes, but the thinking parser needs the entire
+/// marker at once. Only a suffix that the complete message proves is a real tag
+/// is withheld, so ordinary text such as `x < y` still streams normally.
+pub(crate) fn trim_incomplete_tag<'a>(visible: &'a str, full: &str) -> &'a str {
+    if visible.len() >= full.len() || !full.starts_with(visible) {
+        return visible;
+    }
+
+    for tag in ["<thinking>", "</thinking>"] {
+        let longest = visible.len().min(tag.len() - 1);
+        for suffix_len in (1..=longest).rev() {
+            let start = visible.len() - suffix_len;
+            if visible.is_char_boundary(start)
+                && tag.starts_with(&visible[start..])
+                && full[start..].starts_with(tag)
+            {
+                return &visible[..start];
+            }
+        }
+    }
+    visible
+}
+
 /// Byte ranges of fenced code blocks (``` or ~~~), fences included.
 ///
 /// An unclosed opening fence (still streaming) swallows the rest of the
@@ -158,5 +183,28 @@ mod tests {
         let segments = split_thinking_segments(source);
         assert_eq!(segments.len(), 1);
         assert!(matches!(segments[0], Segment::Markdown(_)));
+    }
+
+    #[test]
+    fn incomplete_streaming_tags_are_withheld_until_complete() {
+        let full = "before<thinking>reason</thinking>after";
+        assert_eq!(trim_incomplete_tag("before<thi", full), "before");
+        assert_eq!(
+            trim_incomplete_tag("before<thinking>reason</thin", full),
+            "before<thinking>reason"
+        );
+        assert_eq!(
+            trim_incomplete_tag("before<thinking>", full),
+            "before<thinking>"
+        );
+    }
+
+    #[test]
+    fn non_tag_suffixes_are_not_withheld() {
+        assert_eq!(trim_incomplete_tag("x <", "x < y"), "x <");
+        assert_eq!(
+            trim_incomplete_tag("literal <thi", "literal <thing"),
+            "literal <thi"
+        );
     }
 }

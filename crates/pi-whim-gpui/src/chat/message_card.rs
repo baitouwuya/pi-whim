@@ -6,11 +6,13 @@
 //! card that can be expanded for its report; a system notice is mono text.
 //!
 //! Reasoning arrives inside the assistant's text wrapped in `<thinking>` tags,
-//! and is rendered muted rather than shown as markup.
+//! and is presented as a collapsed section rather than shown as markup.
+
+use std::collections::HashSet;
 
 use gpui::{
-    AnyElement, App, Entity, Hsla, IntoElement, ParentElement, RenderOnce, SharedString, Styled,
-    Window, div, prelude::FluentBuilder, px,
+    AnyElement, App, Entity, Hsla, InteractiveElement, IntoElement, ParentElement, RenderOnce,
+    SharedString, Styled, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::{
     Icon, IconName, Sizable,
@@ -22,10 +24,33 @@ use pi_whim_engine::thinking::{Segment, split_thinking_segments};
 use pi_whim_theme::{Rgba, Tokens, layout, text};
 
 use crate::{
-    chat::{Conversation, ConversationEvent},
+    chat::{
+        Conversation, ConversationEvent, ToolCard, message_disclosure::disclosure_button,
+        reading_lane,
+    },
     icons,
     theme::IntoHsla,
 };
+
+/// The independently expandable sections belonging to one message.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MessageExpansion {
+    pub(crate) tool_report: bool,
+    pub(crate) tool_details: bool,
+    pub(crate) thinking: HashSet<usize>,
+}
+
+impl MessageExpansion {
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.tool_report |= other.tool_report;
+        self.tool_details |= other.tool_details;
+        self.thinking.extend(other.thinking);
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        !self.tool_report && !self.tool_details && self.thinking.is_empty()
+    }
+}
 
 /// A single conversation entry.
 #[derive(IntoElement)]
@@ -34,7 +59,7 @@ pub struct MessageCard {
     message: ConversationItem,
     /// The text to show, which for a streaming message is a prefix of the whole.
     visible_text: SharedString,
-    expanded: bool,
+    expansion: MessageExpansion,
     language: Language,
     /// The owning transcript receives action events so cards remain stateless.
     events: Option<Entity<Conversation>>,
@@ -46,14 +71,36 @@ impl MessageCard {
         index: usize,
         message: ConversationItem,
         visible_text: impl Into<SharedString>,
-        expanded: bool,
+        details_expanded: bool,
+        tokens: Tokens,
+    ) -> Self {
+        Self::with_expansion(
+            index,
+            message,
+            visible_text,
+            MessageExpansion {
+                // Before double disclosure was restored, the normal report was
+                // always visible and the public flag controlled raw details.
+                tool_report: true,
+                tool_details: details_expanded,
+                thinking: HashSet::new(),
+            },
+            tokens,
+        )
+    }
+
+    pub(crate) fn with_expansion(
+        index: usize,
+        message: ConversationItem,
+        visible_text: impl Into<SharedString>,
+        expansion: MessageExpansion,
         tokens: Tokens,
     ) -> Self {
         Self {
             index,
             message,
             visible_text: visible_text.into(),
-            expanded,
+            expansion,
             language: Language::default(),
             events: None,
             tokens,
@@ -87,7 +134,7 @@ impl MessageCard {
         matches!(self.message.role, ConversationRole::User)
     }
 
-    /// Render assistant text, muting any reasoning it contains.
+    /// Render assistant text, folding any reasoning it contains.
     fn assistant_body(&self) -> Vec<AnyElement> {
         let source = self.visible_text.as_ref();
         let tokens = self.tokens;
@@ -105,13 +152,35 @@ impl MessageCard {
                     return None;
                 }
                 Some(if is_thinking {
+                    let expanded = self.expansion.thinking.contains(&part);
                     div()
-                        .pl(px(10.0))
-                        .border_l_2()
-                        .border_color(tokens.line.hsla())
-                        .text_color(tokens.muted.hsla())
-                        .text_size(px(text::DETAIL_SIZE))
-                        .child(slice.to_owned())
+                        .flex()
+                        .flex_col()
+                        .items_start()
+                        .gap(px(3.0))
+                        .child(disclosure_button(
+                            format!("thinking-{}-{part}", self.index),
+                            translate("thinking-process", self.language),
+                            expanded,
+                            tokens.muted.hsla(),
+                            ConversationEvent::ToggleThinking {
+                                id: self.message.id.clone(),
+                                segment: part,
+                            },
+                            self.events.clone(),
+                        ))
+                        .when(expanded, |this| {
+                            this.child(
+                                div()
+                                    .w_full()
+                                    .pl(px(10.0))
+                                    .border_l_2()
+                                    .border_color(tokens.line.hsla())
+                                    .text_color(tokens.muted.hsla())
+                                    .text_size(px(text::DETAIL_SIZE))
+                                    .child(slice.to_owned()),
+                            )
+                        })
                         .into_any_element()
                 } else {
                     TextView::markdown(("assistant-md", self.index * 32 + part), slice.to_owned())
@@ -156,11 +225,13 @@ impl MessageCard {
         event: ConversationEvent,
     ) -> Option<AnyElement> {
         let owner = self.events.clone()?;
-        let button = Button::new(id).ghost().xsmall().tooltip(label);
+        let button = Button::new(id).xsmall().tooltip(label);
         let button = if let Some(icon) = icon {
-            button.icon(icon)
+            button.ghost().icon(icon)
         } else {
-            button.label(label)
+            // Text actions should not reserve the component library's fixed 20px
+            // xsmall button box below a message bubble.
+            button.text().label(label)
         };
         Some(
             button
@@ -179,8 +250,14 @@ impl MessageCard {
 /// translucent fill lets the grid run straight through the text. Compositing
 /// against `bg_canvas` keeps the intended colour and stops the paper at the card's
 /// edge.
-fn opaque_over(fill: Rgba, tokens: Tokens) -> Hsla {
+pub(crate) fn opaque_over(fill: Rgba, tokens: Tokens) -> Hsla {
     fill.over(tokens.bg_canvas).hsla()
+}
+
+/// Keep stored prompts byte-for-byte intact while suppressing display-only
+/// whitespace that would otherwise make a bubble look one line taller.
+fn user_text_for_display(text: &str) -> &str {
+    text.trim_end()
 }
 
 impl RenderOnce for MessageCard {
@@ -191,184 +268,142 @@ impl RenderOnce for MessageCard {
         let language = self.language;
         let message_id = self.message.id.clone();
         let has_attachments = !self.message.attachments.is_empty();
+        let hugs_its_content = self.hugs_its_content();
+        let visible_user_text = user_text_for_display(self.visible_text.as_ref()).to_owned();
 
         // A prompt is a bubble, so it shrinks to its text; everything else fills
         // the measure, because markdown and tool reports need a stable column to
         // wrap against. `w(width)` for both would pad a three-word question out to
         // 620px of empty fill.
-        let body = div()
-            .max_w(px(width))
-            .when(!self.hugs_its_content(), |this| this.w(px(width)))
-            .child(match role {
-                ConversationRole::User => div()
-                    .flex()
-                    .flex_col()
-                    .items_end()
-                    .gap(px(4.0))
-                    .child(
-                        div()
-                            .p(px(10.0))
-                            // Composited rather than translucent: a card sitting on the graph
-                            // paper would otherwise have the grid running through the text
-                            // behind it.
-                            .bg(opaque_over(tokens.accent_surface_soft(), tokens))
-                            .border_1()
-                            .border_color(tokens.accent_border_muted().hsla())
-                            .text_color(tokens.text.hsla())
-                            .when(!self.visible_text.is_empty(), |this| {
-                                this.child(self.visible_text.clone())
-                            })
-                            .when(has_attachments, |this| this.child(self.attachment_cards())),
-                    )
-                    .when_some(
-                        self.action_button(
-                            format!("fork-message-{}", self.index),
-                            translate("fork-here", language),
-                            None,
-                            ConversationEvent::ForkAt(message_id.clone()),
-                        ),
-                        |this, button| this.child(button),
-                    )
-                    .into_any_element(),
+        let content = match role {
+            ConversationRole::User => div()
+                .flex()
+                .flex_col()
+                .items_end()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .p(px(10.0))
+                        // Composited rather than translucent: a card sitting on the graph
+                        // paper would otherwise have the grid running through the text
+                        // behind it.
+                        .bg(opaque_over(tokens.accent_surface_soft(), tokens))
+                        .border_1()
+                        .border_color(tokens.accent_border_muted().hsla())
+                        .text_color(tokens.text.hsla())
+                        .when(!visible_user_text.is_empty(), |this| {
+                            this.child(visible_user_text)
+                        })
+                        .when(has_attachments, |this| this.child(self.attachment_cards())),
+                )
+                .when_some(
+                    self.action_button(
+                        format!("fork-message-{}", self.index),
+                        translate("fork-here", language),
+                        None,
+                        ConversationEvent::ForkAt(message_id.clone()),
+                    ),
+                    |this, button| this.child(button),
+                )
+                .into_any_element(),
 
-                ConversationRole::Assistant => div()
+            ConversationRole::Assistant => {
+                let reveal_pending =
+                    self.message.streaming && self.visible_text.as_ref() != self.message.full_text;
+                let action_group = SharedString::from(format!("assistant-actions-{}", self.index));
+                let action = if reveal_pending {
+                    self.action_button(
+                        format!("reveal-message-{}", self.index),
+                        translate("show-all", language),
+                        Some(icons::details(false)),
+                        ConversationEvent::RevealAll(message_id.clone()),
+                    )
+                } else if !self.message.streaming && !self.message.full_text.trim().is_empty() {
+                    self.action_button(
+                        format!("copy-message-{}", self.index),
+                        translate("copy-report", language),
+                        Some(icons::copy()),
+                        ConversationEvent::CopyAssistant(message_id.clone()),
+                    )
+                } else {
+                    None
+                };
+
+                div()
+                    .group(action_group.clone())
+                    .relative()
+                    .w_full()
                     .flex()
                     .flex_col()
+                    // The action floats over this reserved edge instead of
+                    // becoming a trailing flex row that makes every reply look
+                    // one line taller.
+                    .pr(px(28.0))
                     .gap(px(8.0))
                     .children(self.assistant_body())
-                    .when(
-                        self.message.streaming
-                            && self.visible_text.as_ref() != self.message.full_text,
-                        |this| {
-                            this.when_some(
-                                self.action_button(
-                                    format!("reveal-message-{}", self.index),
-                                    translate("show-all", language),
-                                    Some(icons::details(false)),
-                                    ConversationEvent::RevealAll(message_id.clone()),
-                                ),
-                                |this, button| this.child(div().flex().justify_end().child(button)),
-                            )
-                        },
-                    )
-                    .when(
-                        !self.message.streaming && !self.message.full_text.trim().is_empty(),
-                        |this| {
-                            this.when_some(
-                                self.action_button(
-                                    format!("copy-message-{}", self.index),
-                                    translate("copy-report", language),
-                                    Some(icons::copy()),
-                                    ConversationEvent::CopyAssistant(message_id.clone()),
-                                ),
-                                |this, button| this.child(div().flex().justify_end().child(button)),
-                            )
-                        },
-                    )
-                    .into_any_element(),
-
-                ConversationRole::Tool => {
-                    let name = self
-                        .message
-                        .tool_name
-                        .clone()
-                        .unwrap_or_else(|| "tool".to_owned());
-                    let accent = if self.message.is_error {
-                        tokens.error
-                    } else {
-                        tokens.accent
-                    };
-                    let details_button = self.message.tool_details.as_ref().and_then(|_| {
-                        self.action_button(
-                            format!("tool-details-{}", self.index),
-                            translate("raw-tool-details", language),
-                            Some(icons::details(self.expanded)),
-                            ConversationEvent::ToggleToolDetails(message_id.clone()),
-                        )
-                    });
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(4.0))
-                        .p(px(8.0))
-                        .bg(opaque_over(tokens.surface_tint(), tokens))
-                        .border_1()
-                        .border_color(accent.alpha(0.25).hsla())
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(5.0))
-                                .when_some(icons::role(&ConversationRole::Tool), |this, icon| {
-                                    this.child(
-                                        Icon::new(icon).size(px(12.0)).text_color(accent.hsla()),
-                                    )
-                                })
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .text_size(px(text::LABEL_SIZE))
-                                        .text_color(accent.hsla())
-                                        .child(name),
-                                )
-                                .when_some(details_button, |this, button| this.child(button)),
-                        )
-                        .when_some(self.message.tool_report.clone(), |this, report| {
-                            this.child(
-                                div()
-                                    .text_size(px(text::MONO_DETAIL_SIZE))
-                                    .text_color(tokens.muted.hsla())
-                                    .child(report),
-                            )
-                        })
-                        // Raw event data is a second level of detail, shown only when
-                        // asked for: it is diagnostic, not part of reading the
-                        // conversation.
-                        .when(self.expanded, |this| {
-                            this.when_some(self.message.tool_details.clone(), |this, details| {
-                                this.child(
-                                    div()
-                                        .p(px(6.0))
-                                        .bg(opaque_over(tokens.panel_soft, tokens))
-                                        .text_size(px(text::MONO_DETAIL_SIZE))
-                                        .text_color(tokens.muted.hsla())
-                                        .child(details),
-                                )
-                            })
-                        })
-                        .into_any_element()
-                }
-
-                ConversationRole::System => div()
-                    .flex()
-                    .items_center()
-                    .gap(px(5.0))
-                    .when_some(icons::role(&ConversationRole::System), |this, icon| {
+                    .when_some(action, |this, button| {
                         this.child(
-                            Icon::new(icon)
-                                .size(px(12.0))
-                                .text_color(tokens.muted.hsla()),
+                            div()
+                                .absolute()
+                                .top_0()
+                                .right_0()
+                                .when(!reveal_pending, |this| {
+                                    this.invisible()
+                                        .group_hover(action_group, |this| this.visible())
+                                })
+                                .child(button),
                         )
                     })
-                    .child(
-                        div()
-                            .text_size(px(text::MONO_DETAIL_SIZE))
-                            .text_color(tokens.muted.hsla())
-                            .child(self.visible_text.clone()),
-                    )
-                    .into_any_element(),
-            });
+                    .into_any_element()
+            }
 
-        div()
+            ConversationRole::Tool => ToolCard::new(
+                self.index,
+                self.message.clone(),
+                self.expansion.tool_report,
+                self.expansion.tool_details,
+                language,
+                self.events.clone(),
+                tokens,
+            )
+            .into_any_element(),
+
+            ConversationRole::System => div()
+                .flex()
+                .items_center()
+                .gap(px(5.0))
+                .when_some(icons::role(&ConversationRole::System), |this, icon| {
+                    this.child(
+                        Icon::new(icon)
+                            .size(px(12.0))
+                            .text_color(tokens.muted.hsla()),
+                    )
+                })
+                .child(
+                    div()
+                        .text_size(px(text::MONO_DETAIL_SIZE))
+                        .text_color(tokens.muted.hsla())
+                        .child(self.visible_text.clone()),
+                )
+                .into_any_element(),
+        };
+
+        // Every role lives in the same centred reading lane. Assistant, tool, and
+        // system content fill it from the left; a user bubble hugs the lane's right
+        // edge instead of the window's right edge.
+        let body = div()
             .w_full()
-            .flex()
-            .px(px(16.0))
-            .py(px(6.0))
-            // A prompt hugs the trailing edge, everything else the leading one.
             .when(matches!(role, ConversationRole::User), |this| {
-                this.justify_end()
+                this.flex().justify_end()
             })
-            .child(body)
+            .child(
+                div()
+                    .max_w(px(width))
+                    .when(!hugs_its_content, |this| this.w_full())
+                    .child(content),
+            );
+
+        reading_lane(body).py(px(6.0))
     }
 }
 
@@ -487,5 +522,12 @@ mod tests {
         let full = message(ConversationRole::Assistant, "the whole answer");
         let partial = MessageCard::new(0, full, "the whole", false, Tokens::light());
         assert_eq!(partial.visible_text.as_ref(), "the whole");
+    }
+
+    #[test]
+    fn prompt_display_drops_only_trailing_whitespace() {
+        assert_eq!(user_text_for_display("question\n"), "question");
+        assert_eq!(user_text_for_display("question  \n\n"), "question");
+        assert_eq!(user_text_for_display("  question"), "  question");
     }
 }

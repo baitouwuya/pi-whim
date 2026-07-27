@@ -21,8 +21,8 @@ use crate::{
     icons,
     settings::{
         Emit, SettingsEvent,
-        form::{self, CONTROL_WIDTH},
-        segmented::{Segment, segmented},
+        dropdown::{self, Choice, ChoiceState},
+        form,
     },
     theme::IntoHsla,
 };
@@ -34,6 +34,8 @@ pub struct Fields {
     /// The key field. Masked, and never filled from the keychain.
     pub api_key: Entity<InputState>,
     pub model_id: Entity<InputState>,
+    pub preset: Entity<ChoiceState<Preset>>,
+    pub protocol: Entity<ChoiceState<ProviderProtocol>>,
 }
 
 /// Build the Providers page.
@@ -55,44 +57,45 @@ pub fn render(
             Some(tr(state, "providers-help")),
             tokens,
         ))
-        .child(form::section_header(
-            tr(state, "configured-providers"),
-            None,
-            tokens,
-        ))
-        .child(provider_list(state, draft, tokens, emit.clone()))
-        // Where the key ends up is worth saying next to the field that takes it:
-        // a reader typing a secret into a form wants to know it is not going into
-        // the database beside it.
-        .child(form::section_header(
-            tr(state, "connection"),
-            Some(tr(state, "provider-help")),
-            tokens,
-        ))
-        .child(preset_row(state, draft, tokens, emit.clone()))
-        .child(name_row(state, fields, tokens, collides))
-        .child(form::row(
-            tr(state, "base-url"),
-            None,
-            tokens,
-            field(&fields.base_url),
-        ))
-        .child(protocol_row(state, draft, tokens, emit.clone()))
-        .child(api_key_row(state, draft, fields, tokens))
-        .child(form::section_header(
-            tr(state, "models"),
-            Some(tr(state, "models-help")),
-            tokens,
-        ))
-        .child(model_tools(state, draft, fields, tokens, emit.clone()))
-        .child(model_list(state, draft, tokens, emit.clone()))
-        .child(save_row(state, draft, tokens, emit))
+        .child(form::group_stack(vec![
+            form::group(
+                tr(state, "configured-providers"),
+                None,
+                tokens,
+                vec![provider_list(state, draft, tokens, emit.clone())],
+            ),
+            // Where the key ends up is worth saying next to the field that takes
+            // it: a reader typing a secret into a form wants to know it is not
+            // going into the database beside it.
+            form::group(
+                tr(state, "connection"),
+                Some(tr(state, "provider-help")),
+                tokens,
+                vec![
+                    preset_row(state, fields, tokens),
+                    name_row(state, fields, tokens, collides),
+                    form::row(tr(state, "base-url"), None, tokens, field(&fields.base_url)),
+                    protocol_row(state, fields, tokens),
+                    api_key_row(state, draft, fields, tokens),
+                ],
+            ),
+            form::group(
+                tr(state, "models"),
+                Some(tr(state, "models-help")),
+                tokens,
+                vec![
+                    model_tools(state, draft, fields, tokens, emit.clone()),
+                    model_list(state, draft, tokens, emit.clone()),
+                    save_row(state, draft, tokens, emit),
+                ],
+            ),
+        ]))
         .into_any_element()
 }
 
 /// A text field filling the control column.
 fn field(state: &Entity<InputState>) -> AnyElement {
-    Input::new(state).into_any_element()
+    Input::new(state).w_full().into_any_element()
 }
 
 /// The stored providers, plus a way to start a new one.
@@ -111,9 +114,11 @@ fn provider_list(
             let id = profile.id;
             let emit = emit.clone();
             div()
+                .w_full()
                 .flex()
-                .items_center()
-                .gap(px(form::INLINE_GAP))
+                .flex_col()
+                .gap(px(2.0))
+                .py(px(3.0))
                 .child(
                     Button::new(("provider", index as u64))
                         .label(SharedString::from(profile.name.clone()))
@@ -126,6 +131,11 @@ fn provider_list(
                 )
                 .child(
                     div()
+                        .w_full()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
                         .font_family(font::MONO)
                         .text_size(px(text::LABEL_SIZE))
                         .text_color(tokens.muted.hsla())
@@ -138,6 +148,7 @@ fn provider_list(
     let empty = rows.is_empty();
     form::control_row(
         div()
+            .w_full()
             .flex()
             .flex_col()
             .gap(px(4.0))
@@ -146,7 +157,7 @@ fn provider_list(
                 this.child(form::help_text(tr(state, "no-providers"), tokens))
             })
             .child(
-                div().pt(px(6.0)).child(
+                div().flex().justify_end().pt(px(6.0)).child(
                     Button::new("add-provider")
                         .label(tr(state, "add-provider"))
                         .outline()
@@ -159,27 +170,12 @@ fn provider_list(
     )
 }
 
-fn preset_row(state: &AppState, draft: &ProviderDraft, tokens: Tokens, emit: Emit) -> AnyElement {
+fn preset_row(state: &AppState, fields: &Fields, tokens: Tokens) -> AnyElement {
     form::row(
         tr(state, "preset"),
         Some(tr(state, "preset-help")),
         tokens,
-        div()
-            .flex()
-            .flex_wrap()
-            .gap(px(4.0))
-            .children(Preset::ALL.into_iter().enumerate().map(|(index, preset)| {
-                let active = draft.preset == preset;
-                let emit = emit.clone();
-                Button::new(("preset", index as u64))
-                    .label(preset.label())
-                    .when(active, |button| button.primary())
-                    .when(!active, |button| button.outline())
-                    .small()
-                    .on_click(move |_, window, cx| {
-                        emit(SettingsEvent::SelectPreset(preset), window, cx)
-                    })
-            })),
+        dropdown::dropdown(&fields.preset),
     )
 }
 
@@ -193,6 +189,7 @@ fn name_row(state: &AppState, fields: &Fields, tokens: Tokens, collides: bool) -
         None,
         tokens,
         div()
+            .w_full()
             .flex()
             .flex_col()
             .child(field(&fields.name))
@@ -205,22 +202,27 @@ fn name_row(state: &AppState, fields: &Fields, tokens: Tokens, collides: bool) -
     )
 }
 
-fn protocol_row(state: &AppState, draft: &ProviderDraft, tokens: Tokens, emit: Emit) -> AnyElement {
+fn protocol_row(state: &AppState, fields: &Fields, tokens: Tokens) -> AnyElement {
     form::row(
         tr(state, "protocol"),
         None,
         tokens,
-        segmented(
-            "provider-protocol",
-            draft.protocol,
-            ProviderProtocol::ALL
-                .into_iter()
-                .map(|protocol| Segment::new(protocol, protocol.label()))
-                .collect(),
-            tokens,
-            move |protocol, window, cx| emit(SettingsEvent::SetProtocol(protocol), window, cx),
-        ),
+        dropdown::dropdown(&fields.protocol),
     )
+}
+
+pub fn preset_choices() -> Vec<Choice<Preset>> {
+    Preset::ALL
+        .into_iter()
+        .map(|preset| Choice::new(preset, preset.label()))
+        .collect()
+}
+
+pub fn protocol_choices() -> Vec<Choice<ProviderProtocol>> {
+    ProviderProtocol::ALL
+        .into_iter()
+        .map(|protocol| Choice::new(protocol, protocol.label()))
+        .collect()
 }
 
 /// The key field, with whether one is already stored.
@@ -257,28 +259,33 @@ fn model_tools(
     let discover = emit.clone();
     form::control_row(
         div()
+            .w_full()
             .flex()
             .flex_col()
             .gap(px(8.0))
             .child(
-                Button::new("discover-models")
-                    .label(tr(state, "discover-models"))
-                    .outline()
-                    .small()
-                    .disabled(!can_discover)
-                    .on_click(move |_, window, cx| {
-                        discover(SettingsEvent::DiscoverModels, window, cx)
-                    }),
+                div().flex().justify_end().child(
+                    Button::new("discover-models")
+                        .label(tr(state, "discover-models"))
+                        .outline()
+                        .small()
+                        .disabled(!can_discover)
+                        .on_click(move |_, window, cx| {
+                            discover(SettingsEvent::DiscoverModels, window, cx)
+                        }),
+                ),
             )
             .child(
                 div()
+                    .w_full()
                     .flex()
                     .items_center()
                     .gap(px(form::INLINE_GAP))
                     .child(
                         div()
-                            .w(px(CONTROL_WIDTH - 100.0))
-                            .child(Input::new(&fields.model_id)),
+                            .flex_1()
+                            .min_w_0()
+                            .child(Input::new(&fields.model_id).w_full()),
                     )
                     .child(
                         Button::new("add-model")
@@ -299,7 +306,7 @@ fn model_list(state: &AppState, draft: &ProviderDraft, tokens: Tokens, emit: Emi
     if draft.models.is_empty() {
         return form::control_row(form::help_text(tr(state, "no-models"), tokens));
     }
-    form::control_row(div().flex().flex_col().gap(px(2.0)).children(
+    form::control_row(div().w_full().flex().flex_col().gap(px(2.0)).children(
         draft.models.iter().enumerate().map(|(index, model)| {
             model_row(index, model, tr(state, "remove"), tokens, emit.clone())
         }),
@@ -324,6 +331,7 @@ fn model_row(
         .join(" · ");
 
     div()
+        .w_full()
         .flex()
         .items_center()
         .gap(px(form::INLINE_GAP))
@@ -331,10 +339,15 @@ fn model_row(
         .child(
             div()
                 .flex_1()
+                .min_w_0()
                 .flex()
                 .flex_col()
                 .child(
                     div()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
                         .font_family(font::MONO)
                         .text_size(px(text::MONO_DETAIL_SIZE))
                         .text_color(tokens.text.hsla())
@@ -368,6 +381,7 @@ fn save_row(state: &AppState, draft: &ProviderDraft, tokens: Tokens, emit: Emit)
     form::control_row(
         div()
             .flex()
+            .flex_wrap()
             .items_center()
             .gap(px(form::INLINE_GAP))
             .pt(px(6.0))

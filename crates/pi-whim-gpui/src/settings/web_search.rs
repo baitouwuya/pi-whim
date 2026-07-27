@@ -12,7 +12,6 @@ use gpui::{
 use gpui_component::{
     Disableable, Sizable,
     button::{Button, ButtonVariants},
-    checkbox::Checkbox,
     input::{Input, InputState},
 };
 use pi_whim_core::{
@@ -24,7 +23,7 @@ use pi_whim_theme::{Tokens, font, text};
 
 use crate::{
     icons,
-    settings::{Emit, SettingsEvent, form},
+    settings::{Emit, SettingsEvent, form, toggle},
     theme::IntoHsla,
 };
 
@@ -50,33 +49,37 @@ pub fn render(
             Some(tr(state, "web-search-help")),
             tokens,
         ))
-        .child(form::section_header(
-            tr(state, "search-engines"),
-            None,
-            tokens,
-        ))
-        .child(engine_list(state, draft, tokens, emit.clone()))
-        // The fields below edit whichever instance is selected above, or a new
-        // one when none is; without a header they read as belonging to the list.
-        .child(form::section_header(
-            tr(state, "search-engine-details"),
-            None,
-            tokens,
-        ))
-        .child(form::row(
-            tr(state, "provider-name"),
-            None,
-            tokens,
-            Input::new(&fields.name),
-        ))
-        .child(form::row(
-            tr(state, "base-url"),
-            Some(tr(state, "searxng-url-help")),
-            tokens,
-            Input::new(&fields.base_url),
-        ))
-        .child(enabled_row(state, draft, tokens, emit.clone()))
-        .child(save_row(state, draft, tokens, emit))
+        .child(form::group_stack(vec![
+            form::group(
+                tr(state, "search-engines"),
+                None,
+                tokens,
+                vec![engine_list(state, draft, tokens, emit.clone())],
+            ),
+            // These fields edit whichever instance is selected above, or a new
+            // one when none is; the group keeps that relationship explicit.
+            form::group(
+                tr(state, "search-engine-details"),
+                None,
+                tokens,
+                vec![
+                    form::row(
+                        tr(state, "provider-name"),
+                        None,
+                        tokens,
+                        Input::new(&fields.name).w_full(),
+                    ),
+                    form::row(
+                        tr(state, "base-url"),
+                        Some(tr(state, "searxng-url-help")),
+                        tokens,
+                        Input::new(&fields.base_url).w_full(),
+                    ),
+                    enabled_row(state, draft, tokens, emit.clone()),
+                    save_row(state, draft, tokens, emit),
+                ],
+            ),
+        ]))
         .into_any_element()
 }
 
@@ -92,7 +95,7 @@ fn engine_list(
         return form::control_row(form::help_text(tr(state, "no-search-engines"), tokens));
     }
     let last = profiles.len() - 1;
-    form::control_row(div().flex().flex_col().gap(px(2.0)).children(
+    form::control_row(div().w_full().flex().flex_col().gap(px(2.0)).children(
         profiles.iter().enumerate().map(|(index, profile)| {
             engine_row(
                 index,
@@ -123,27 +126,80 @@ fn engine_row(
     let down = emit.clone();
 
     div()
+        .w_full()
         .flex()
-        .items_center()
-        .gap(px(form::INLINE_GAP))
+        .flex_col()
+        .gap(px(2.0))
         .py(px(2.0))
         .child(
-            Button::new(("engine", index as u64))
-                .label(SharedString::from(profile.name.clone()))
-                .when(selected, |button| button.primary())
-                .when(!selected, |button| button.ghost())
-                .small()
-                .on_click(move |_, window, cx| {
-                    select(
-                        SettingsEvent::SelectSearchEngine(profile_for_select.clone()),
-                        window,
-                        cx,
-                    )
-                }),
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .gap(px(form::INLINE_GAP))
+                .child(
+                    Button::new(("engine", index as u64))
+                        .label(SharedString::from(profile.name.clone()))
+                        .when(selected, |button| button.primary())
+                        .when(!selected, |button| button.ghost())
+                        .small()
+                        .on_click(move |_, window, cx| {
+                            select(
+                                SettingsEvent::SelectSearchEngine(profile_for_select.clone()),
+                                window,
+                                cx,
+                            )
+                        }),
+                )
+                .child(div().flex_1())
+                .child(
+                    Button::new(("engine-up", index as u64))
+                        .icon(icons::move_up())
+                        .ghost()
+                        .xsmall()
+                        .disabled(index == 0)
+                        .tooltip(translate("move-up", language))
+                        .on_click(move |_, window, cx| {
+                            up(
+                                SettingsEvent::MoveSearchEngine { index, delta: -1 },
+                                window,
+                                cx,
+                            )
+                        }),
+                )
+                .child(
+                    Button::new(("engine-down", index as u64))
+                        .icon(icons::move_down())
+                        .ghost()
+                        .xsmall()
+                        .disabled(index == last)
+                        .tooltip(translate("move-down", language))
+                        .on_click(move |_, window, cx| {
+                            down(
+                                SettingsEvent::MoveSearchEngine { index, delta: 1 },
+                                window,
+                                cx,
+                            )
+                        }),
+                )
+                .child(
+                    Button::new(("engine-remove", index as u64))
+                        .icon(icons::close())
+                        .ghost()
+                        .xsmall()
+                        .tooltip(translate("remove", language))
+                        .on_click(move |_, window, cx| {
+                            emit(SettingsEvent::RemoveSearchEngine(index), window, cx)
+                        }),
+                ),
         )
         .child(
             div()
-                .flex_1()
+                .w_full()
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
                 .font_family(font::MONO)
                 .text_size(px(text::LABEL_SIZE))
                 .text_color(if profile.enabled {
@@ -154,48 +210,6 @@ fn engine_row(
                     tokens.line_strong.hsla()
                 })
                 .child(SharedString::from(profile.base_url.clone())),
-        )
-        // Disabled at the ends rather than wrapping: a list that jumps from top
-        // to bottom under one click is hard to aim.
-        .child(
-            Button::new(("engine-up", index as u64))
-                .icon(icons::move_up())
-                .ghost()
-                .xsmall()
-                .disabled(index == 0)
-                .tooltip(translate("move-up", language))
-                .on_click(move |_, window, cx| {
-                    up(
-                        SettingsEvent::MoveSearchEngine { index, delta: -1 },
-                        window,
-                        cx,
-                    )
-                }),
-        )
-        .child(
-            Button::new(("engine-down", index as u64))
-                .icon(icons::move_down())
-                .ghost()
-                .xsmall()
-                .disabled(index == last)
-                .tooltip(translate("move-down", language))
-                .on_click(move |_, window, cx| {
-                    down(
-                        SettingsEvent::MoveSearchEngine { index, delta: 1 },
-                        window,
-                        cx,
-                    )
-                }),
-        )
-        .child(
-            Button::new(("engine-remove", index as u64))
-                .icon(icons::close())
-                .ghost()
-                .xsmall()
-                .tooltip(translate("remove", language))
-                .on_click(move |_, window, cx| {
-                    emit(SettingsEvent::RemoveSearchEngine(index), window, cx)
-                }),
         )
         .into_any_element()
 }
@@ -211,12 +225,15 @@ fn enabled_row(
         tr(state, "enabled"),
         None,
         tokens,
-        Checkbox::new("search-engine-enabled")
-            .label(tr(state, "enabled"))
-            .checked(enabled)
-            .on_click(move |_, window, cx| {
-                emit(SettingsEvent::SetSearchEngineEnabled(!enabled), window, cx)
-            }),
+        toggle::toggle(
+            "search-engine-enabled",
+            tr(state, "enabled"),
+            enabled,
+            tokens,
+            move |checked, window, cx| {
+                emit(SettingsEvent::SetSearchEngineEnabled(checked), window, cx)
+            },
+        ),
     )
 }
 
@@ -227,6 +244,7 @@ fn save_row(state: &AppState, draft: &SearchEngineDraft, tokens: Tokens, emit: E
     form::control_row(
         div()
             .flex()
+            .flex_wrap()
             .items_center()
             .gap(px(form::INLINE_GAP))
             .pt(px(6.0))

@@ -11,7 +11,7 @@ use std::{
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use pi_whim_agent_team::{AgentLaunchConfig, AgentSupervisor};
-use pi_whim_core::{AgentTeamConfig, SearchEngineProfile};
+use pi_whim_core::{AgentPermissionLevel, AgentTeamConfig, SearchEngineProfile};
 use pi_whim_pi_rpc::{PiLaunch, PiRpcClient, PiRpcEvent, RpcError};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -89,6 +89,9 @@ pub trait AgentRuntime: Send {
         request_id: String,
         decision: String,
     ) -> Result<Value, RuntimeError>;
+    /// Update the default policy for agents spawned after this call.
+    fn set_default_permission_level(&self, level: AgentPermissionLevel)
+    -> Result<(), RuntimeError>;
     fn events(&self) -> Receiver<RuntimeEvent>;
     /// A handle for issuing commands off the calling thread, if the agent is
     /// running.
@@ -320,6 +323,17 @@ impl AgentRuntime for PiRpcRuntime {
             .map_err(RuntimeError::AgentSupervisor)
     }
 
+    fn set_default_permission_level(
+        &self,
+        level: AgentPermissionLevel,
+    ) -> Result<(), RuntimeError> {
+        self.agent_supervisor
+            .as_ref()
+            .ok_or_else(|| RuntimeError::AgentSupervisor("agent supervisor is unavailable".into()))?
+            .set_default_permission_level(level)
+            .map_err(|error| RuntimeError::AgentSupervisor(error.to_string()))
+    }
+
     fn events(&self) -> Receiver<RuntimeEvent> {
         self.event_receiver.clone()
     }
@@ -358,6 +372,7 @@ pub struct FakeRuntime {
     commands: Arc<Mutex<Vec<Value>>>,
     starts: Arc<Mutex<Vec<RuntimeStart>>>,
     responses: Arc<Mutex<HashMap<String, Value>>>,
+    permission_levels: Arc<Mutex<Vec<AgentPermissionLevel>>>,
 }
 
 impl Clone for FakeRuntime {
@@ -373,6 +388,7 @@ impl Clone for FakeRuntime {
             commands: self.commands.clone(),
             starts: self.starts.clone(),
             responses: self.responses.clone(),
+            permission_levels: self.permission_levels.clone(),
         }
     }
 }
@@ -387,6 +403,7 @@ impl Default for FakeRuntime {
             commands: Arc::new(Mutex::new(Vec::new())),
             starts: Arc::new(Mutex::new(Vec::new())),
             responses: Arc::new(Mutex::new(HashMap::new())),
+            permission_levels: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -404,6 +421,13 @@ impl FakeRuntime {
 
     pub fn starts(&self) -> Vec<RuntimeStart> {
         self.starts.lock().expect("fake runtime starts").clone()
+    }
+
+    pub fn permission_levels(&self) -> Vec<AgentPermissionLevel> {
+        self.permission_levels
+            .lock()
+            .expect("fake runtime permission levels")
+            .clone()
     }
 
     pub fn set_response(&self, command_type: &str, response: Value) {
@@ -501,6 +525,16 @@ impl AgentRuntime for FakeRuntime {
             .expect("fake runtime commands")
             .push(command);
         Ok(Value::Null)
+    }
+    fn set_default_permission_level(
+        &self,
+        level: AgentPermissionLevel,
+    ) -> Result<(), RuntimeError> {
+        self.permission_levels
+            .lock()
+            .expect("fake runtime permission levels")
+            .push(level);
+        Ok(())
     }
     fn events(&self) -> Receiver<RuntimeEvent> {
         self.receiver.clone()

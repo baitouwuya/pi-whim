@@ -19,6 +19,7 @@ use pi_whim_core::{
 pub enum Section {
     #[default]
     General,
+    Execution,
     Providers,
     WebSearch,
 }
@@ -26,14 +27,20 @@ pub enum Section {
 impl Section {
     /// Every section, in the order they are listed.
     ///
-    /// General first because it is what most readers came for; providers before
-    /// web search because a provider is required to use the app at all.
-    pub const ALL: [Self; 3] = [Self::General, Self::Providers, Self::WebSearch];
+    /// General first because it is what most readers came for; execution follows
+    /// because it controls local behavior; providers precede optional web search.
+    pub const ALL: [Self; 4] = [
+        Self::General,
+        Self::Execution,
+        Self::Providers,
+        Self::WebSearch,
+    ];
 
     /// The translation key for this section's name.
     pub fn key(self) -> &'static str {
         match self {
             Self::General => "general",
+            Self::Execution => "execution",
             Self::Providers => "providers",
             Self::WebSearch => "web-search",
         }
@@ -696,10 +703,15 @@ mod tests {
 
     #[test]
     fn the_sections_are_listed_in_a_deliberate_order() {
-        // A provider is required to use the app, so it comes before web search.
+        // Local execution behavior belongs before connection-specific pages.
         assert_eq!(
             Section::ALL,
-            [Section::General, Section::Providers, Section::WebSearch]
+            [
+                Section::General,
+                Section::Execution,
+                Section::Providers,
+                Section::WebSearch
+            ]
         );
     }
 }

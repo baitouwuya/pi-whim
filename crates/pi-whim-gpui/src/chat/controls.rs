@@ -6,46 +6,28 @@
 //! be sent, and as a full-width row they wrapped onto three lines while leaving
 //! most of each one empty.
 //!
-//! Both pickers are `Select`s over `gpui-component`'s searchable list, drawn
-//! without their trigger chrome: on one row inside the prompt's border, a boxed
-//! control apiece read as three nested edges. The egui build hand-rolled the model
-//! picker out of a `ComboBox` wrapping a `TextEdit` and a `ScrollArea`, re-grouping
-//! every model by provider on each frame it was open; grouping and filtering are
-//! both built into the delegate here.
-//!
-//! Two details are load-bearing:
-//!
-//! * The virtual list measures one probe row and assumes the rest match, so a
-//!   model row reserves its second line even when the id equals the name. Showing
-//!   it conditionally makes rows of two heights and the list mis-measures.
-//! * `matches` is widened past the default. The default only searches the display
-//!   title, and a reader hunting `sonnet-4-5` is typing the id, not the name.
+//! All three controls share one flat trigger and one dense popup surface. Models
+//! add search and scrolling; the two short closed lists stay simpler.
 
 use gpui::{
-    App, AppContext, Context, Entity, EventEmitter, InteractiveElement, IntoElement, ParentElement,
-    Render, SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder,
-    px,
+    AppContext, Context, Entity, EventEmitter, InteractiveElement, IntoElement, ParentElement,
+    Render, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
-use gpui_component::{
-    Sizable,
-    select::{SearchableVec, Select, SelectEvent, SelectGroup, SelectItem, SelectState},
-    tooltip::Tooltip,
-};
+use gpui_component::tooltip::Tooltip;
 use pi_whim_core::{
     AgentPermissionLevel, AppState, Language, ModelOption, SessionStatus, ThinkingLevel,
     strings::text as translate,
 };
 use pi_whim_theme::{Tokens, radius, text};
 
+use super::{
+    dropdown::{Choice, ChoicePicker, ChoicePickerEvent},
+    model_picker::{ModelPicker, ModelPickerEvent},
+};
 use crate::theme::IntoHsla;
 
-/// Width of the popup the model picker opens, and how tall it grows.
-///
-/// Only the popup has a width. The trigger takes whatever its current value
-/// measures, because it is text on a shared row rather than a box of its own — a
-/// fixed width there would leave a gap after a short model name.
-const MODEL_MENU_WIDTH: f32 = 340.0;
-const MODEL_MENU_MAX_HEIGHT: f32 = 320.0;
+const PERMISSION_MENU_WIDTH: f32 = 148.0;
+const THINKING_MENU_WIDTH: f32 = 132.0;
 
 /// What the controls ask the shell to change.
 #[derive(Clone, Debug, PartialEq)]
@@ -56,131 +38,6 @@ pub enum ControlsEvent {
     SetThinkingLevel(ThinkingLevel),
     /// Raise or lower what a spawned agent may reach without asking.
     SetPermissionLevel(AgentPermissionLevel),
-}
-
-/// One model in the picker.
-///
-/// Carries the provider name so the delegate can group by it, and so a search
-/// for a provider surfaces everything under it.
-#[derive(Clone, Debug, PartialEq)]
-struct ModelItem {
-    model: ModelOption,
-    /// Provider and id, precomputed because `value` returns a reference.
-    key: (String, String),
-    tokens: Tokens,
-}
-
-impl ModelItem {
-    fn new(model: ModelOption, tokens: Tokens) -> Self {
-        let key = (model.provider.clone(), model.id.clone());
-        Self { model, key, tokens }
-    }
-
-    /// The dimmed second line: the model's id, when it says anything the name
-    /// does not.
-    ///
-    /// Empty rather than absent when it would repeat — see the note on row
-    /// heights at the top of this module.
-    fn secondary(&self) -> SharedString {
-        if self.model.id == self.model.name {
-            SharedString::default()
-        } else {
-            self.model.id.clone().into()
-        }
-    }
-}
-
-impl SelectItem for ModelItem {
-    /// Provider and id together: two models can share a name across providers,
-    /// and selecting one has to be distinguishable from the other.
-    type Value = (String, String);
-
-    fn title(&self) -> SharedString {
-        self.model.name.clone().into()
-    }
-
-    fn value(&self) -> &Self::Value {
-        // Stored rather than derived so the borrow outlives this call.
-        &self.key
-    }
-
-    fn matches(&self, query: &str) -> bool {
-        // The default searches only the title. A reader looking for a specific
-        // build is typing the id.
-        let query = query.trim().to_lowercase();
-        if query.is_empty() {
-            return true;
-        }
-        let model = &self.model;
-        model.name.to_lowercase().contains(&query)
-            || model.id.to_lowercase().contains(&query)
-            || model.provider_name.to_lowercase().contains(&query)
-    }
-
-    fn render(&self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        // The second line is always laid out, even when it is empty: the virtual
-        // list measures one row and applies that height to all of them.
-        let secondary = self.secondary();
-        div()
-            .flex()
-            .flex_col()
-            .child(div().text_size(px(text::DETAIL_SIZE)).child(self.title()))
-            .child(
-                div()
-                    .font_family(pi_whim_theme::font::MONO)
-                    .text_size(px(text::LABEL_SIZE))
-                    .text_color(self.tokens.muted.hsla())
-                    .child(secondary),
-            )
-    }
-}
-
-/// A picker over a fixed set of enum values, with no search.
-///
-/// Thinking levels and queue modes are both short closed lists where a search
-/// field would be more chrome than help.
-#[derive(Clone, Debug, PartialEq)]
-struct Choice<T: Clone + PartialEq + 'static> {
-    label: SharedString,
-    value: T,
-}
-
-impl<T: Clone + PartialEq + 'static> SelectItem for Choice<T> {
-    type Value = T;
-
-    fn title(&self) -> SharedString {
-        self.label.clone()
-    }
-
-    fn value(&self) -> &Self::Value {
-        &self.value
-    }
-}
-
-/// Group the available models by provider, in a stable order.
-///
-/// Providers sort by name and models keep the order the agent reported them in,
-/// which is its own ranking and worth preserving.
-fn model_groups(models: &[ModelOption], tokens: Tokens) -> Vec<SelectGroup<ModelItem>> {
-    let mut providers: Vec<&str> = Vec::new();
-    for model in models {
-        if !providers.contains(&model.provider_name.as_str()) {
-            providers.push(&model.provider_name);
-        }
-    }
-    providers.sort_unstable();
-
-    providers
-        .into_iter()
-        .map(|provider| {
-            SelectGroup::new(provider.to_owned()).items(
-                models
-                    .iter()
-                    .filter(|model| model.provider_name == provider)
-                    .map(|model| ModelItem::new(model.clone(), tokens)),
-            )
-        })
-        .collect()
 }
 
 /// Diameter of the permission dot.
@@ -233,9 +90,9 @@ fn models_unavailable_note(status: &SessionStatus, language: Language) -> String
 
 /// The runtime controls bar.
 pub struct Controls {
-    model: Entity<SelectState<SearchableVec<SelectGroup<ModelItem>>>>,
-    thinking: Entity<SelectState<Vec<Choice<ThinkingLevel>>>>,
-    permission_picker: Entity<SelectState<Vec<Choice<AgentPermissionLevel>>>>,
+    model_picker: Entity<ModelPicker>,
+    thinking: Entity<ChoicePicker<ThinkingLevel>>,
+    permission_picker: Entity<ChoicePicker<AgentPermissionLevel>>,
     /// Whether a project is selected. With none, there is no agent to configure.
     visible: bool,
     /// Kept so the picker can explain an empty model list.
@@ -257,37 +114,38 @@ impl EventEmitter<ControlsEvent> for Controls {}
 
 impl Controls {
     pub fn new(tokens: Tokens, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let model = cx.new(|cx| {
-            SelectState::new(SearchableVec::new(Vec::new()), None, window, cx).searchable(true)
-        });
-        cx.subscribe_in(&model, window, |controls, _, event, _, cx| {
-            let SelectEvent::Confirm(Some(key)) = event else {
-                return;
-            };
-            if let Some(model) = controls.model_for(key) {
-                cx.emit(ControlsEvent::SetModel(model));
+        let model_picker = cx.new(|cx| ModelPicker::new(tokens, window, cx));
+        cx.subscribe_in(&model_picker, window, |_, _, event, _, cx| match event {
+            ModelPickerEvent::Confirm(model) => {
+                cx.emit(ControlsEvent::SetModel(model.clone()));
             }
         })
         .detach();
 
-        let thinking = cx.new(|cx| SelectState::new(Vec::new(), None, window, cx));
-        cx.subscribe_in(&thinking, window, |_, _, event, _, cx| {
-            if let SelectEvent::Confirm(Some(level)) = event {
+        let thinking: Entity<ChoicePicker<ThinkingLevel>> =
+            cx.new(|_| ChoicePicker::new("thinking", THINKING_MENU_WIDTH, tokens));
+        cx.subscribe_in(&thinking, window, |_, _, event, _, cx| match event {
+            ChoicePickerEvent::Confirm(level) => {
                 cx.emit(ControlsEvent::SetThinkingLevel(*level));
             }
         })
         .detach();
 
-        let permission_picker = cx.new(|cx| SelectState::new(Vec::new(), None, window, cx));
-        cx.subscribe_in(&permission_picker, window, |_, _, event, _, cx| {
-            if let SelectEvent::Confirm(Some(level)) = event {
-                cx.emit(ControlsEvent::SetPermissionLevel(*level));
-            }
-        })
+        let permission_picker: Entity<ChoicePicker<AgentPermissionLevel>> =
+            cx.new(|_| ChoicePicker::new("permission", PERMISSION_MENU_WIDTH, tokens));
+        cx.subscribe_in(
+            &permission_picker,
+            window,
+            |_, _, event, _, cx| match event {
+                ChoicePickerEvent::Confirm(level) => {
+                    cx.emit(ControlsEvent::SetPermissionLevel(*level));
+                }
+            },
+        )
         .detach();
 
         Self {
-            model,
+            model_picker,
             thinking,
             permission_picker,
             visible: false,
@@ -303,12 +161,7 @@ impl Controls {
     pub fn sync(&mut self, state: &AppState, window: &mut Window, cx: &mut Context<Self>) {
         self.visible = state.selected_project.is_some();
         self.status = state.session_status.clone();
-        self.models = state.available_models.clone();
-        self.permission = state.agent_team_config.default_policy.level;
-        self.language = state.language;
-        let tokens = self.tokens;
 
-        let groups = model_groups(&self.models, tokens);
         // A pending switch is what the picker shows: the user chose it, and it
         // takes effect on the next prompt.
         let selected = state
@@ -316,40 +169,47 @@ impl Controls {
             .as_ref()
             .or(state.current_model.as_ref())
             .map(|model| (model.provider.clone(), model.id.clone()));
-        self.model.update(cx, |picker, cx| {
-            picker.set_items(SearchableVec::new(groups), window, cx);
-            match &selected {
-                Some(key) => picker.set_selected_value(key, window, cx),
-                None => picker.set_selected_index(None, window, cx),
-            }
+        if self.models != state.available_models {
+            self.models = state.available_models.clone();
+        }
+        self.model_picker.update(cx, |picker, cx| {
+            picker.sync(
+                &state.available_models,
+                selected,
+                state.language,
+                window,
+                cx,
+            );
         });
 
-        let levels: Vec<Choice<ThinkingLevel>> = state
-            .available_thinking_levels
-            .iter()
-            .map(|level| Choice {
-                label: level.as_str().into(),
-                value: *level,
-            })
-            .collect();
-        let level = state.thinking_level;
+        let permission = state.agent_team_config.default_policy.level;
+        let language = state.language;
+        self.permission = permission;
+        self.language = language;
         self.thinking.update(cx, |picker, cx| {
-            picker.set_items(levels, window, cx);
-            picker.set_selected_value(&level, window, cx);
+            picker.sync(
+                state
+                    .available_thinking_levels
+                    .iter()
+                    .map(|level| Choice::new(level.as_str(), *level))
+                    .collect(),
+                Some(state.thinking_level),
+                translate("thinking-prefix", language),
+                translate("thinking-off", language),
+                cx,
+            );
         });
-
-        let language = self.language;
-        let permissions: Vec<Choice<AgentPermissionLevel>> = PERMISSION_LEVELS
-            .iter()
-            .map(|level| Choice {
-                label: translate(permission_key(*level), language).into(),
-                value: *level,
-            })
-            .collect();
-        let permission = self.permission;
         self.permission_picker.update(cx, |picker, cx| {
-            picker.set_items(permissions, window, cx);
-            picker.set_selected_value(&permission, window, cx);
+            picker.sync(
+                PERMISSION_LEVELS
+                    .iter()
+                    .map(|level| Choice::new(translate(permission_key(*level), language), *level))
+                    .collect(),
+                Some(permission),
+                "",
+                translate(permission_key(permission), language),
+                cx,
+            );
         });
 
         cx.notify();
@@ -357,21 +217,24 @@ impl Controls {
 
     pub fn set_tokens(&mut self, tokens: Tokens, cx: &mut Context<Self>) {
         self.tokens = tokens;
+        self.model_picker
+            .update(cx, |picker, cx| picker.set_tokens(tokens, cx));
+        self.thinking
+            .update(cx, |picker, cx| picker.set_tokens(tokens, cx));
+        self.permission_picker
+            .update(cx, |picker, cx| picker.set_tokens(tokens, cx));
         cx.notify();
     }
 
     /// The permission level: a dot, then a picker over the three levels.
     ///
-    /// The dot is separate from the picker rather than inside it, because a
-    /// `Select` renders its own row and a coloured marker in the trigger would not
-    /// survive the selection. What it carries is the warning — full access lets a
-    /// spawned agent reach the host without asking, and that should be visible
-    /// without reading the word next to it.
+    /// The dot stays separate from the shared trigger because it carries the
+    /// warning: full access lets an agent reach the host without asking.
     fn permission_indicator(&self) -> impl IntoElement {
         let tokens = self.tokens;
         // The tooltip sits on the group rather than the picker: the dot and the
         // level name say what is granted, not what kind of setting this is, and
-        // `Select` has no tooltip of its own to hang it from.
+        // The whole group owns the tooltip, so both the dot and label explain it.
         let label = translate("permission-level", self.language);
         div()
             .id("permission-level")
@@ -388,23 +251,7 @@ impl Controls {
                     .rounded(px(radius::DOT))
                     .bg(permission_color(self.permission, tokens)),
             )
-            .child(
-                Select::new(&self.permission_picker)
-                    .xsmall()
-                    .appearance(false),
-            )
-    }
-
-    /// The model behind a picked row.
-    ///
-    /// The event carries only the row's value, and the shell needs the whole
-    /// option, so it is looked back up here. Keeping the table on this side means
-    /// not reaching into the picker for its items.
-    fn model_for(&self, key: &(String, String)) -> Option<ModelOption> {
-        self.models
-            .iter()
-            .find(|model| model.provider == key.0 && model.id == key.1)
-            .cloned()
+            .child(self.permission_picker.clone())
     }
 }
 
@@ -421,10 +268,8 @@ impl Render for Controls {
         // box, so the panel and the border around it are already the shell's.
         // Giving it a second surface drew a bar inside a bar.
         //
-        // One line, never wrapped. The pickers are drawn without their trigger
-        // chrome — on this row a boxed control apiece read as edges inside edges —
-        // so what shows is the current value as text, which is all a reader needs
-        // until they click it.
+        // One line, never wrapped. Every picker uses the same neutral trigger:
+        // quiet at rest, grey on hover or while open.
         div()
             .flex()
             .flex_none()
@@ -434,15 +279,7 @@ impl Render for Controls {
             .child(
                 div()
                     .when(!self.models.is_empty(), |this| {
-                        this.child(
-                            Select::new(&self.model)
-                                .xsmall()
-                                .appearance(false)
-                                .menu_width(px(MODEL_MENU_WIDTH))
-                                .menu_max_h(px(MODEL_MENU_MAX_HEIGHT))
-                                .placeholder(translate("model", self.language))
-                                .search_placeholder(translate("search-models", self.language)),
-                        )
+                        this.child(self.model_picker.clone())
                     })
                     .when(self.models.is_empty(), |this| {
                         // Why there is nothing to pick, rather than an empty
@@ -459,94 +296,13 @@ impl Render for Controls {
                         )
                     }),
             )
-            .child(
-                Select::new(&self.thinking)
-                    .xsmall()
-                    .appearance(false)
-                    .title_prefix(translate("thinking-prefix", self.language))
-                    .placeholder(translate("thinking-off", self.language)),
-            )
+            .child(self.thinking.clone())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn model(provider: &str, provider_name: &str, id: &str, name: &str) -> ModelOption {
-        ModelOption {
-            provider: provider.into(),
-            provider_name: provider_name.into(),
-            id: id.into(),
-            name: name.into(),
-        }
-    }
-
-    fn item(model: ModelOption) -> ModelItem {
-        ModelItem::new(model, Tokens::light())
-    }
-
-    #[test]
-    fn models_are_grouped_under_their_provider() {
-        let models = vec![
-            model("p1", "Anthropic", "claude-opus-4-8", "Opus 4.8"),
-            model("p2", "OpenAI", "gpt-5", "GPT-5"),
-            model("p1", "Anthropic", "claude-sonnet-5", "Sonnet 5"),
-        ];
-        let groups = model_groups(&models, Tokens::light());
-
-        assert_eq!(groups.len(), 2);
-        // Providers sort by name, so the order does not shift between refreshes.
-        assert_eq!(groups[0].title, "Anthropic");
-        assert_eq!(groups[1].title, "OpenAI");
-        assert_eq!(groups[0].items.len(), 2);
-        // Within a provider the agent's own order is kept — it is a ranking.
-        assert_eq!(groups[0].items[0].model.name, "Opus 4.8");
-        assert_eq!(groups[0].items[1].model.name, "Sonnet 5");
-    }
-
-    #[test]
-    fn no_models_means_no_groups() {
-        assert!(model_groups(&[], Tokens::light()).is_empty());
-    }
-
-    #[test]
-    fn a_model_is_identified_by_provider_and_id_together() {
-        // Two providers can serve the same model id, and picking one must not
-        // select the other's.
-        let first = item(model("p1", "Anthropic", "claude-opus-4-8", "Opus"));
-        let second = item(model("p2", "Bedrock", "claude-opus-4-8", "Opus"));
-
-        assert_ne!(first.value(), second.value());
-    }
-
-    #[test]
-    fn searching_matches_the_id_as_well_as_the_name() {
-        // The default delegate only searches the title; someone hunting a
-        // specific build types the id.
-        let candidate = item(model("p1", "Anthropic", "claude-sonnet-5", "Sonnet 5"));
-
-        assert!(candidate.matches("sonnet"));
-        assert!(candidate.matches("claude-sonnet-5"));
-        assert!(candidate.matches("Anthropic"));
-        assert!(!candidate.matches("gpt"));
-    }
-
-    #[test]
-    fn searching_ignores_case_and_surrounding_space() {
-        let candidate = item(model("p1", "Anthropic", "claude-opus-4-8", "Opus 4.8"));
-
-        assert!(candidate.matches("  OPUS "));
-        assert!(candidate.matches("CLAUDE-OPUS"));
-    }
-
-    #[test]
-    fn an_empty_query_matches_everything() {
-        let candidate = item(model("p1", "Anthropic", "claude-opus-4-8", "Opus 4.8"));
-
-        assert!(candidate.matches(""));
-        assert!(candidate.matches("   "));
-    }
 
     #[test]
     fn an_empty_model_list_says_why_when_the_session_failed() {
@@ -583,17 +339,6 @@ mod tests {
         for level in ThinkingLevel::ALL {
             assert!(!level.as_str().is_empty());
         }
-    }
-
-    #[test]
-    fn a_models_secondary_line_is_reserved_even_when_it_would_repeat() {
-        // The virtual list measures one row and applies that height to all of
-        // them; a conditionally-present second line makes rows of two heights.
-        let same = item(model("p1", "Local", "llama", "llama"));
-        assert_eq!(same.secondary(), SharedString::default());
-
-        let different = item(model("p1", "Anthropic", "claude-opus-4-8", "Opus 4.8"));
-        assert_eq!(different.secondary(), SharedString::from("claude-opus-4-8"));
     }
 
     #[test]
@@ -644,11 +389,7 @@ mod tests {
         }
     }
 
-    // The popup is wide enough for an id, and bounded so a long model list
-    // scrolls rather than filling the window.
     const _: () = {
-        assert!(MODEL_MENU_WIDTH > 0.0);
-        assert!(MODEL_MENU_MAX_HEIGHT > 0.0);
         assert!(DOT_SIZE > 0.0);
     };
 }

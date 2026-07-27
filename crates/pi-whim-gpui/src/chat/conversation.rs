@@ -14,7 +14,10 @@
 //! Here it is a constructor argument, and `CachedMessageLayout` has no
 //! counterpart — gpui measures and caches item heights itself.
 
-use std::{collections::HashSet, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 
 use gpui::{
     AnyElement, Context, EventEmitter, FollowMode, IntoElement, ListAlignment, ListState,
@@ -26,7 +29,10 @@ use pi_whim_core::{
 use pi_whim_engine::typewriter::Typewriter;
 use pi_whim_theme::{Tokens, text};
 
-use crate::{chat::MessageCard, theme::IntoHsla};
+use crate::{
+    chat::{MessageCard, message_card::MessageExpansion, reading_lane},
+    theme::IntoHsla,
+};
 
 /// How far beyond the visible span to render, so scrolling does not flash blank.
 const OVERDRAW: f32 = 400.0;
@@ -36,8 +42,12 @@ const TYPEWRITER_FRAME: Duration = Duration::from_millis(16);
 /// What the conversation asks the shell to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConversationEvent {
+    /// Show or hide a tool card's normal output.
+    ToggleToolReport(String),
     /// Show or hide a tool card's raw event data.
     ToggleToolDetails(String),
+    /// Show or hide one reasoning section inside an assistant message.
+    ToggleThinking { id: String, segment: usize },
     /// Reveal the rest of one streaming reply immediately.
     RevealAll(String),
     /// Fork the session at a user message.
@@ -49,8 +59,9 @@ pub enum ConversationEvent {
 /// The scrolling list of conversation entries.
 pub struct Conversation {
     messages: Vec<ConversationItem>,
-    /// Tool entries whose diagnostic detail is showing, by message id.
-    expanded: HashSet<String>,
+    /// Independently expandable content, grouped by message so lifecycle changes
+    /// cannot leave one disclosure state behind another.
+    expansions: HashMap<String, MessageExpansion>,
     typewriter: Typewriter,
     /// Whether a project is selected, which is what the empty state turns on.
     ///
@@ -78,7 +89,7 @@ impl Conversation {
         list.set_follow_mode(FollowMode::Tail);
         Self {
             messages: Vec::new(),
-            expanded: HashSet::new(),
+            expansions: HashMap::new(),
             typewriter: Typewriter::new(),
             has_project: false,
             language: Language::default(),
@@ -100,6 +111,7 @@ impl Conversation {
         }
         let previous = self.messages.len();
         let next = messages.len();
+        let changed_existing = changed_message_indices(&self.messages, &messages);
 
         // Pi replaces a draft streaming id with its real entry id in place.
         // Carry reveal progress across that rename, then discard progress for
@@ -112,6 +124,7 @@ impl Conversation {
                     || new.full_text.starts_with(&old.full_text));
             if old.id != new.id && same_stream {
                 self.typewriter.rekey(&old.id, &new.id);
+                rekey_expansion(&mut self.expansions, &old.id, &new.id);
             }
         }
         let next_ids: HashSet<_> = messages.iter().map(|message| message.id.as_str()).collect();
@@ -120,14 +133,17 @@ impl Conversation {
                 self.typewriter.forget(&old.id);
             }
         }
+        self.expansions
+            .retain(|id, _| next_ids.contains(id.as_str()));
         self.messages = messages;
 
         if next >= previous {
             // Appended, or the tail changed in place.
             self.list.splice(previous..previous, next - previous);
-            if previous > 0 {
-                // The last existing entry may have grown while streaming.
-                self.list.remeasure_items(previous - 1..previous);
+            // Tool output and streaming text can update any existing entry, not
+            // only the tail (parallel tools are the common case).
+            for index in changed_existing {
+                self.list.remeasure_items(index..index + 1);
             }
         } else {
             // Entries went away, which only happens on a reset.
@@ -140,7 +156,7 @@ impl Conversation {
     /// Drop everything, for switching sessions or clearing the conversation.
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         self.messages.clear();
-        self.expanded.clear();
+        self.expansions.clear();
         self.typewriter.clear();
         self.list.reset(0);
         self.list.set_follow_mode(FollowMode::Tail);
@@ -255,20 +271,67 @@ impl Conversation {
         true
     }
 
-    /// Whether a tool entry's diagnostic detail is showing.
-    pub fn is_expanded(&self, id: &str) -> bool {
-        self.expanded.contains(id)
+    pub fn is_tool_report_expanded(&self, id: &str) -> bool {
+        self.expansions
+            .get(id)
+            .is_some_and(|expansion| expansion.tool_report)
     }
 
-    /// Show or hide a tool entry's diagnostic detail.
-    pub fn toggle_details(&mut self, id: &str, cx: &mut Context<Self>) {
-        if !self.expanded.remove(id) {
-            self.expanded.insert(id.to_owned());
+    pub fn is_tool_details_expanded(&self, id: &str) -> bool {
+        self.expansions
+            .get(id)
+            .is_some_and(|expansion| expansion.tool_details)
+    }
+
+    pub fn is_thinking_expanded(&self, id: &str, segment: usize) -> bool {
+        self.expansions
+            .get(id)
+            .is_some_and(|expansion| expansion.thinking.contains(&segment))
+    }
+
+    /// Show or hide the normal output of a tool entry.
+    pub fn toggle_tool_report(&mut self, id: &str, cx: &mut Context<Self>) {
+        let expansion = self.expansions.entry(id.to_owned()).or_default();
+        expansion.tool_report = !expansion.tool_report;
+        self.drop_empty_expansion(id);
+        self.remeasure(id);
+        cx.notify();
+    }
+
+    /// Show or hide a tool entry's raw diagnostic data.
+    pub fn toggle_tool_details(&mut self, id: &str, cx: &mut Context<Self>) {
+        let expansion = self.expansions.entry(id.to_owned()).or_default();
+        expansion.tool_details = !expansion.tool_details;
+        self.drop_empty_expansion(id);
+        self.remeasure(id);
+        cx.notify();
+    }
+
+    /// Show or hide one reasoning section in an assistant message.
+    pub fn toggle_thinking(&mut self, id: &str, segment: usize, cx: &mut Context<Self>) {
+        let expansion = self.expansions.entry(id.to_owned()).or_default();
+        if !expansion.thinking.remove(&segment) {
+            expansion.thinking.insert(segment);
         }
+        self.drop_empty_expansion(id);
+        self.remeasure(id);
+        cx.notify();
+    }
+
+    fn drop_empty_expansion(&mut self, id: &str) {
+        if self
+            .expansions
+            .get(id)
+            .is_some_and(MessageExpansion::is_empty)
+        {
+            self.expansions.remove(id);
+        }
+    }
+
+    fn remeasure(&mut self, id: &str) {
         if let Some(index) = self.messages.iter().position(|message| message.id == id) {
             self.list.remeasure_items(index..index + 1);
         }
-        cx.notify();
     }
 
     /// Scroll so the newest entry is in view.
@@ -316,11 +379,14 @@ impl Conversation {
         let Some(message) = self.messages.get(index) else {
             return div().into_any_element();
         };
-        MessageCard::new(
+        MessageCard::with_expansion(
             index,
             message.clone(),
             self.typewriter.visible_text(message).to_owned(),
-            self.expanded.contains(&message.id),
+            self.expansions
+                .get(&message.id)
+                .cloned()
+                .unwrap_or_default(),
             self.tokens,
         )
         .language(self.language)
@@ -330,18 +396,37 @@ impl Conversation {
 
     fn render_generating(&self) -> AnyElement {
         let tokens = self.tokens;
-        div()
-            .flex()
-            .items_center()
-            .gap(px(7.0))
-            .px(px(18.0))
-            .py(px(5.0))
-            .text_size(px(text::LABEL_SIZE))
-            .text_color(tokens.muted.hsla())
-            .child(div().w(px(6.0)).h(px(6.0)).bg(tokens.accent.hsla()))
-            .child(translate("generating", self.language))
-            .into_any_element()
+        reading_lane(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(7.0))
+                .text_size(px(text::LABEL_SIZE))
+                .text_color(tokens.muted.hsla())
+                .child(div().w(px(6.0)).h(px(6.0)).bg(tokens.accent.hsla()))
+                .child(translate("generating", self.language)),
+        )
+        .py(px(5.0))
+        .into_any_element()
     }
+}
+
+fn rekey_expansion(expansions: &mut HashMap<String, MessageExpansion>, from: &str, to: &str) {
+    if let Some(expansion) = expansions.remove(from) {
+        expansions
+            .entry(to.to_owned())
+            .or_default()
+            .merge(expansion);
+    }
+}
+
+fn changed_message_indices(before: &[ConversationItem], after: &[ConversationItem]) -> Vec<usize> {
+    before
+        .iter()
+        .zip(after)
+        .enumerate()
+        .filter_map(|(index, (old, new))| (old != new).then_some(index))
+        .collect()
 }
 
 /// The entries worth rendering from state.
@@ -475,6 +560,19 @@ mod tests {
         assert_eq!(visible_messages(&state).len(), 1);
     }
 
+    #[test]
+    fn a_changed_non_tail_entry_is_remeasured() {
+        let before = vec![
+            message("tool-a", ConversationRole::Tool, "running"),
+            message("tool-b", ConversationRole::Tool, "running"),
+        ];
+        let mut after = before.clone();
+        after[0].tool_report = Some("a much taller report".into());
+        after.push(message("tail", ConversationRole::Assistant, "answer"));
+
+        assert_eq!(changed_message_indices(&before, &after), vec![0]);
+    }
+
     #[gpui::test]
     async fn streaming_text_is_advanced_without_a_window_frame_loop(cx: &mut gpui::TestAppContext) {
         let conversation = cx.update(|cx| cx.new(|_| Conversation::new(Tokens::light())));
@@ -514,6 +612,9 @@ mod tests {
             conversation.update(cx, |conversation, cx| {
                 conversation.set_messages(vec![draft], cx);
                 conversation.reveal_all("draft", cx);
+                conversation.toggle_tool_report("draft", cx);
+                conversation.toggle_tool_details("draft", cx);
+                conversation.toggle_thinking("draft", 1, cx);
             });
         });
 
@@ -528,6 +629,64 @@ mod tests {
                         .visible_text(&conversation.messages[0]),
                     "hello"
                 );
+                assert!(conversation.is_tool_report_expanded("entry-1"));
+                assert!(conversation.is_tool_details_expanded("entry-1"));
+                assert!(conversation.is_thinking_expanded("entry-1", 1));
+                assert!(!conversation.expansions.contains_key("draft"));
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn disclosures_default_closed_and_toggle_independently(cx: &mut gpui::TestAppContext) {
+        let conversation = cx.update(|cx| cx.new(|_| Conversation::new(Tokens::light())));
+        let mut tool = message("tool", ConversationRole::Tool, "running");
+        tool.tool_report = Some("report".into());
+        tool.tool_details = Some("{\"raw\":true}".into());
+
+        cx.update(|cx| {
+            conversation.update(cx, |conversation, cx| {
+                conversation.set_messages(vec![tool], cx);
+                assert!(!conversation.is_tool_report_expanded("tool"));
+                assert!(!conversation.is_tool_details_expanded("tool"));
+                assert!(!conversation.is_thinking_expanded("tool", 2));
+
+                conversation.toggle_tool_report("tool", cx);
+                assert!(conversation.is_tool_report_expanded("tool"));
+                assert!(!conversation.is_tool_details_expanded("tool"));
+
+                conversation.toggle_tool_details("tool", cx);
+                conversation.toggle_thinking("tool", 2, cx);
+                assert!(conversation.is_tool_report_expanded("tool"));
+                assert!(conversation.is_tool_details_expanded("tool"));
+                assert!(conversation.is_thinking_expanded("tool", 2));
+
+                conversation.toggle_tool_report("tool", cx);
+                assert!(!conversation.is_tool_report_expanded("tool"));
+                assert!(conversation.is_tool_details_expanded("tool"));
+                assert!(conversation.is_thinking_expanded("tool", 2));
+
+                conversation.toggle_tool_details("tool", cx);
+                conversation.toggle_thinking("tool", 2, cx);
+                assert!(!conversation.expansions.contains_key("tool"));
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn removing_a_message_drops_its_disclosure_state(cx: &mut gpui::TestAppContext) {
+        let conversation = cx.update(|cx| cx.new(|_| Conversation::new(Tokens::light())));
+        cx.update(|cx| {
+            conversation.update(cx, |conversation, cx| {
+                conversation.set_messages(
+                    vec![message("gone", ConversationRole::Assistant, "answer")],
+                    cx,
+                );
+                conversation.toggle_thinking("gone", 0, cx);
+                assert!(conversation.expansions.contains_key("gone"));
+
+                conversation.set_messages(Vec::new(), cx);
+                assert!(conversation.expansions.is_empty());
             });
         });
     }

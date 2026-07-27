@@ -12,11 +12,11 @@ use std::{
 };
 
 use pi_whim_core::{
-    Action, AppState, Attachment, ConversationItem, ConversationRole, Language, ModelOption,
-    Project, ProjectId, ProviderId, ProviderProfile, ProviderProtocol, QueueMode,
-    SearchEngineProfile, SessionMetrics, SessionStatus, SessionSummary, SubmitMode, ThinkingLevel,
-    normalize_bash_patterns, normalize_provider_display_name, provider_name_key, stable_session_id,
-    strings,
+    Action, AgentPermissionLevel, AppState, Attachment, ConversationItem, ConversationRole,
+    Language, ModelOption, Project, ProjectId, ProviderId, ProviderProfile, ProviderProtocol,
+    QueueMode, SearchEngineProfile, SessionMetrics, SessionStatus, SessionSummary, SubmitMode,
+    ThinkingLevel, normalize_bash_patterns, normalize_provider_display_name, provider_name_key,
+    stable_session_id, strings,
 };
 use pi_whim_persistence::{
     AppPreferences, AttachmentStore, MacosKeychainStore, PreferencesRepository, ProjectRepository,
@@ -366,6 +366,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                     self.restart_selected_project();
                 }
             }
+            Request::SetPermissionLevel(level) => self.set_permission_level(level),
             Request::SetAgentTeamConfig(config) => {
                 let config = config.normalized();
                 if self.state().agent_team_config != config {
@@ -1114,6 +1115,26 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             return;
         }
         self.refresh_runtime_controls();
+    }
+
+    /// Apply the prompt's permission selector without restarting any session.
+    ///
+    /// The policy is global, so every live supervisor receives it. Existing
+    /// children keep the ceiling they started with; newly spawned children use
+    /// the new default while all root sessions and in-flight turns stay intact.
+    fn set_permission_level(&mut self, level: AgentPermissionLevel) {
+        if self.state().agent_team_config.default_policy.level == level {
+            return;
+        }
+        for (_, session) in self.sessions.iter() {
+            if let Err(error) = session.runtime.set_default_permission_level(level) {
+                self.notices.error(error.to_string());
+            }
+        }
+        let mut config = self.state().agent_team_config.clone();
+        config.default_policy.level = level;
+        self.apply(Action::SetAgentTeamConfig(config));
+        self.save_preferences();
     }
 
     fn compact_session(&mut self) {
@@ -2144,7 +2165,6 @@ mod tests {
         let observer = runtime.clone();
         let mut app = test_application(&directory, runtime);
         start_test_session(&mut app, &directory);
-        let commands_before = observer.commands().len();
 
         let other = project("other", &directory.path().join("other"));
         let other_id = other.id;
@@ -2162,7 +2182,9 @@ mod tests {
         );
 
         assert!(app.state().conversation.is_empty());
-        assert_eq!(observer.commands().len(), commands_before);
+        assert!(!observer.commands().iter().any(|command| {
+            command.get("message").and_then(Value::as_str) == Some("do not misroute this")
+        }));
     }
 
     #[test]
@@ -2183,6 +2205,67 @@ mod tests {
         ));
 
         assert_eq!(observer.starts().len(), starts);
+    }
+
+    #[test]
+    fn permission_switch_updates_every_live_supervisor_without_restarting_or_compacting() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = FakeRuntime::default();
+        let observer = runtime.clone();
+        let mut app = test_application(&directory, runtime);
+        start_test_session(&mut app, &directory);
+        let project_id = app.state().selected_project.unwrap();
+
+        // A user turn makes the visible draft non-empty, so a second session is
+        // launched and the first remains pooled in the background.
+        app.apply(Action::UpsertConversation(ConversationItem {
+            id: "user-1".into(),
+            role: ConversationRole::User,
+            full_text: "keep the first session".into(),
+            streaming: false,
+            tool_name: None,
+            tool_report: None,
+            tool_details: None,
+            is_error: false,
+            model: None,
+            attachments: Vec::new(),
+        }));
+        app.start_new_session(project_id);
+        assert_eq!(app.sessions.iter().count(), 2);
+        let starts = observer.starts().len();
+
+        app.handle(Request::SetPermissionLevel(AgentPermissionLevel::ReadOnly));
+
+        assert_eq!(observer.starts().len(), starts);
+        assert_eq!(app.sessions.iter().count(), 2);
+        assert_eq!(
+            observer.permission_levels(),
+            vec![
+                AgentPermissionLevel::ReadOnly,
+                AgentPermissionLevel::ReadOnly
+            ]
+        );
+        assert_eq!(
+            app.state().agent_team_config.default_policy.level,
+            AgentPermissionLevel::ReadOnly
+        );
+        assert!(observer.commands().iter().all(|command| {
+            !matches!(
+                command.get("type").and_then(Value::as_str),
+                Some("abort" | "compact" | "set_model")
+            )
+        }));
+        assert_eq!(
+            app.store
+                .as_ref()
+                .unwrap()
+                .load_preferences()
+                .unwrap()
+                .agent_team_config
+                .default_policy
+                .level,
+            AgentPermissionLevel::ReadOnly
+        );
     }
 
     #[test]

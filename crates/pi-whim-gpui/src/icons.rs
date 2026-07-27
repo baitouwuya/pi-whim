@@ -103,6 +103,37 @@ pub fn session() -> IconName {
     IconName::File
 }
 
+/// The glyph for a tool invocation, grouped by what the tool acts on.
+///
+/// Tool names originate in Pi and extensions, so matching is intentionally
+/// tolerant of namespace prefixes and case. Unknown tools retain the terminal
+/// glyph used by the previous role-wide mapping.
+pub fn tool(name: &str) -> IconName {
+    let normalized = name
+        .rsplit(['.', ':', '/'])
+        .next()
+        .unwrap_or(name)
+        .to_ascii_lowercase();
+    match normalized.as_str() {
+        "read" | "read_file" => IconName::BookOpen,
+        "write" | "write_file" => IconName::File,
+        "edit" | "apply_patch" => IconName::Replace,
+        "grep" | "search" | "web_search" | "search_sessions" => IconName::Search,
+        "find" => IconName::FolderOpen,
+        "ls" | "list_files" => IconName::Folder,
+        "bash" | "shell" | "exec" | "exec_command" => IconName::SquareTerminal,
+        "list_processes" | "read_process" => IconName::Cpu,
+        "stop_process" | "interrupt_agent" | "reset_team" => IconName::Pause,
+        "fetch" | "browser" | "web" => IconName::Globe,
+        "spawn_agent" | "list_agents" | "wait_agent" => IconName::Bot,
+        "send_message" | "read_messages" | "list_pending_requests" | "resolve_interaction" => {
+            IconName::Inbox
+        }
+        "read_session" | "list_sessions" => IconName::BookOpen,
+        _ => IconName::SquareTerminal,
+    }
+}
+
 /// The glyph for a slash-command's purpose.
 ///
 /// `engine::slash_commands` names what an option is *for* and leaves the drawing
@@ -230,6 +261,24 @@ mod tests {
         ] {
             assert!(role(&with_icon).is_some(), "{with_icon:?}");
         }
+    }
+
+    #[test]
+    fn tool_purposes_use_distinct_bundled_svg_glyphs() {
+        assert_eq!(path(tool("read")), path(IconName::BookOpen));
+        assert_eq!(path(tool("write")), path(IconName::File));
+        assert_eq!(path(tool("edit")), path(IconName::Replace));
+        assert_eq!(path(tool("grep")), path(IconName::Search));
+        assert_eq!(path(tool("bash")), path(IconName::SquareTerminal));
+        assert_eq!(path(tool("spawn_agent")), path(IconName::Bot));
+        assert_eq!(path(tool("web_search")), path(IconName::Search));
+    }
+
+    #[test]
+    fn namespaced_and_unknown_tools_still_receive_an_icon() {
+        assert_eq!(path(tool("functions.read")), path(IconName::BookOpen));
+        assert_eq!(path(tool("vendor:edit")), path(IconName::Replace));
+        assert_eq!(path(tool("custom_tool")), path(IconName::SquareTerminal));
     }
 
     #[test]
