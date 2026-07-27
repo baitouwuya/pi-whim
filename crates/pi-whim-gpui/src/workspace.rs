@@ -12,9 +12,9 @@ use gpui::{
 };
 use gpui_component::theme::{Theme as ComponentTheme, ThemeMode as ComponentMode};
 use pi_whim_core::{
-    AgentTeamConfig, AppState, Attachment, BashPolicy, Language, ModelOption, ProjectId,
-    ProviderId, ProviderProfile, ProviderProtocol, QueueMode, SearchEngineProfile, SessionStatus,
-    SubmitMode, ThinkingLevel,
+    AgentPermissionPolicy, AgentTeamConfig, AppState, Attachment, BashPolicy, Language,
+    ModelOption, ProjectId, ProviderId, ProviderProfile, ProviderProtocol, QueueMode,
+    SearchEngineProfile, SessionStatus, SubmitMode, ThinkingLevel,
 };
 use pi_whim_engine::dialogs::{Answer, Prompt};
 use pi_whim_engine::notice::Outbox;
@@ -526,6 +526,19 @@ impl Workspace {
                 // the picker shows it when that snapshot comes back.
                 self.request(Request::SetModel(model), cx);
             }
+            ControlsEvent::SetPermissionLevel(level) => {
+                // The level lives inside the agent-team config, so the whole
+                // config travels: the request stores it as one document, and a
+                // partial one would blank the rest of it.
+                let config = AgentTeamConfig {
+                    default_policy: AgentPermissionPolicy {
+                        level,
+                        ..self.state.agent_team_config.default_policy.clone()
+                    },
+                    ..self.state.agent_team_config.clone()
+                };
+                self.request(Request::SetAgentTeamConfig(config), cx);
+            }
             ControlsEvent::SetThinkingLevel(level) => {
                 self.request(Request::SetThinkingLevel(level), cx);
             }
@@ -845,32 +858,36 @@ impl Workspace {
 
     /// The prompt and everything that describes the turn it will start.
     ///
-    /// One panel holding the field, the key hint, and the runtime controls. The
+    /// One bordered box: the field on top, and beneath it a single row carrying
+    /// attach, the permission level, the model, the thinking level, and send. The
     /// controls used to be a full-width bar under the top chrome, where they
     /// wrapped onto three rows and left most of each one empty; they describe the
     /// turn about to be sent, so this is where they belong.
     ///
     /// Assembled here rather than inside [`Composer`] because a single row cannot
-    /// be split across two entities — the hint and the controls share one.
-    fn prompt_area(&self, tokens: Tokens) -> impl IntoElement {
-        // One line, never wrapped. The controls are left-aligned and keep their
-        // measured widths; the hint follows them and is the only thing allowed to
-        // shrink, because it is a reminder rather than something to act on.
+    /// be split across two entities — the composer's own buttons share it with the
+    /// controls.
+    ///
+    /// Square, like everything else with an edge: the whole app carries pi.dev's
+    /// `border-radius: 0`, and the only round thing on this row is the permission
+    /// dot.
+    fn prompt_area(&self, tokens: Tokens, cx: &mut Context<Self>) -> impl IntoElement {
+        let (attach, send) = self.composer.update(cx, |composer, cx| {
+            (composer.attach_button(cx), composer.send_button(cx))
+        });
+
+        // One line, never wrapped. Attach and the controls sit left; send is pushed
+        // to the far edge, where the eye ends up after reading what it will send.
         let footer = div()
             .flex()
             .items_center()
-            .gap(px(10.0))
+            .gap(px(8.0))
+            .child(attach)
             .child(div().flex_none().child(self.controls.clone()))
-            .child(
-                div()
-                    .flex_shrink(1.0)
-                    .min_w(px(0.0))
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .text_size(px(text::LABEL_SIZE))
-                    .text_color(tokens.muted.hsla())
-                    .child(chat::SUBMIT_HINT),
-            );
+            // Takes the slack, so send stays at the right edge however narrow the
+            // window gets.
+            .child(div().flex_1().min_w(px(0.0)))
+            .child(send);
 
         div()
             // The containing block the palette anchors against.
@@ -896,11 +913,14 @@ impl Workspace {
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(6.0))
+                    .gap(px(4.0))
                     .w_full()
-                    .p(px(10.0))
+                    .p(px(8.0))
                     .bg(tokens.panel.hsla())
-                    .border_t_1()
+                    // All four edges, not just the top: the field inside is
+                    // borderless now, so this is the only thing saying where the
+                    // prompt begins and ends.
+                    .border_1()
                     .border_color(tokens.line.hsla())
                     .child(self.composer.clone())
                     .child(footer),
@@ -1040,7 +1060,7 @@ impl Render for Workspace {
                                         .flex_col()
                                         .min_w(px(0.0))
                                         .child(self.conversation.clone())
-                                        .child(self.prompt_area(tokens)),
+                                        .child(self.prompt_area(tokens, cx)),
                                 ),
                         )
                     }),

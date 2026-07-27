@@ -147,6 +147,12 @@ const STRINGS: &[(&str, &str, &str)] = &[
         "控制 Bash 工具的执行方式。",
     ),
     ("queue-mode", "Queue mode", "队列模式"),
+    // The permission level, shown beside the prompt as well as in settings: it is
+    // what the agent may reach without asking, so it belongs where a turn is sent.
+    ("permission-level", "Permission", "权限"),
+    ("permission-read-only", "Read-only", "只读"),
+    ("permission-controlled", "Approval", "审批"),
+    ("permission-full", "Full access", "完全访问"),
     (
         "provider-help",
         "Keys are stored securely in macOS Keychain.",

@@ -7,8 +7,8 @@
 //! is nothing to reimplement here.
 
 use gpui::{
-    App, AppContext, ClipboardEntry, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, ParentElement, Render, Styled, Window, div,
+    AnyElement, App, AppContext, ClipboardEntry, Context, Entity, EventEmitter, FocusHandle,
+    Focusable, InteractiveElement, IntoElement, ParentElement, Render, Styled, Window, div,
     prelude::FluentBuilder, px,
 };
 use gpui_component::{
@@ -35,11 +35,10 @@ use crate::{
 const MIN_ROWS: usize = 2;
 const MAX_ROWS: usize = 12;
 
-/// What the two keys do, for the footer beneath the field.
+/// What the two keys do, for a tooltip on the send button.
 ///
-/// Lives here because it describes this input's behavior, but is rendered by the
-/// shell: the footer is one row shared with the runtime controls, and a row cannot
-/// be split across two entities.
+/// It used to be a line of text under the field. That spent a row restating what
+/// the first Enter teaches, so it now hangs off the control it describes.
 pub const SUBMIT_HINT: &str = "Enter to send · Shift+Enter for a newline";
 
 /// What the composer asks the shell to do.
@@ -71,7 +70,12 @@ pub enum ComposerEvent {
     PickAttachments { directories: bool },
 }
 
-/// The prompt input, its attachments, and the send controls.
+/// The prompt input and its attachments.
+///
+/// The send button and the attach button are rendered by the shell, on the row it
+/// shares with the runtime controls. They emit through this entity all the same —
+/// [`Composer::send_button`] and [`Composer::attach_button`] are built here
+/// because what they do is this view's, only where they sit is not.
 pub struct Composer {
     input: Entity<InputState>,
     draft: Draft,
@@ -170,6 +174,59 @@ impl Composer {
         self.input.focus_handle(cx)
     }
 
+    /// Send, or Stop while a turn is in flight.
+    ///
+    /// One button rather than two, because there is only ever one thing to do
+    /// with a turn: start it, or end the one running. Built here and placed by the
+    /// shell — see the note on [`Composer`].
+    pub fn send_button(&self, cx: &mut Context<Self>) -> AnyElement {
+        let button = if self.busy {
+            Button::new("stop")
+                .danger()
+                .icon(icons::stop())
+                .xsmall()
+                .tooltip("Stop the turn in flight")
+                .on_click(cx.listener(|_, _, _, cx| cx.emit(ComposerEvent::Stop)))
+        } else {
+            Button::new("send")
+                .primary()
+                .icon(icons::send())
+                .xsmall()
+                .tooltip(SUBMIT_HINT)
+                .on_click(cx.listener(|composer, _, window, cx| composer.submit(window, cx)))
+        };
+        button.into_any_element()
+    }
+
+    /// The only way to attach from disk.
+    ///
+    /// A paste covers the common case, but a file the reader has not copied still
+    /// has to be reachable, and the egui build's menu on the same "+" is where
+    /// they will look for it.
+    pub fn attach_button(&self, cx: &mut Context<Self>) -> AnyElement {
+        Button::new("attach")
+            .ghost()
+            .icon(icons::add())
+            .xsmall()
+            .tooltip("Attach files or a folder")
+            .dropdown_menu({
+                let composer = cx.entity();
+                move |menu, _, _| {
+                    [("Choose files…", false), ("Choose folder…", true)]
+                        .into_iter()
+                        .fold(menu, |menu, (label, directories)| {
+                            let composer = composer.clone();
+                            menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                                composer.update(cx, |_, cx| {
+                                    cx.emit(ComposerEvent::PickAttachments { directories });
+                                });
+                            }))
+                        })
+                }
+            })
+            .into_any_element()
+    }
+
     /// Decide what a paste means, and report it if it belongs on disk.
     ///
     /// Returns true when the paste was taken, which is the caller's signal to stop
@@ -259,49 +316,6 @@ impl Render for Composer {
             .map(|attachment| attachment.name.clone())
             .collect();
 
-        // Icon only, and inside the field: the glyph is unambiguous next to the
-        // text it acts on, and a labelled button below the input spent a whole
-        // row on a control Enter already reaches.
-        let action = if self.busy {
-            Button::new("stop")
-                .danger()
-                .icon(icons::stop())
-                .xsmall()
-                .tooltip("Stop the turn in flight")
-                .on_click(cx.listener(|_, _, _, cx| cx.emit(ComposerEvent::Stop)))
-        } else {
-            Button::new("send")
-                .primary()
-                .icon(icons::send())
-                .xsmall()
-                .tooltip("Send · Enter")
-                .on_click(cx.listener(|composer, _, window, cx| composer.submit(window, cx)))
-        };
-
-        // The only way to attach from disk. A paste covers the common case, but a
-        // file the reader has not copied still has to be reachable, and the egui
-        // build's menu on the same "+" is where they will look for it.
-        let attach = Button::new("attach")
-            .ghost()
-            .icon(icons::add())
-            .xsmall()
-            .tooltip("Attach files or a folder")
-            .dropdown_menu({
-                let composer = cx.entity();
-                move |menu, _, _| {
-                    [("Choose files…", false), ("Choose folder…", true)]
-                        .into_iter()
-                        .fold(menu, |menu, (label, directories)| {
-                            let composer = composer.clone();
-                            menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
-                                composer.update(cx, |_, cx| {
-                                    cx.emit(ComposerEvent::PickAttachments { directories });
-                                });
-                            }))
-                        })
-                }
-            });
-
         div()
             // Captured, not bubbled: an action reaches the focused element first
             // in the bubble phase, so by then the input would already have
@@ -343,9 +357,15 @@ impl Render for Composer {
                     }),
                 ))
             })
-            // The action rides in the field's suffix slot, which the component
-            // lays out inside the border and vertically centred.
-            .child(Input::new(&self.input).prefix(attach).suffix(action))
+            // Borderless, and with no focus ring: the box around the whole prompt
+            // area is the shell's, and a second edge just inside it drew a field
+            // within a field. The caret is what says where the typing goes.
+            .child(
+                Input::new(&self.input)
+                    .bordered(false)
+                    .focus_bordered(false)
+                    .appearance(false),
+            )
     }
 }
 

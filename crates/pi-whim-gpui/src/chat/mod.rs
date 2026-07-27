@@ -10,7 +10,7 @@ mod paste;
 mod rows;
 mod sidebar;
 
-pub use composer::{Composer, ComposerEvent, SUBMIT_HINT};
+pub use composer::{Composer, ComposerEvent};
 pub use controls::{Controls, ControlsEvent};
 pub use conversation::{Conversation, ConversationEvent, visible_messages};
 pub use message_card::MessageCard;

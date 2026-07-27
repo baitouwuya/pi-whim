@@ -1,15 +1,17 @@
-//! The runtime controls: which model answers, how hard it thinks, how queued
-//! prompts are released.
+//! The runtime controls: what the agent may reach, which model answers, and how
+//! hard it thinks.
 //!
-//! These render into the composer's footer rather than as a bar under the top
+//! These render into the prompt's own box rather than as a bar under the top
 //! chrome. They belong next to the prompt because they describe the turn about to
 //! be sent, and as a full-width row they wrapped onto three lines while leaving
 //! most of each one empty.
 //!
-//! All four are `Select`s over `gpui-component`'s searchable list. The egui build
-//! hand-rolled the model picker out of a `ComboBox` wrapping a `TextEdit` and a
-//! `ScrollArea`, re-grouping every model by provider on each frame it was open;
-//! grouping and filtering are both built into the delegate here.
+//! Both pickers are `Select`s over `gpui-component`'s searchable list, drawn
+//! without their trigger chrome: on one row inside the prompt's border, a boxed
+//! control apiece read as three nested edges. The egui build hand-rolled the model
+//! picker out of a `ComboBox` wrapping a `TextEdit` and a `ScrollArea`, re-grouping
+//! every model by provider on each frame it was open; grouping and filtering are
+//! both built into the delegate here.
 //!
 //! Two details are load-bearing:
 //!
@@ -20,23 +22,27 @@
 //!   title, and a reader hunting `sonnet-4-5` is typing the id, not the name.
 
 use gpui::{
-    App, AppContext, Context, Entity, EventEmitter, IntoElement, ParentElement, Render,
-    SharedString, Styled, Window, div, prelude::FluentBuilder, px,
+    App, AppContext, Context, Entity, EventEmitter, InteractiveElement, IntoElement, ParentElement,
+    Render, SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder,
+    px,
 };
 use gpui_component::{
     Sizable,
     select::{SearchableVec, Select, SelectEvent, SelectGroup, SelectItem, SelectState},
 };
-use pi_whim_core::{AppState, ModelOption, SessionStatus, ThinkingLevel};
-use pi_whim_theme::{Tokens, text};
+use pi_whim_core::{
+    AgentPermissionLevel, AppState, Language, ModelOption, SessionStatus, ThinkingLevel,
+    strings::text as translate,
+};
+use pi_whim_theme::{Tokens, radius, text};
 
 use crate::theme::IntoHsla;
 
-/// Width of the model trigger, and of the popup it opens.
+/// Width of the popup the model picker opens, and how tall it grows.
 ///
-/// The popup is wider than the trigger because a model's id is longer than its
-/// name — that is the whole reason the second line exists.
-const MODEL_TRIGGER_WIDTH: f32 = 190.0;
+/// Only the popup has a width. The trigger takes whatever its current value
+/// measures, because it is text on a shared row rather than a box of its own — a
+/// fixed width there would leave a gap after a short model name.
 const MODEL_MENU_WIDTH: f32 = 340.0;
 const MODEL_MENU_MAX_HEIGHT: f32 = 320.0;
 
@@ -47,6 +53,8 @@ pub enum ControlsEvent {
     /// compacts the history first.
     SetModel(ModelOption),
     SetThinkingLevel(ThinkingLevel),
+    /// Raise or lower what a spawned agent may reach without asking.
+    SetPermissionLevel(AgentPermissionLevel),
 }
 
 /// One model in the picker.
@@ -174,6 +182,50 @@ fn model_groups(models: &[ModelOption], tokens: Tokens) -> Vec<SelectGroup<Model
         .collect()
 }
 
+/// Diameter of the permission dot.
+const DOT_SIZE: f32 = 7.0;
+
+/// The three permission levels, in the order they escalate.
+///
+/// Cycled rather than picked from a menu: there are only three, and the label
+/// beside the dot already says which one is current, so a click that advances is
+/// less chrome than a popup listing what is already visible.
+const PERMISSION_LEVELS: [AgentPermissionLevel; 3] = [
+    AgentPermissionLevel::ReadOnly,
+    AgentPermissionLevel::Controlled,
+    AgentPermissionLevel::Full,
+];
+
+/// The level after `level`, wrapping.
+fn next_permission_level(level: AgentPermissionLevel) -> AgentPermissionLevel {
+    let index = PERMISSION_LEVELS
+        .iter()
+        .position(|candidate| *candidate == level)
+        .unwrap_or(0);
+    PERMISSION_LEVELS[(index + 1) % PERMISSION_LEVELS.len()]
+}
+
+/// The string key naming `level`.
+fn permission_key(level: AgentPermissionLevel) -> &'static str {
+    match level {
+        AgentPermissionLevel::ReadOnly => "permission-read-only",
+        AgentPermissionLevel::Controlled => "permission-controlled",
+        AgentPermissionLevel::Full => "permission-full",
+    }
+}
+
+/// What colour the dot beside the level takes.
+///
+/// Full access is the one worth flagging: the agent can reach the host without
+/// asking, and that should be visible from across the room rather than only on
+/// the settings page. The other two are ordinary states, so they stay muted.
+fn permission_color(level: AgentPermissionLevel, tokens: Tokens) -> gpui::Hsla {
+    match level {
+        AgentPermissionLevel::Full => tokens.warning.hsla(),
+        _ => tokens.muted.hsla(),
+    }
+}
+
 /// Why the model picker is not showing any models.
 ///
 /// A failed session explains itself; an empty list with no failure means the
@@ -193,6 +245,13 @@ pub struct Controls {
     visible: bool,
     /// Kept so the picker can explain an empty model list.
     status: SessionStatus,
+    /// What a spawned agent may reach without asking.
+    ///
+    /// A copy of `agent_team_config.default_policy.level`. Read from the snapshot
+    /// rather than held as its own truth: the settings page changes the same field.
+    permission: AgentPermissionLevel,
+    /// The language the permission label is read in.
+    language: Language,
     /// The models as the agent reported them, for resolving a picked row back to
     /// the option the shell needs.
     models: Vec<ModelOption>,
@@ -230,6 +289,8 @@ impl Controls {
             visible: false,
             status: SessionStatus::default(),
             models: Vec::new(),
+            permission: AgentPermissionLevel::default(),
+            language: Language::default(),
             tokens,
         }
     }
@@ -239,6 +300,8 @@ impl Controls {
         self.visible = state.selected_project.is_some();
         self.status = state.session_status.clone();
         self.models = state.available_models.clone();
+        self.permission = state.agent_team_config.default_policy.level;
+        self.language = state.language;
         let tokens = self.tokens;
 
         let groups = model_groups(&self.models, tokens);
@@ -279,6 +342,46 @@ impl Controls {
         cx.notify();
     }
 
+    /// The permission level, as a dot and a word.
+    ///
+    /// Clicking advances to the next level rather than opening a menu: there are
+    /// three, and the word beside the dot already names the current one, so a popup
+    /// would list what is on screen. The dot is what carries the warning — full
+    /// access lets a spawned agent reach the host without asking.
+    fn permission_indicator(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let tokens = self.tokens;
+        let level = self.permission;
+        let color = permission_color(level, tokens);
+        div()
+            .id("permission-level")
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(5.0))
+            .px(px(4.0))
+            .cursor_pointer()
+            .hover(|this| this.bg(tokens.control_background_hover().hsla()))
+            .on_click(cx.listener(move |_, _, _, cx| {
+                cx.emit(ControlsEvent::SetPermissionLevel(next_permission_level(
+                    level,
+                )));
+            }))
+            .child(
+                div()
+                    .w(px(DOT_SIZE))
+                    .h(px(DOT_SIZE))
+                    .rounded(px(radius::DOT))
+                    .bg(color),
+            )
+            .child(
+                div()
+                    .font_family(pi_whim_theme::font::MONO)
+                    .text_size(px(text::LABEL_SIZE))
+                    .text_color(color)
+                    .child(translate(permission_key(level), self.language)),
+            )
+    }
+
     /// The model behind a picked row.
     ///
     /// The event carries only the row's value, and the shell needs the whole
@@ -293,7 +396,7 @@ impl Controls {
 }
 
 impl Render for Controls {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = self.tokens;
         if !self.visible {
             // No project means no agent to configure, and an empty bar would
@@ -301,23 +404,27 @@ impl Render for Controls {
             return div();
         }
 
-        // No background, border, or width of its own: this sits in the composer's
-        // footer now, so the panel and the border around it are already the
-        // composer's. Giving it a second surface drew a bar inside a bar.
-        // One line, never wrapped: these sit in the composer's footer beside the
-        // key hint, and the hint is what gives up space when the window narrows.
+        // No background, border, or width of its own: this sits inside the prompt's
+        // box, so the panel and the border around it are already the shell's.
+        // Giving it a second surface drew a bar inside a bar.
+        //
+        // One line, never wrapped. The pickers are drawn without their trigger
+        // chrome — on this row a boxed control apiece read as edges inside edges —
+        // so what shows is the current value as text, which is all a reader needs
+        // until they click it.
         div()
             .flex()
             .flex_none()
             .items_center()
-            .gap(px(6.0))
+            .gap(px(10.0))
+            .child(self.permission_indicator(cx))
             .child(
                 div()
                     .when(!self.models.is_empty(), |this| {
                         this.child(
                             Select::new(&self.model)
-                                .small()
-                                .w(px(MODEL_TRIGGER_WIDTH))
+                                .xsmall()
+                                .appearance(false)
                                 .menu_width(px(MODEL_MENU_WIDTH))
                                 .menu_max_h(px(MODEL_MENU_MAX_HEIGHT))
                                 .placeholder("Model")
@@ -341,7 +448,8 @@ impl Render for Controls {
             )
             .child(
                 Select::new(&self.thinking)
-                    .small()
+                    .xsmall()
+                    .appearance(false)
                     .title_prefix("Thinking: ")
                     .placeholder("off"),
             )
@@ -464,9 +572,64 @@ mod tests {
         assert_eq!(different.secondary(), SharedString::from("claude-opus-4-8"));
     }
 
-    // The popup is wider than its trigger, since an id is longer than a name.
+    #[test]
+    fn the_permission_level_cycles_through_all_three() {
+        // Clicking advances rather than opening a menu, so every level has to be
+        // reachable by clicking — a cycle that skipped one would strand it.
+        let mut level = AgentPermissionLevel::ReadOnly;
+        let mut seen = vec![level];
+        for _ in 0..PERMISSION_LEVELS.len() - 1 {
+            level = next_permission_level(level);
+            seen.push(level);
+        }
+
+        assert_eq!(seen, PERMISSION_LEVELS.to_vec());
+        // And back to the start, so the reader can undo an over-click.
+        assert_eq!(
+            next_permission_level(AgentPermissionLevel::Full),
+            AgentPermissionLevel::ReadOnly
+        );
+    }
+
+    #[test]
+    fn only_full_access_is_flagged() {
+        // The dot is a warning, not decoration: full access lets a spawned agent
+        // reach the host without asking, and the other two do not.
+        let tokens = Tokens::light();
+        assert_eq!(
+            permission_color(AgentPermissionLevel::Full, tokens),
+            tokens.warning.hsla()
+        );
+        assert_eq!(
+            permission_color(AgentPermissionLevel::Controlled, tokens),
+            tokens.muted.hsla()
+        );
+        assert_eq!(
+            permission_color(AgentPermissionLevel::ReadOnly, tokens),
+            tokens.muted.hsla()
+        );
+    }
+
+    #[test]
+    fn every_permission_level_has_a_label_in_both_languages() {
+        // A missing key renders as "?", which would leave the row claiming the
+        // agent's reach is unknown.
+        for level in PERMISSION_LEVELS {
+            for language in [Language::English, Language::SimplifiedChinese] {
+                assert_ne!(
+                    translate(permission_key(level), language),
+                    "?",
+                    "{level:?} has no label in {language:?}"
+                );
+            }
+        }
+    }
+
+    // The popup is wide enough for an id, and bounded so a long model list
+    // scrolls rather than filling the window.
     const _: () = {
-        assert!(MODEL_MENU_WIDTH > MODEL_TRIGGER_WIDTH);
+        assert!(MODEL_MENU_WIDTH > 0.0);
         assert!(MODEL_MENU_MAX_HEIGHT > 0.0);
+        assert!(DOT_SIZE > 0.0);
     };
 }
