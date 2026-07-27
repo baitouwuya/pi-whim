@@ -35,6 +35,13 @@ use crate::{
 const MIN_ROWS: usize = 2;
 const MAX_ROWS: usize = 12;
 
+/// What the two keys do, for the footer beneath the field.
+///
+/// Lives here because it describes this input's behavior, but is rendered by the
+/// shell: the footer is one row shared with the runtime controls, and a row cannot
+/// be split across two entities.
+pub const SUBMIT_HINT: &str = "Enter to send · Shift+Enter for a newline";
+
 /// What the composer asks the shell to do.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ComposerEvent {
@@ -314,10 +321,9 @@ impl Render for Composer {
             .flex_col()
             .gap(px(6.0))
             .w_full()
-            .p(px(10.0))
-            .bg(tokens.panel.hsla())
-            .border_t_1()
-            .border_color(tokens.line.hsla())
+            // The panel surface and the rule above it belong to the shell's
+            // composer box, not here: the runtime controls share that surface, and
+            // two entities cannot each draw half of one panel.
             .when(!attachments.is_empty(), |this| {
                 this.child(div().flex().flex_wrap().gap(px(4.0)).children(
                     attachments.into_iter().map(|name| {
@@ -340,12 +346,6 @@ impl Render for Composer {
             // The action rides in the field's suffix slot, which the component
             // lays out inside the border and vertically centred.
             .child(Input::new(&self.input).prefix(attach).suffix(action))
-            .child(
-                div()
-                    .text_size(px(text::LABEL_SIZE))
-                    .text_color(tokens.muted.hsla())
-                    .child("Enter to send · Shift+Enter for a newline"),
-            )
     }
 }
 

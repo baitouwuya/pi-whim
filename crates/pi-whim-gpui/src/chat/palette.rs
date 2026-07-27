@@ -225,11 +225,10 @@ impl Render for Palette {
         }
         let selection = self.selection;
 
+        // Position is the shell's business, not this view's: it anchors the panel
+        // above the prompt. Positioning here against whatever box happened to be
+        // the containing block is what put the list on top of the field it filters.
         div()
-            .absolute()
-            // Anchored above the composer so the panel grows upward and never
-            // covers the text it is filtering on.
-            .bottom(px(8.0))
             .w(px(PALETTE_WIDTH))
             .max_w_full()
             .bg(tokens.panel.hsla())

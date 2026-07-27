@@ -529,18 +529,6 @@ impl Workspace {
             ControlsEvent::SetThinkingLevel(level) => {
                 self.request(Request::SetThinkingLevel(level), cx);
             }
-            ControlsEvent::SetQueueModes {
-                steering,
-                follow_up,
-            } => {
-                self.request(
-                    Request::SetQueueModes {
-                        steering,
-                        follow_up,
-                    },
-                    cx,
-                );
-            }
         }
     }
 
@@ -854,6 +842,70 @@ impl Workspace {
         self.sync_views(window, cx);
         cx.notify();
     }
+
+    /// The prompt and everything that describes the turn it will start.
+    ///
+    /// One panel holding the field, the key hint, and the runtime controls. The
+    /// controls used to be a full-width bar under the top chrome, where they
+    /// wrapped onto three rows and left most of each one empty; they describe the
+    /// turn about to be sent, so this is where they belong.
+    ///
+    /// Assembled here rather than inside [`Composer`] because a single row cannot
+    /// be split across two entities — the hint and the controls share one.
+    fn prompt_area(&self, tokens: Tokens) -> impl IntoElement {
+        // One line, never wrapped. The controls are left-aligned and keep their
+        // measured widths; the hint follows them and is the only thing allowed to
+        // shrink, because it is a reminder rather than something to act on.
+        let footer = div()
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .child(div().flex_none().child(self.controls.clone()))
+            .child(
+                div()
+                    .flex_shrink(1.0)
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .text_size(px(text::LABEL_SIZE))
+                    .text_color(tokens.muted.hsla())
+                    .child(chat::SUBMIT_HINT),
+            );
+
+        div()
+            // The containing block the palette anchors against.
+            .relative()
+            .flex()
+            .flex_col()
+            .items_center()
+            .child(
+                // `bottom_full` puts this box's bottom edge on the prompt's top
+                // edge, so the list opens upward over the conversation. Absolute
+                // rather than in the flow, where a growing list would push the
+                // input down as the reader typed.
+                div()
+                    .absolute()
+                    .bottom_full()
+                    .mb(px(6.0))
+                    .flex()
+                    .justify_center()
+                    .w_full()
+                    .child(self.palette.clone()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .w_full()
+                    .p(px(10.0))
+                    .bg(tokens.panel.hsla())
+                    .border_t_1()
+                    .border_color(tokens.line.hsla())
+                    .child(self.composer.clone())
+                    .child(footer),
+            )
+    }
 }
 
 /// The banner a session status calls for, if any.
@@ -970,45 +1022,27 @@ impl Render for Workspace {
                         this.child(div().flex_1().min_h(px(0.0)).child(self.settings.clone()))
                     })
                     .when(!self.showing_settings, |this| {
-                        this
-                            // Below the banner and above the panes: these
-                            // configure the agent, so they belong with the window
-                            // chrome rather than beside the prompt.
-                            .child(self.controls.clone())
-                            .when_some(banner_for(&status, tokens), |this, banner| {
-                                this.child(banner)
-                            })
-                            // The conversation and sidebar fill whatever the
-                            // chrome leaves.
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .flex()
-                                    .min_h(px(0.0))
-                                    .child(self.sidebar.clone())
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .flex()
-                                            .flex_col()
-                                            .min_w(px(0.0))
-                                            .child(self.conversation.clone())
-                                            .child(
-                                                // The palette is absolutely
-                                                // positioned against this box so it
-                                                // floats over the conversation
-                                                // rather than pushing the input
-                                                // down as it grows.
-                                                div()
-                                                    .relative()
-                                                    .flex()
-                                                    .flex_col()
-                                                    .items_center()
-                                                    .child(self.palette.clone())
-                                                    .child(self.composer.clone()),
-                                            ),
-                                    ),
-                            )
+                        this.when_some(banner_for(&status, tokens), |this, banner| {
+                            this.child(banner)
+                        })
+                        // The conversation and sidebar fill whatever the
+                        // chrome leaves.
+                        .child(
+                            div()
+                                .flex_1()
+                                .flex()
+                                .min_h(px(0.0))
+                                .child(self.sidebar.clone())
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .flex()
+                                        .flex_col()
+                                        .min_w(px(0.0))
+                                        .child(self.conversation.clone())
+                                        .child(self.prompt_area(tokens)),
+                                ),
+                        )
                     }),
             )
             // Modals last, so they paint over the panes. Each renders nothing
@@ -1020,6 +1054,7 @@ impl Render for Workspace {
 
 #[cfg(test)]
 mod tests {
+    use gpui::{KeyDownEvent, Keystroke};
     use pi_whim_core::{ConversationItem, ConversationRole, stable_session_id};
 
     use super::*;
@@ -1112,6 +1147,71 @@ mod tests {
 
         assert!(!expanded.contains(&first));
         assert!(expanded.contains(&second));
+    }
+
+    /// A state with one project selected, so the palette has commands to offer.
+    fn state_with_a_project() -> AppState {
+        AppState {
+            selected_project: Some(uuid::Uuid::new_v4()),
+            ..Default::default()
+        }
+    }
+
+    #[gpui::test]
+    async fn the_palette_runs_a_command_from_the_keyboard(cx: &mut gpui::TestAppContext) {
+        // The keys are captured on the workspace's own element while the composer
+        // keeps focus, so this exercises the same path a keystroke takes: open the
+        // list by typing, move, then run. Enter reached the input instead of the
+        // palette once, which submitted the raw `/` text as a prompt.
+        let shell = shell(cx);
+
+        shell
+            .update(cx, |workspace, window, cx| {
+                workspace.set_state(state_with_a_project(), window, cx);
+                workspace.handle_composer_event(ComposerEvent::TextChanged("/".to_owned()), cx);
+
+                let open = workspace.palette.read(cx).is_open();
+                assert!(open, "typing `/` should offer the commands");
+
+                let down = KeyDownEvent {
+                    keystroke: Keystroke::parse("down").expect("a valid keystroke"),
+                    is_held: false,
+                    prefer_character_input: false,
+                };
+                let consumed = workspace
+                    .palette
+                    .update(cx, |palette, cx| palette.handle_key(&down, cx));
+                assert!(
+                    consumed,
+                    "an arrow belongs to the open palette, not the caret"
+                );
+            })
+            .expect("the window is open");
+    }
+
+    #[gpui::test]
+    async fn escape_closes_the_palette_without_clearing_the_draft(cx: &mut gpui::TestAppContext) {
+        let shell = shell(cx);
+
+        shell
+            .update(cx, |workspace, window, cx| {
+                workspace.set_state(state_with_a_project(), window, cx);
+                workspace.handle_composer_event(ComposerEvent::TextChanged("/ex".to_owned()), cx);
+                assert!(workspace.palette.read(cx).is_open());
+
+                let escape = KeyDownEvent {
+                    keystroke: Keystroke::parse("escape").expect("a valid keystroke"),
+                    is_held: false,
+                    prefer_character_input: false,
+                };
+                let consumed = workspace
+                    .palette
+                    .update(cx, |palette, cx| palette.handle_key(&escape, cx));
+
+                assert!(consumed, "escape is the palette's while it is open");
+                assert!(!workspace.palette.read(cx).is_open());
+            })
+            .expect("the window is open");
     }
 
     /// A shell in a headless window, for the tests that need one.

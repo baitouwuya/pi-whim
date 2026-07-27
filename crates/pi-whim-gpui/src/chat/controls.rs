@@ -1,6 +1,11 @@
 //! The runtime controls: which model answers, how hard it thinks, how queued
 //! prompts are released.
 //!
+//! These render into the composer's footer rather than as a bar under the top
+//! chrome. They belong next to the prompt because they describe the turn about to
+//! be sent, and as a full-width row they wrapped onto three lines while leaving
+//! most of each one empty.
+//!
 //! All four are `Select`s over `gpui-component`'s searchable list. The egui build
 //! hand-rolled the model picker out of a `ComboBox` wrapping a `TextEdit` and a
 //! `ScrollArea`, re-grouping every model by provider on each frame it was open;
@@ -22,7 +27,7 @@ use gpui_component::{
     Sizable,
     select::{SearchableVec, Select, SelectEvent, SelectGroup, SelectItem, SelectState},
 };
-use pi_whim_core::{AppState, ModelOption, QueueMode, SessionStatus, ThinkingLevel};
+use pi_whim_core::{AppState, ModelOption, SessionStatus, ThinkingLevel};
 use pi_whim_theme::{Tokens, text};
 
 use crate::theme::IntoHsla;
@@ -42,10 +47,6 @@ pub enum ControlsEvent {
     /// compacts the history first.
     SetModel(ModelOption),
     SetThinkingLevel(ThinkingLevel),
-    SetQueueModes {
-        steering: QueueMode,
-        follow_up: QueueMode,
-    },
 }
 
 /// One model in the picker.
@@ -147,14 +148,6 @@ impl<T: Clone + PartialEq + 'static> SelectItem for Choice<T> {
     }
 }
 
-/// How a queue mode reads to someone who has not read Pi's protocol.
-fn queue_mode_label(mode: QueueMode) -> &'static str {
-    match mode {
-        QueueMode::All => "all at once",
-        QueueMode::OneAtATime => "one at a time",
-    }
-}
-
 /// Group the available models by provider, in a stable order.
 ///
 /// Providers sort by name and models keep the order the agent reported them in,
@@ -196,8 +189,6 @@ fn models_unavailable_note(status: &SessionStatus) -> String {
 pub struct Controls {
     model: Entity<SelectState<SearchableVec<SelectGroup<ModelItem>>>>,
     thinking: Entity<SelectState<Vec<Choice<ThinkingLevel>>>>,
-    steering: Entity<SelectState<Vec<Choice<QueueMode>>>>,
-    follow_up: Entity<SelectState<Vec<Choice<QueueMode>>>>,
     /// Whether a project is selected. With none, there is no agent to configure.
     visible: bool,
     /// Kept so the picker can explain an empty model list.
@@ -233,33 +224,9 @@ impl Controls {
         })
         .detach();
 
-        let steering = cx.new(|cx| SelectState::new(queue_choices(), None, window, cx));
-        cx.subscribe_in(&steering, window, |controls, _, event, _, cx| {
-            if let SelectEvent::Confirm(Some(mode)) = event {
-                cx.emit(ControlsEvent::SetQueueModes {
-                    steering: *mode,
-                    follow_up: controls.follow_up_mode(cx),
-                });
-            }
-        })
-        .detach();
-
-        let follow_up = cx.new(|cx| SelectState::new(queue_choices(), None, window, cx));
-        cx.subscribe_in(&follow_up, window, |controls, _, event, _, cx| {
-            if let SelectEvent::Confirm(Some(mode)) = event {
-                cx.emit(ControlsEvent::SetQueueModes {
-                    steering: controls.steering_mode(cx),
-                    follow_up: *mode,
-                });
-            }
-        })
-        .detach();
-
         Self {
             model,
             thinking,
-            steering,
-            follow_up,
             visible: false,
             status: SessionStatus::default(),
             models: Vec::new(),
@@ -304,15 +271,6 @@ impl Controls {
             picker.set_selected_value(&level, window, cx);
         });
 
-        let steering = state.steering_mode;
-        self.steering.update(cx, |picker, cx| {
-            picker.set_selected_value(&steering, window, cx);
-        });
-        let follow_up = state.follow_up_mode;
-        self.follow_up.update(cx, |picker, cx| {
-            picker.set_selected_value(&follow_up, window, cx);
-        });
-
         cx.notify();
     }
 
@@ -332,33 +290,6 @@ impl Controls {
             .find(|model| model.provider == key.0 && model.id == key.1)
             .cloned()
     }
-
-    fn steering_mode(&self, cx: &App) -> QueueMode {
-        self.steering
-            .read(cx)
-            .selected_value()
-            .copied()
-            .unwrap_or_default()
-    }
-
-    fn follow_up_mode(&self, cx: &App) -> QueueMode {
-        self.follow_up
-            .read(cx)
-            .selected_value()
-            .copied()
-            .unwrap_or_default()
-    }
-}
-
-/// The two queue modes, as picker rows.
-fn queue_choices() -> Vec<Choice<QueueMode>> {
-    [QueueMode::All, QueueMode::OneAtATime]
-        .into_iter()
-        .map(|mode| Choice {
-            label: queue_mode_label(mode).into(),
-            value: mode,
-        })
-        .collect()
 }
 
 impl Render for Controls {
@@ -370,17 +301,16 @@ impl Render for Controls {
             return div();
         }
 
+        // No background, border, or width of its own: this sits in the composer's
+        // footer now, so the panel and the border around it are already the
+        // composer's. Giving it a second surface drew a bar inside a bar.
+        // One line, never wrapped: these sit in the composer's footer beside the
+        // key hint, and the hint is what gives up space when the window narrows.
         div()
             .flex()
+            .flex_none()
             .items_center()
-            .flex_wrap()
             .gap(px(6.0))
-            .w_full()
-            .px(px(10.0))
-            .py(px(6.0))
-            .bg(tokens.panel_soft.hsla())
-            .border_b_1()
-            .border_color(tokens.line.hsla())
             .child(
                 div()
                     .when(!self.models.is_empty(), |this| {
@@ -414,16 +344,6 @@ impl Render for Controls {
                     .small()
                     .title_prefix("Thinking: ")
                     .placeholder("off"),
-            )
-            .child(
-                Select::new(&self.steering)
-                    .small()
-                    .title_prefix("Steering: "),
-            )
-            .child(
-                Select::new(&self.follow_up)
-                    .small()
-                    .title_prefix("Follow-up: "),
             )
     }
 }
@@ -522,20 +442,6 @@ mod tests {
             models_unavailable_note(&SessionStatus::Ready),
             "No models available"
         );
-    }
-
-    #[test]
-    fn queue_modes_read_as_english_rather_than_protocol() {
-        assert_eq!(queue_mode_label(QueueMode::All), "all at once");
-        assert_eq!(queue_mode_label(QueueMode::OneAtATime), "one at a time");
-    }
-
-    #[test]
-    fn both_queue_modes_are_offered() {
-        let choices = queue_choices();
-        assert_eq!(choices.len(), 2);
-        assert_eq!(choices[0].value, QueueMode::All);
-        assert_eq!(choices[1].value, QueueMode::OneAtATime);
     }
 
     #[test]
