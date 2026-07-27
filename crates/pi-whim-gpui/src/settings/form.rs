@@ -19,7 +19,12 @@ use crate::theme::IntoHsla;
 pub const CONTENT_WIDTH: f32 = 640.0;
 /// Width of the label column, so controls line up down the page.
 pub const LABEL_WIDTH: f32 = 220.0;
-/// Width of a control, matching the label column's alignment.
+/// Width of the control column.
+///
+/// [`row`] applies this to every control slot, so a page of mixed controls — text
+/// fields, segmented pickers, a checkbox — shares one right edge. Call sites used
+/// to set it individually, and the ones that forgot stretched to fill the row
+/// instead, which is what made the page look ragged.
 pub const CONTROL_WIDTH: f32 = 320.0;
 /// Height of a single-line control.
 pub const CONTROL_HEIGHT: f32 = 34.0;
@@ -105,7 +110,9 @@ pub fn row(
                 )
                 .when_some_help(help, tokens),
         )
-        .child(div().flex_1().child(control))
+        // Fixed rather than `flex_1`: the column is what the rows align on, and a
+        // slot that grows to fill the row gives every control a different width.
+        .child(div().w(px(CONTROL_WIDTH)).flex_none().child(control))
         .into_any_element()
 }
 

@@ -13,8 +13,7 @@ use pi_whim_core::{AppState, BashPolicy, Language, QueueMode, strings::tr};
 use pi_whim_theme::Tokens;
 
 use crate::settings::{
-    Emit, SettingsEvent,
-    form::{self, CONTROL_WIDTH},
+    Emit, SettingsEvent, form,
     segmented::{Segment, segmented},
 };
 
@@ -49,9 +48,7 @@ pub fn render(state: &AppState, fields: &Fields, tokens: Tokens, emit: Emit) -> 
             tr(state, "blocked-patterns"),
             Some(tr(state, "blocked-patterns-help")),
             tokens,
-            div()
-                .w(px(CONTROL_WIDTH))
-                .child(Input::new(&fields.blocked_patterns)),
+            Input::new(&fields.blocked_patterns),
         ))
         .child(form::section_header(
             tr(state, "agent-team"),

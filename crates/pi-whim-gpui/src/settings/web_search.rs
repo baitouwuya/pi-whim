@@ -20,10 +20,7 @@ use pi_whim_engine::settings::SearchEngineDraft;
 use pi_whim_theme::{Tokens, font, text};
 
 use crate::{
-    settings::{
-        Emit, SettingsEvent,
-        form::{self, CONTROL_WIDTH},
-    },
+    settings::{Emit, SettingsEvent, form},
     theme::IntoHsla,
 };
 
@@ -59,15 +56,13 @@ pub fn render(
             tr(state, "provider-name"),
             None,
             tokens,
-            div().w(px(CONTROL_WIDTH)).child(Input::new(&fields.name)),
+            Input::new(&fields.name),
         ))
         .child(form::row(
             tr(state, "base-url"),
             Some(tr(state, "searxng-url-help")),
             tokens,
-            div()
-                .w(px(CONTROL_WIDTH))
-                .child(Input::new(&fields.base_url)),
+            Input::new(&fields.base_url),
         ))
         .child(enabled_row(state, draft, tokens, emit.clone()))
         .child(save_row(state, draft, tokens, emit))

@@ -82,12 +82,9 @@ pub fn render(
         .into_any_element()
 }
 
-/// A full-width text field.
+/// A text field filling the control column.
 fn field(state: &Entity<InputState>) -> AnyElement {
-    div()
-        .w(px(CONTROL_WIDTH))
-        .child(Input::new(state))
-        .into_any_element()
+    Input::new(state).into_any_element()
 }
 
 /// The stored providers, plus a way to start a new one.
