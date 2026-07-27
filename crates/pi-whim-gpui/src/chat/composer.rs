@@ -32,7 +32,11 @@ use crate::{
 };
 
 /// Rows the input grows through before it starts scrolling.
-const MIN_ROWS: usize = 2;
+///
+/// Starts at one. A floor of two reserved a second line that nothing was on, which
+/// read as a blank strip hanging under the caret now that the field has no border
+/// of its own to explain it. It still grows as the reader types.
+const MIN_ROWS: usize = 1;
 const MAX_ROWS: usize = 12;
 
 /// What the two keys do, for a tooltip on the send button.

@@ -34,6 +34,14 @@ use crate::{
     theme::IntoHsla,
 };
 
+/// Space around the prompt box.
+///
+/// `GAP` is the larger of the two: the distance from the last message to the top
+/// of the prompt has to read as a separation between two regions, while the margin
+/// to the window's edges only has to stop the border touching them.
+const PROMPT_GAP: f32 = 16.0;
+const PROMPT_MARGIN: f32 = 10.0;
+
 /// Something the shell cannot do itself, queued for whoever owns the backend.
 ///
 /// Adding a project opens a folder picker and writes to the store; starting a
@@ -876,17 +884,19 @@ impl Workspace {
             (composer.attach_button(cx), composer.send_button(cx))
         });
 
-        // One line, never wrapped. Attach and the controls sit left; send is pushed
-        // to the far edge, where the eye ends up after reading what it will send.
+        // One line, never wrapped. Attach sits alone on the left; everything that
+        // describes the turn — permission, model, thinking — gathers at the right
+        // beside send, so the settings read as one group next to the action they
+        // apply to rather than trailing off from the attach button.
         let footer = div()
             .flex()
             .items_center()
             .gap(px(8.0))
             .child(attach)
-            .child(div().flex_none().child(self.controls.clone()))
-            // Takes the slack, so send stays at the right edge however narrow the
-            // window gets.
+            // Takes the slack, so the group stays at the right edge however wide
+            // the window gets.
             .child(div().flex_1().min_w(px(0.0)))
+            .child(div().flex_none().child(self.controls.clone()))
             .child(send);
 
         div()
@@ -895,6 +905,12 @@ impl Workspace {
             .flex()
             .flex_col()
             .items_center()
+            // Clear of the transcript, and of the window's edges. The prompt used
+            // to sit flush against the last message and the bottom of the window,
+            // which left the newest reply looking like part of the input.
+            .px(px(PROMPT_MARGIN))
+            .pb(px(PROMPT_MARGIN))
+            .pt(px(PROMPT_GAP))
             .child(
                 // `bottom_full` puts this box's bottom edge on the prompt's top
                 // edge, so the list opens upward over the conversation. Absolute

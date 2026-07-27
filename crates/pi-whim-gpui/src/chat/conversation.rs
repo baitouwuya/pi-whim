@@ -1,9 +1,13 @@
 //! The conversation itself.
 //!
 //! Entries vary in height — a one-line prompt, a long markdown reply, a tool card
-//! — so this uses `list` rather than `uniform_list`, with `ListAlignment::Bottom`
-//! because a chat log grows downward and the newest entry is the one you want in
-//! view.
+//! — so this uses `list` rather than `uniform_list`.
+//!
+//! Aligned to the top, not the bottom. `ListAlignment::Bottom` pins the content to
+//! the foot of the viewport, so a two-message conversation sat down by the prompt
+//! with the empty space above it, and a reply appeared to grow upward out of the
+//! input. Reading starts at the top. Following a stream is [`Conversation::
+//! scroll_to_latest`]'s job instead, which is explicit about when the view moves.
 //!
 //! `overdraw` is what the egui build maintained by hand: it rendered a viewport's
 //! worth above and below the visible span so scrolling did not reveal blank space.
@@ -51,7 +55,7 @@ impl Conversation {
             expanded: HashSet::new(),
             typewriter: Typewriter::new(),
             tokens,
-            list: ListState::new(0, ListAlignment::Bottom, px(OVERDRAW)),
+            list: ListState::new(0, ListAlignment::Top, px(OVERDRAW)),
         }
     }
 

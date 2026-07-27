@@ -22,9 +22,8 @@
 //!   title, and a reader hunting `sonnet-4-5` is typing the id, not the name.
 
 use gpui::{
-    App, AppContext, Context, Entity, EventEmitter, InteractiveElement, IntoElement, ParentElement,
-    Render, SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder,
-    px,
+    App, AppContext, Context, Entity, EventEmitter, IntoElement, ParentElement, Render,
+    SharedString, Styled, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::{
     Sizable,
@@ -187,23 +186,15 @@ const DOT_SIZE: f32 = 7.0;
 
 /// The three permission levels, in the order they escalate.
 ///
-/// Cycled rather than picked from a menu: there are only three, and the label
-/// beside the dot already says which one is current, so a click that advances is
-/// less chrome than a popup listing what is already visible.
+/// Offered as a list, like the other two controls on this row. Click-to-advance
+/// fit in less space, but raising what an agent may reach is not something to do
+/// by accident, and it is the one control here where landing on the wrong value
+/// costs more than a second click.
 const PERMISSION_LEVELS: [AgentPermissionLevel; 3] = [
     AgentPermissionLevel::ReadOnly,
     AgentPermissionLevel::Controlled,
     AgentPermissionLevel::Full,
 ];
-
-/// The level after `level`, wrapping.
-fn next_permission_level(level: AgentPermissionLevel) -> AgentPermissionLevel {
-    let index = PERMISSION_LEVELS
-        .iter()
-        .position(|candidate| *candidate == level)
-        .unwrap_or(0);
-    PERMISSION_LEVELS[(index + 1) % PERMISSION_LEVELS.len()]
-}
 
 /// The string key naming `level`.
 fn permission_key(level: AgentPermissionLevel) -> &'static str {
@@ -241,6 +232,7 @@ fn models_unavailable_note(status: &SessionStatus) -> String {
 pub struct Controls {
     model: Entity<SelectState<SearchableVec<SelectGroup<ModelItem>>>>,
     thinking: Entity<SelectState<Vec<Choice<ThinkingLevel>>>>,
+    permission_picker: Entity<SelectState<Vec<Choice<AgentPermissionLevel>>>>,
     /// Whether a project is selected. With none, there is no agent to configure.
     visible: bool,
     /// Kept so the picker can explain an empty model list.
@@ -283,9 +275,18 @@ impl Controls {
         })
         .detach();
 
+        let permission_picker = cx.new(|cx| SelectState::new(Vec::new(), None, window, cx));
+        cx.subscribe_in(&permission_picker, window, |_, _, event, _, cx| {
+            if let SelectEvent::Confirm(Some(level)) = event {
+                cx.emit(ControlsEvent::SetPermissionLevel(*level));
+            }
+        })
+        .detach();
+
         Self {
             model,
             thinking,
+            permission_picker,
             visible: false,
             status: SessionStatus::default(),
             models: Vec::new(),
@@ -334,6 +335,20 @@ impl Controls {
             picker.set_selected_value(&level, window, cx);
         });
 
+        let language = self.language;
+        let permissions: Vec<Choice<AgentPermissionLevel>> = PERMISSION_LEVELS
+            .iter()
+            .map(|level| Choice {
+                label: translate(permission_key(*level), language).into(),
+                value: *level,
+            })
+            .collect();
+        let permission = self.permission;
+        self.permission_picker.update(cx, |picker, cx| {
+            picker.set_items(permissions, window, cx);
+            picker.set_selected_value(&permission, window, cx);
+        });
+
         cx.notify();
     }
 
@@ -342,43 +357,32 @@ impl Controls {
         cx.notify();
     }
 
-    /// The permission level, as a dot and a word.
+    /// The permission level: a dot, then a picker over the three levels.
     ///
-    /// Clicking advances to the next level rather than opening a menu: there are
-    /// three, and the word beside the dot already names the current one, so a popup
-    /// would list what is on screen. The dot is what carries the warning — full
-    /// access lets a spawned agent reach the host without asking.
-    fn permission_indicator(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The dot is separate from the picker rather than inside it, because a
+    /// `Select` renders its own row and a coloured marker in the trigger would not
+    /// survive the selection. What it carries is the warning — full access lets a
+    /// spawned agent reach the host without asking, and that should be visible
+    /// without reading the word next to it.
+    fn permission_indicator(&self) -> impl IntoElement {
         let tokens = self.tokens;
-        let level = self.permission;
-        let color = permission_color(level, tokens);
         div()
-            .id("permission-level")
             .flex()
             .flex_none()
             .items_center()
             .gap(px(5.0))
-            .px(px(4.0))
-            .cursor_pointer()
-            .hover(|this| this.bg(tokens.control_background_hover().hsla()))
-            .on_click(cx.listener(move |_, _, _, cx| {
-                cx.emit(ControlsEvent::SetPermissionLevel(next_permission_level(
-                    level,
-                )));
-            }))
             .child(
                 div()
                     .w(px(DOT_SIZE))
                     .h(px(DOT_SIZE))
+                    .flex_none()
                     .rounded(px(radius::DOT))
-                    .bg(color),
+                    .bg(permission_color(self.permission, tokens)),
             )
             .child(
-                div()
-                    .font_family(pi_whim_theme::font::MONO)
-                    .text_size(px(text::LABEL_SIZE))
-                    .text_color(color)
-                    .child(translate(permission_key(level), self.language)),
+                Select::new(&self.permission_picker)
+                    .xsmall()
+                    .appearance(false),
             )
     }
 
@@ -396,7 +400,7 @@ impl Controls {
 }
 
 impl Render for Controls {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = self.tokens;
         if !self.visible {
             // No project means no agent to configure, and an empty bar would
@@ -417,7 +421,7 @@ impl Render for Controls {
             .flex_none()
             .items_center()
             .gap(px(10.0))
-            .child(self.permission_indicator(cx))
+            .child(self.permission_indicator())
             .child(
                 div()
                     .when(!self.models.is_empty(), |this| {
@@ -573,22 +577,17 @@ mod tests {
     }
 
     #[test]
-    fn the_permission_level_cycles_through_all_three() {
-        // Clicking advances rather than opening a menu, so every level has to be
-        // reachable by clicking — a cycle that skipped one would strand it.
-        let mut level = AgentPermissionLevel::ReadOnly;
-        let mut seen = vec![level];
-        for _ in 0..PERMISSION_LEVELS.len() - 1 {
-            level = next_permission_level(level);
-            seen.push(level);
-        }
+    fn the_permission_levels_are_offered_in_escalating_order() {
+        // The picker lists them in this order, so a reader scanning down the popup
+        // reads increasing reach rather than an arbitrary sequence.
+        let ranks: Vec<u8> = PERMISSION_LEVELS.iter().map(|level| level.rank()).collect();
+        let mut sorted = ranks.clone();
+        sorted.sort_unstable();
 
-        assert_eq!(seen, PERMISSION_LEVELS.to_vec());
-        // And back to the start, so the reader can undo an over-click.
-        assert_eq!(
-            next_permission_level(AgentPermissionLevel::Full),
-            AgentPermissionLevel::ReadOnly
-        );
+        assert_eq!(ranks, sorted);
+        // And all three are offered: a level missing from the list is one the
+        // reader could never get back to after leaving it.
+        assert_eq!(ranks.len(), 3);
     }
 
     #[test]
