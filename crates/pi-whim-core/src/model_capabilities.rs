@@ -97,16 +97,6 @@ pub enum ModelCapabilitySource {
     Unverified,
 }
 
-impl ModelCapabilitySource {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::OnlineCatalog => "models.dev",
-            Self::BundledCatalog => "Pi catalog",
-            Self::Unverified => "Unverified",
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelCapability {
     pub name: String,
