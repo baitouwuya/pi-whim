@@ -12,10 +12,10 @@ use std::{
 };
 
 use pi_whim_core::{
-    Action, AppState, Attachment, ConversationItem, ConversationRole, ModelOption, Project,
-    ProjectId, ProviderId, ProviderProfile, ProviderProtocol, QueueMode, SearchEngineProfile,
-    SessionStatus, SessionSummary, SubmitMode, ThinkingLevel, normalize_provider_display_name,
-    provider_name_key, stable_session_id, strings,
+    Action, AppState, Attachment, ConversationItem, ConversationRole, Language, ModelOption,
+    Project, ProjectId, ProviderId, ProviderProfile, ProviderProtocol, QueueMode,
+    SearchEngineProfile, SessionMetrics, SessionStatus, SessionSummary, SubmitMode, ThinkingLevel,
+    normalize_provider_display_name, provider_name_key, stable_session_id, strings,
 };
 use pi_whim_persistence::{
     AppPreferences, AttachmentStore, MacosKeychainStore, PreferencesRepository, ProjectRepository,
@@ -432,25 +432,14 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             }
             SlashCommand::ShowSessionInfo => {
                 let metrics = self.state().session_metrics.clone().unwrap_or_default();
-                self.push_command_output(format!(
-                    "Session info\n\nMessages: {} ({} user, {} assistant)\nTool calls: {}\nTokens: {}\nCost: ${:.4}",
-                    metrics.total_messages,
-                    metrics.user_messages,
-                    metrics.assistant_messages,
-                    metrics.tool_calls,
-                    metrics.total_tokens,
-                    metrics.cost_microusd as f64 / 1_000_000.0
-                ));
+                self.push_command_output(session_info(&metrics, self.state().language));
             }
             SlashCommand::ShowHotkeys => {
-                self.push_command_output(
-                    "Keyboard shortcuts\n\nEnter: send\nShift+Enter: new line\n/: quick actions\nUp/Down: select action\nTab or Enter: confirm action\nEsc: close action menu or reveal streamed text".into(),
-                );
+                self.push_command_output(hotkeys(self.state().language));
             }
             SlashCommand::ShowChangelog => {
-                self.push_command_output(
-                    "Pi changelog: https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/CHANGELOG.md".into(),
-                );
+                let heading = self.say("changelog");
+                self.push_command_output(format!("{heading}: {CHANGELOG_URL}"));
             }
             // These only prefill the composer, which the palette does without
             // asking anyone, so they never travel as a request.
@@ -1852,6 +1841,54 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     }
 }
 
+/// Where Pi's own changelog lives.
+const CHANGELOG_URL: &str =
+    "https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/CHANGELOG.md";
+
+/// The body `/info` answers with.
+///
+/// Assembled from labels rather than one stored sentence per language: the
+/// figures are the content, and a stored sentence with six holes in it drifts out
+/// of step with them.
+fn session_info(metrics: &SessionMetrics, language: Language) -> String {
+    let say = |key| strings::text(key, language);
+    format!(
+        "{}\n\n{}: {} ({} {}, {} {})\n{}: {}\n{}: {}\n{}: ${:.4}",
+        say("session-info"),
+        say("info-messages"),
+        metrics.total_messages,
+        metrics.user_messages,
+        say("info-user"),
+        metrics.assistant_messages,
+        say("info-assistant"),
+        say("info-tool-calls"),
+        metrics.tool_calls,
+        say("info-tokens"),
+        metrics.total_tokens,
+        say("info-cost"),
+        metrics.cost_microusd as f64 / 1_000_000.0
+    )
+}
+
+/// The body `/hotkeys` answers with.
+///
+/// The keystrokes are literals in both languages — they are what is printed on
+/// the keyboard — so only what each one does is translated.
+fn hotkeys(language: Language) -> String {
+    let say = |key| strings::text(key, language);
+    let lines = [
+        ("Enter", say("hint-send")),
+        ("Shift+Enter", say("hint-newline")),
+        ("/", say("hint-slash")),
+        ("Up/Down", say("hint-arrows")),
+        ("Tab / Enter", say("hint-confirm")),
+        ("Esc", say("hint-escape")),
+    ]
+    .map(|(key, description)| format!("{key}: {description}"))
+    .join("\n");
+    format!("{}\n\n{lines}", say("hotkeys"))
+}
+
 /// Pi accepts an environment reference here, keeping API keys out of models.json.
 fn applescript_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
@@ -1865,6 +1902,47 @@ mod tests {
     use pi_whim_runtime::FakeRuntime;
     use serde_json::json;
     use tempfile::TempDir;
+
+    #[test]
+    fn the_session_info_body_translates_its_labels_and_keeps_its_figures() {
+        let metrics = SessionMetrics {
+            total_messages: 12,
+            user_messages: 5,
+            assistant_messages: 7,
+            tool_calls: 3,
+            total_tokens: 4096,
+            cost_microusd: 12_345,
+        };
+
+        let english = session_info(&metrics, Language::English);
+        assert!(english.starts_with("Session info"));
+        assert!(english.contains("Messages: 12 (5 user, 7 assistant)"));
+        assert!(english.contains("Cost: $0.0123"));
+
+        // Same figures, different words: the numbers are the content and must
+        // not depend on which language assembled the sentence.
+        let chinese = session_info(&metrics, Language::SimplifiedChinese);
+        assert!(chinese.starts_with("会话信息"));
+        assert!(chinese.contains("12 (5"));
+        assert!(chinese.contains("$0.0123"));
+        assert!(!chinese.contains('?'));
+    }
+
+    #[test]
+    fn the_hotkey_body_keeps_the_keystrokes_and_translates_the_rest() {
+        // The keystrokes are printed on the keyboard, so they read the same in
+        // both languages; only what each one does changes.
+        for language in [Language::English, Language::SimplifiedChinese] {
+            let body = hotkeys(language);
+            for key in ["Enter", "Shift+Enter", "Up/Down", "Tab / Enter", "Esc"] {
+                assert!(body.contains(key), "{key} missing in {language:?}");
+            }
+            assert!(!body.contains('?'), "a key is missing in {language:?}");
+        }
+
+        assert!(hotkeys(Language::English).contains("Enter: send"));
+        assert!(hotkeys(Language::SimplifiedChinese).contains("Enter: 发送"));
+    }
 
     fn test_application(
         directory: &TempDir,

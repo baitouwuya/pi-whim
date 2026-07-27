@@ -334,6 +334,31 @@ const STRINGS: &[(&str, &str, &str)] = &[
         "Use arrows to select; Enter or Tab to confirm.",
         "上下方向键选择，Enter 或 Tab 确认。",
     ),
+    // The three slash commands that answer in the conversation itself. Their
+    // bodies are assembled from these lines rather than stored whole, so a figure
+    // moving does not orphan the translation of the sentence around it.
+    ("session-info", "Session info", "会话信息"),
+    ("info-messages", "Messages", "消息数"),
+    ("info-user", "user", "用户"),
+    ("info-assistant", "assistant", "助手"),
+    ("info-tool-calls", "Tool calls", "工具调用"),
+    ("info-tokens", "Tokens", "Token 数"),
+    ("info-cost", "Cost", "费用"),
+    ("hotkeys", "Keyboard shortcuts", "键盘快捷键"),
+    // Descriptions only, because the hotkey list prints the keystroke itself;
+    // `hint-enter` and `hint-shift-enter` name the key as well, since the send
+    // button's tooltip has nothing else to say it.
+    ("hint-send", "send", "发送"),
+    ("hint-newline", "new line", "换行"),
+    ("hint-slash", "quick actions", "快捷操作"),
+    ("hint-arrows", "select action", "选择操作"),
+    ("hint-confirm", "confirm action", "确认操作"),
+    (
+        "hint-escape",
+        "close action menu or reveal streamed text",
+        "关闭操作菜单，或立即显示完整回复",
+    ),
+    ("changelog", "Pi changelog", "Pi 更新日志"),
     // These two are proper nouns of the UI in both languages.
     ("steer-mode", "Steer", "Steer"),
     ("follow-up-mode", "Follow-up", "Follow-up"),
