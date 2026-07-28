@@ -703,7 +703,8 @@ fn agent_team_tool_summary(name: &str, text: &str) -> Option<String> {
     }
 }
 
-fn compact_tool_text(text: &str) -> String {
+/// Collapse arbitrary tool text into one bounded line for a card header.
+pub fn compact_tool_text(text: &str) -> String {
     const MAX_SUMMARY_CHARS: usize = 84;
     let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.chars().count() <= MAX_SUMMARY_CHARS {

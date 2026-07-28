@@ -220,6 +220,7 @@ pub fn translate(event: &Value, context: Context<'_>, turn: &mut Turn) -> Outcom
             outcome.act(Action::UpsertConversation(compaction_card(
                 item_id,
                 "Compacting…".to_owned(),
+                None,
                 false,
             )));
             outcome.act(Action::SetSessionStatus(SessionStatus::Compacting));
@@ -251,7 +252,10 @@ pub fn translate(event: &Value, context: Context<'_>, turn: &mut Turn) -> Outcom
                         None => (compaction_summary(event.get("result")), false),
                     };
                     outcome.act(Action::UpsertConversation(compaction_card(
-                        item_id, text, is_error,
+                        item_id,
+                        text,
+                        event.get("result"),
+                        is_error,
                     )));
                 }
             }
@@ -266,9 +270,25 @@ pub fn translate(event: &Value, context: Context<'_>, turn: &mut Turn) -> Outcom
         Some("entry_appended") => {
             if context.is_active
                 && let Some(entry) = event.get("entry")
-                && let Some(action) = session_entry_action(entry)
             {
-                outcome.act(action);
+                // Compaction starts before Pi has assigned its transcript id.
+                // Once the durable entry arrives, move the temporary card onto
+                // that id so the end event updates one card rather than adding
+                // a live-only duplicate beside the replayable one.
+                if entry.get("type").and_then(Value::as_str) == Some("compaction")
+                    && let Some(persisted_id) = entry.get("id").and_then(Value::as_str)
+                    && let Some(temporary_id) =
+                        turn.compaction_item_id.replace(persisted_id.to_owned())
+                    && temporary_id != persisted_id
+                {
+                    outcome.act(Action::RekeyConversation {
+                        from: temporary_id,
+                        to: persisted_id.to_owned(),
+                    });
+                }
+                if let Some(action) = session_entry_action(entry) {
+                    outcome.act(action);
+                }
             }
         }
 
@@ -332,6 +352,20 @@ pub fn tool_event_action(event: &Value, conversation: &[ConversationItem]) -> Ac
 /// wholesale, so the two paths cannot drift. Roles the workbench does not
 /// render return `None`.
 pub fn session_entry_action(entry: &Value) -> Option<Action> {
+    if entry.get("type").and_then(Value::as_str) == Some("compaction") {
+        let id = entry
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("compaction")
+            .to_owned();
+        return Some(Action::UpsertConversation(compaction_card(
+            id,
+            compaction_summary(Some(entry)),
+            Some(entry),
+            false,
+        )));
+    }
+
     let message = entry.get("message")?;
     let role = match message.get("role").and_then(Value::as_str) {
         Some("user") => ConversationRole::User,
@@ -386,20 +420,53 @@ pub fn session_entry_action(entry: &Value) -> Option<Action> {
     }))
 }
 
-/// The compaction card, which the start and the end of a compaction share.
-fn compaction_card(id: String, text: String, is_error: bool) -> ConversationItem {
+/// The compaction card shared by live events and persisted transcript entries.
+fn compaction_card(
+    id: String,
+    text: String,
+    payload: Option<&Value>,
+    is_error: bool,
+) -> ConversationItem {
+    let tool_report = payload
+        .and_then(|payload| payload.get("summary"))
+        .and_then(Value::as_str)
+        .filter(|summary| !summary.trim().is_empty())
+        .map(str::to_owned);
+    let tool_details = payload.and_then(compaction_details);
+
     ConversationItem {
         id,
         role: ConversationRole::Tool,
         full_text: text,
         streaming: false,
         tool_name: Some("compact".into()),
-        tool_report: None,
-        tool_details: None,
+        tool_report,
+        tool_details,
         is_error,
         model: None,
         attachments: Vec::new(),
     }
+}
+
+/// Raw compaction metadata without duplicating the already-visible summary.
+fn compaction_details(payload: &Value) -> Option<String> {
+    let mut details = serde_json::Map::new();
+    for key in [
+        "tokensBefore",
+        "estimatedTokensAfter",
+        "firstKeptEntryId",
+        "details",
+        "usage",
+        "fromHook",
+    ] {
+        if let Some(value) = payload.get(key) {
+            details.insert(key.to_owned(), value.clone());
+        }
+    }
+    if details.is_empty() {
+        return None;
+    }
+    serde_json::to_string_pretty(&Value::Object(details)).ok()
 }
 
 /// What a successful compaction saved, when Pi says.
@@ -411,10 +478,33 @@ fn compaction_summary(result: Option<&Value>) -> String {
     };
     match (number("tokensBefore"), number("estimatedTokensAfter")) {
         (Some(before), Some(after)) => {
-            format!("Compacted context · {before} → {after} tokens")
+            format!(
+                "Compacted context · {} → {} tokens",
+                format_token_count(before),
+                format_token_count(after)
+            )
         }
+        (Some(before), None) => format!(
+            "Compacted context · {} tokens before",
+            format_token_count(before)
+        ),
         _ => "Compacted context".to_owned(),
     }
+}
+
+fn format_token_count(value: i64) -> String {
+    let digits = value.unsigned_abs().to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    if value < 0 {
+        grouped.insert(0, '-');
+    }
+    grouped
 }
 
 fn string_list(value: Option<&Value>) -> Vec<String> {
@@ -856,7 +946,12 @@ mod tests {
         let end = translate(
             &json!({
                 "type": "compaction_end",
-                "result": {"tokensBefore": 90_000, "estimatedTokensAfter": 12_000},
+                "result": {
+                    "summary": "## Preserved context\n- Current task",
+                    "tokensBefore": 90_000,
+                    "estimatedTokensAfter": 12_000,
+                    "details": {"readFiles": ["src/lib.rs"]},
+                },
             }),
             active(),
             &mut turn,
@@ -865,11 +960,100 @@ mod tests {
         // Same id, so the result lands on the card rather than under it.
         let items = upserted(&end);
         assert_eq!(items[0].id, item_id);
-        assert!(items[0].full_text.contains("90000"));
-        assert!(items[0].full_text.contains("12000"));
+        assert!(items[0].full_text.contains("90,000"));
+        assert!(items[0].full_text.contains("12,000"));
+        assert_eq!(
+            items[0].tool_report.as_deref(),
+            Some("## Preserved context\n- Current task")
+        );
+        assert!(
+            items[0]
+                .tool_details
+                .as_deref()
+                .is_some_and(|details| details.contains("readFiles"))
+        );
         assert!(!items[0].is_error);
         assert_eq!(turn.compaction_item_id, None);
         assert!(turn.conversation_compacted);
+    }
+
+    #[test]
+    fn a_persisted_compaction_rekeys_the_live_card_and_replays_its_summary() {
+        let mut turn = Turn::default();
+        translate(&json!({"type": "compaction_start"}), active(), &mut turn);
+        let temporary_id = turn
+            .compaction_item_id
+            .clone()
+            .expect("a temporary card id");
+        let entry = json!({
+            "type": "compaction",
+            "id": "persisted-compaction",
+            "summary": "## Goal\nKeep the durable summary.",
+            "tokensBefore": 123_967,
+            "firstKeptEntryId": "message-42",
+            "details": {"modifiedFiles": ["src/lib.rs"]},
+            "usage": {"input": 100, "output": 20},
+        });
+        let appended = translate(
+            &json!({"type": "entry_appended", "entry": entry}),
+            active(),
+            &mut turn,
+        );
+
+        assert!(appended.actions.iter().any(|action| matches!(
+            action,
+            Action::RekeyConversation { from, to }
+                if from == &temporary_id && to == "persisted-compaction"
+        )));
+        assert_eq!(
+            turn.compaction_item_id.as_deref(),
+            Some("persisted-compaction")
+        );
+        let card = &upserted(&appended)[0];
+        assert_eq!(card.id, "persisted-compaction");
+        assert_eq!(card.tool_name.as_deref(), Some("compact"));
+        assert_eq!(card.full_text, "Compacted context · 123,967 tokens before");
+        assert_eq!(
+            card.tool_report.as_deref(),
+            Some("## Goal\nKeep the durable summary.")
+        );
+        let details = card.tool_details.as_deref().expect("raw metadata");
+        assert!(details.contains("firstKeptEntryId"));
+        assert!(details.contains("modifiedFiles"));
+        assert!(details.contains("usage"));
+        assert!(!details.contains("Keep the durable summary"));
+
+        let end = translate(
+            &json!({
+                "type": "compaction_end",
+                "result": {
+                    "summary": "## Goal\nKeep the durable summary.",
+                    "tokensBefore": 123_967,
+                    "estimatedTokensAfter": 17_656,
+                }
+            }),
+            active(),
+            &mut turn,
+        );
+        assert_eq!(upserted(&end)[0].id, "persisted-compaction");
+    }
+
+    #[test]
+    fn a_compaction_transcript_entry_is_not_filtered_during_reload() {
+        let Some(Action::UpsertConversation(card)) = session_entry_action(&json!({
+            "type": "compaction",
+            "id": "compaction-1",
+            "summary": "Saved context",
+            "tokensBefore": 42_000,
+            "details": {"readFiles": ["src/main.rs"]},
+        })) else {
+            panic!("expected a replayable compaction card");
+        };
+
+        assert_eq!(card.id, "compaction-1");
+        assert_eq!(card.full_text, "Compacted context · 42,000 tokens before");
+        assert_eq!(card.tool_report.as_deref(), Some("Saved context"));
+        assert!(card.tool_details.is_some());
     }
 
     #[test]
