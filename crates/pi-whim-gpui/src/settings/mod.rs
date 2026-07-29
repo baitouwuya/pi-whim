@@ -18,7 +18,7 @@ pub mod web_search;
 use std::rc::Rc;
 
 use gpui::{
-    App, AppContext, Context, Entity, EventEmitter, IntoElement, ParentElement, Render,
+    App, AppContext, Context, Entity, EventEmitter, Focusable, IntoElement, ParentElement, Render,
     ScrollHandle, SharedString, Styled, Window, div, point, prelude::FluentBuilder, px,
 };
 use gpui_component::{
@@ -91,6 +91,10 @@ pub enum SettingsEvent {
     DeleteProvider(ProviderId),
 
     SelectSearchEngine(SearchEngineProfile),
+    /// Start a search engine that has not been saved.
+    NewSearchEngine,
+    /// Dismiss the add/edit dialog without storing its draft.
+    CloseSearchEngineEditor,
     SetSearchEngineEnabled(bool),
     /// Store the whole list, which is how a reorder or a delete is saved too.
     SaveSearchEngines(Vec<SearchEngineProfile>),
@@ -114,6 +118,7 @@ pub struct Settings {
     state: AppState,
     provider: ProviderDraft,
     search_engine: SearchEngineDraft,
+    search_engine_editor_open: bool,
     general_fields: general::Fields,
     provider_fields: providers::Fields,
     search_fields: web_search::Fields,
@@ -246,6 +251,7 @@ impl Settings {
             state,
             provider,
             search_engine,
+            search_engine_editor_open: false,
             general_fields,
             provider_fields,
             search_fields,
@@ -549,7 +555,13 @@ impl Settings {
         cx.notify();
     }
 
-    /// Point the search-engine draft at a stored profile.
+    /// Start a search engine that has not been saved and open its editor.
+    pub fn new_search_engine(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_engine = SearchEngineDraft::default();
+        self.open_search_engine_editor(window, cx);
+    }
+
+    /// Point the search-engine draft at a stored profile and open its editor.
     pub fn edit_search_engine(
         &mut self,
         profile: &SearchEngineProfile,
@@ -557,6 +569,24 @@ impl Settings {
         cx: &mut Context<Self>,
     ) {
         self.search_engine = SearchEngineDraft::from_profile(profile);
+        self.open_search_engine_editor(window, cx);
+    }
+
+    fn open_search_engine_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_engine_editor_open = true;
+        self.seed_search_fields(window, cx);
+        let focus = self
+            .search_fields
+            .name
+            .update(cx, |input, cx| input.focus_handle(cx));
+        focus.focus(window, cx);
+        cx.notify();
+    }
+
+    /// Close the editor and discard anything that was not saved.
+    pub fn close_search_engine_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_engine_editor_open = false;
+        self.search_engine = SearchEngineDraft::default();
         self.seed_search_fields(window, cx);
     }
 
@@ -587,8 +617,7 @@ impl Settings {
 
     /// Clear the search-engine draft, after the one it edited was deleted.
     pub fn clear_search_engine_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.search_engine = SearchEngineDraft::default();
-        self.seed_search_fields(window, cx);
+        self.close_search_engine_editor(window, cx);
     }
 
     /// Fill every field from the drafts and state.
@@ -784,6 +813,16 @@ impl Render for Settings {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = self.tokens;
         let emit = self.emit(cx);
+        let editor = self.search_engine_editor_open.then(|| {
+            web_search::render_editor(
+                &self.state,
+                &self.search_engine,
+                &self.search_fields,
+                tokens,
+                emit.clone(),
+                cx,
+            )
+        });
         let body = match self.section {
             Section::General => {
                 general::render_general(&self.state, &self.general_fields, tokens, emit)
@@ -798,13 +837,7 @@ impl Render for Settings {
                 tokens,
                 emit,
             ),
-            Section::WebSearch => web_search::render(
-                &self.state,
-                &self.search_engine,
-                &self.search_fields,
-                tokens,
-                emit,
-            ),
+            Section::WebSearch => web_search::render(&self.state, tokens, emit),
         };
 
         div()
@@ -830,6 +863,7 @@ impl Render for Settings {
                         ),
                 ),
             )
+            .when_some(editor, |this, editor| this.child(editor))
     }
 }
 
@@ -937,6 +971,39 @@ mod tests {
                     settings.provider_fields.protocol.read(cx).selected_value(),
                     Some(&ProviderProtocol::GoogleGenerativeAi)
                 );
+            })
+            .expect("the settings window is open");
+    }
+
+    #[gpui::test]
+    async fn search_engine_details_only_live_in_the_open_editor(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| crate::init(ThemePreference::default(), cx).unwrap());
+        let settings = cx.add_window(|window, cx| {
+            Settings::new(Tokens::light(), AppState::default(), window, cx)
+        });
+
+        settings
+            .update(cx, |settings, window, cx| {
+                settings.new_search_engine(window, cx);
+                assert!(settings.search_engine_editor_open);
+                assert_eq!(settings.search_engine, SearchEngineDraft::default());
+
+                let mut profile = SearchEngineProfile::new_searxng();
+                profile.name = "Private search".into();
+                profile.base_url = "https://search.example".into();
+                profile.enabled = false;
+                settings.edit_search_engine(&profile, window, cx);
+
+                assert!(settings.search_engine_editor_open);
+                assert_eq!(settings.search_engine.id, Some(profile.id));
+                assert_eq!(settings.search_engine.name, profile.name);
+                assert_eq!(settings.search_engine.base_url, profile.base_url);
+                assert!(!settings.search_engine.enabled);
+
+                settings.search_engine.name = "Unsaved name".into();
+                settings.close_search_engine_editor(window, cx);
+                assert!(!settings.search_engine_editor_open);
+                assert_eq!(settings.search_engine, SearchEngineDraft::default());
             })
             .expect("the settings window is open");
     }

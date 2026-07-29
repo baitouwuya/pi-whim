@@ -92,6 +92,8 @@ const STRINGS: &[(&str, &str, &str)] = &[
         "配置按顺序尝试的网页搜索引擎。",
     ),
     ("search-engines", "Search engines", "搜索引擎"),
+    ("add-search-engine", "Add search engine", "添加搜索引擎"),
+    ("edit-search-engine", "Edit search engine", "编辑搜索引擎"),
     (
         "search-engine-details",
         "Search engine details",
@@ -103,6 +105,8 @@ const STRINGS: &[(&str, &str, &str)] = &[
         "SearXNG 实例根 URL。",
     ),
     ("enabled", "Enabled", "启用"),
+    ("disabled", "Disabled", "已停用"),
+    ("cancel", "Cancel", "取消"),
     ("save-search-engine", "Save search engine", "保存搜索引擎"),
     ("test-search-engine", "Test connection", "测试连接"),
     (

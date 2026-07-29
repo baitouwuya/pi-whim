@@ -695,6 +695,16 @@ impl Workspace {
                     settings.edit_search_engine(&profile, window, cx);
                 });
             }
+            SettingsEvent::NewSearchEngine => {
+                self.settings.update(cx, |settings, cx| {
+                    settings.new_search_engine(window, cx);
+                });
+            }
+            SettingsEvent::CloseSearchEngineEditor => {
+                self.settings.update(cx, |settings, cx| {
+                    settings.close_search_engine_editor(window, cx);
+                });
+            }
             SettingsEvent::SetSearchEngineEnabled(enabled) => {
                 self.settings.update(cx, |settings, cx| {
                     settings.set_search_engine_enabled(enabled, cx);
@@ -706,6 +716,9 @@ impl Workspace {
             SettingsEvent::SaveSearchEngine => {
                 let profiles = self.settings.read(cx).search_engines_with_draft();
                 self.request(Request::SaveSearchEngines(profiles), cx);
+                self.settings.update(cx, |settings, cx| {
+                    settings.close_search_engine_editor(window, cx);
+                });
             }
             SettingsEvent::TestSearchEngine => {
                 // Tested as it would be stored — trimmed URL, chosen protocol —

@@ -1,17 +1,17 @@
 //! Web search settings: which SearXNG instances answer, and in what order.
 //!
-//! Order is the point of the list — it decides which instance is asked first —
-//! so each row carries move-up and move-down beside its delete. The list
-//! operations themselves are `engine::settings`, which renumbers positions so a
-//! reload preserves what was arranged here.
+//! The page is deliberately list-first. Details only appear in a dialog after
+//! adding an engine or opening a stored row, so an empty form never competes
+//! with the collection it edits.
 
 use gpui::{
-    AnyElement, Entity, IntoElement, ParentElement, SharedString, Styled, div,
-    prelude::FluentBuilder, px,
+    AnyElement, App, Entity, InteractiveElement, IntoElement, ParentElement, SharedString,
+    StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px,
 };
 use gpui_component::{
     Disableable, Sizable,
     button::{Button, ButtonVariants},
+    dialog::Dialog,
     input::{Input, InputState},
 };
 use pi_whim_core::{
@@ -19,7 +19,7 @@ use pi_whim_core::{
     strings::{text as translate, tr},
 };
 use pi_whim_engine::settings::SearchEngineDraft;
-use pi_whim_theme::{Tokens, font, text};
+use pi_whim_theme::{Tokens, font, radius, text};
 
 use crate::{
     icons,
@@ -27,21 +27,22 @@ use crate::{
     theme::IntoHsla,
 };
 
-/// The typed fields on this page.
+const EDITOR_WIDTH: f32 = 620.0;
+const ENGINE_ROW_HEIGHT: f32 = 54.0;
+const STATUS_WIDTH: f32 = 76.0;
+
+/// The typed fields in the add/edit dialog.
 pub struct Fields {
     pub name: Entity<InputState>,
     pub base_url: Entity<InputState>,
 }
 
-/// Build the Web search page.
-pub fn render(
-    state: &AppState,
-    draft: &SearchEngineDraft,
-    fields: &Fields,
-    tokens: Tokens,
-    emit: Emit,
-) -> AnyElement {
+/// Build the list-first Web search page.
+pub fn render(state: &AppState, tokens: Tokens, emit: Emit) -> AnyElement {
+    let add = emit.clone();
+
     div()
+        .w_full()
         .flex()
         .flex_col()
         .child(form::page_header(
@@ -49,109 +50,159 @@ pub fn render(
             Some(tr(state, "web-search-help")),
             tokens,
         ))
-        .child(form::group_stack(vec![
-            form::group(
-                tr(state, "search-engines"),
-                None,
-                tokens,
-                vec![engine_list(state, draft, tokens, emit.clone())],
-            ),
-            // These fields edit whichever instance is selected above, or a new
-            // one when none is; the group keeps that relationship explicit.
-            form::group(
-                tr(state, "search-engine-details"),
-                None,
-                tokens,
-                vec![
-                    form::row(
-                        tr(state, "provider-name"),
-                        None,
-                        tokens,
-                        Input::new(&fields.name).w_full(),
-                    ),
-                    form::row(
-                        tr(state, "base-url"),
-                        Some(tr(state, "searxng-url-help")),
-                        tokens,
-                        Input::new(&fields.base_url).w_full(),
-                    ),
-                    enabled_row(state, draft, tokens, emit.clone()),
-                    save_row(state, draft, tokens, emit),
-                ],
-            ),
-        ]))
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .pt(px(form::PAGE_GROUP_GAP))
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .items_start()
+                        .justify_between()
+                        .child(div().flex_1().child(form::section_header(
+                            tr(state, "search-engines"),
+                            None,
+                            tokens,
+                        )))
+                        .child(
+                            Button::new("add-search-engine")
+                                .icon(icons::add())
+                                .ghost()
+                                .xsmall()
+                                .tooltip(tr(state, "add-search-engine"))
+                                .on_click(move |_, window, cx| {
+                                    add(SettingsEvent::NewSearchEngine, window, cx)
+                                }),
+                        ),
+                )
+                .child(engine_list(state, tokens, emit)),
+        )
         .into_any_element()
 }
 
 /// The stored instances, in the order they are asked.
-fn engine_list(
-    state: &AppState,
-    draft: &SearchEngineDraft,
-    tokens: Tokens,
-    emit: Emit,
-) -> AnyElement {
+fn engine_list(state: &AppState, tokens: Tokens, emit: Emit) -> AnyElement {
     let profiles = &state.search_engine_profiles;
     if profiles.is_empty() {
-        return form::control_row(form::help_text(tr(state, "no-search-engines"), tokens));
+        return div()
+            .w_full()
+            .min_h(px(76.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .border_t_1()
+            .border_b_1()
+            .border_color(tokens.line.hsla())
+            .child(form::help_text(tr(state, "no-search-engines"), tokens))
+            .into_any_element();
     }
+
     let last = profiles.len() - 1;
-    form::control_row(div().w_full().flex().flex_col().gap(px(2.0)).children(
-        profiles.iter().enumerate().map(|(index, profile)| {
-            engine_row(
-                index,
-                last,
-                profile,
-                draft,
-                state.language,
-                tokens,
-                emit.clone(),
-            )
-        }),
-    ))
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .border_t_1()
+        .border_color(tokens.line.hsla())
+        .children(profiles.iter().enumerate().map(|(index, profile)| {
+            engine_row(index, last, profile, state.language, tokens, emit.clone())
+        }))
+        .into_any_element()
 }
 
 fn engine_row(
     index: usize,
     last: usize,
     profile: &SearchEngineProfile,
-    draft: &SearchEngineDraft,
     language: Language,
     tokens: Tokens,
     emit: Emit,
 ) -> AnyElement {
-    let selected = draft.id == Some(profile.id);
     let profile_for_select = profile.clone();
     let select = emit.clone();
     let up = emit.clone();
     let down = emit.clone();
+    let enabled = profile.enabled;
+    let status = translate(if enabled { "enabled" } else { "disabled" }, language);
 
     div()
+        .id(("search-engine-row", index))
         .w_full()
+        .h(px(ENGINE_ROW_HEIGHT))
         .flex()
-        .flex_col()
-        .gap(px(2.0))
-        .py(px(2.0))
+        .items_center()
+        .gap(px(12.0))
+        .px(px(10.0))
+        .border_b_1()
+        .border_color(tokens.line.hsla())
+        .cursor_pointer()
+        .hover(move |row| row.bg(tokens.control_background_hover().hsla()))
         .child(
             div()
-                .w_full()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .w_full()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_size(px(text::DETAIL_SIZE))
+                        .text_color(if enabled {
+                            tokens.text.hsla()
+                        } else {
+                            tokens.muted.hsla()
+                        })
+                        .child(SharedString::from(profile.name.clone())),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .font_family(font::MONO)
+                        .text_size(px(text::LABEL_SIZE))
+                        .text_color(tokens.muted.hsla())
+                        .child(SharedString::from(profile.base_url.clone())),
+                ),
+        )
+        .child(
+            div()
+                .w(px(STATUS_WIDTH))
+                .flex_none()
                 .flex()
                 .items_center()
-                .gap(px(form::INLINE_GAP))
+                .gap(px(6.0))
+                .child(div().size(px(6.0)).rounded(px(radius::DOT)).bg(if enabled {
+                    tokens.success.hsla()
+                } else {
+                    tokens.line_strong.hsla()
+                }))
                 .child(
-                    Button::new(("engine", index as u64))
-                        .label(SharedString::from(profile.name.clone()))
-                        .when(selected, |button| button.primary())
-                        .when(!selected, |button| button.ghost())
-                        .small()
-                        .on_click(move |_, window, cx| {
-                            select(
-                                SettingsEvent::SelectSearchEngine(profile_for_select.clone()),
-                                window,
-                                cx,
-                            )
-                        }),
-                )
-                .child(div().flex_1())
+                    div()
+                        .font_family(font::MONO)
+                        .text_size(px(text::LABEL_SIZE))
+                        .text_color(tokens.muted.hsla())
+                        .child(status),
+                ),
+        )
+        // The action strip stops bubbling so a reorder or delete never opens
+        // the editor underneath the pointer. This also covers disabled arrows.
+        .child(
+            div()
+                .id(("search-engine-actions", index))
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(2.0))
+                .on_click(|_, _, cx| cx.stop_propagation())
                 .child(
                     Button::new(("engine-up", index as u64))
                         .icon(icons::move_up())
@@ -193,23 +244,121 @@ fn engine_row(
                         }),
                 ),
         )
+        .on_click(move |_, window, cx| {
+            select(
+                SettingsEvent::SelectSearchEngine(profile_for_select.clone()),
+                window,
+                cx,
+            )
+        })
+        .into_any_element()
+}
+
+/// The shared add/edit dialog. The same draft and backend requests power both
+/// paths; only its title changes for a stored profile.
+pub fn render_editor(
+    state: &AppState,
+    draft: &SearchEngineDraft,
+    fields: &Fields,
+    tokens: Tokens,
+    emit: Emit,
+    cx: &mut App,
+) -> AnyElement {
+    let can_save = draft.can_save();
+    let title = tr(
+        state,
+        if draft.id.is_some() {
+            "edit-search-engine"
+        } else {
+            "add-search-engine"
+        },
+    );
+    let test = emit.clone();
+    let cancel_button = emit.clone();
+    let save_button = emit.clone();
+    let confirm = emit.clone();
+    let cancel = emit.clone();
+
+    let footer = div()
+        .w_full()
+        .flex()
+        .items_center()
+        .justify_between()
+        .child(
+            Button::new("test-search-engine")
+                .label(tr(state, "test-search-engine"))
+                .outline()
+                .small()
+                .disabled(!can_save)
+                .on_click(move |_, window, cx| test(SettingsEvent::TestSearchEngine, window, cx)),
+        )
         .child(
             div()
-                .w_full()
-                .min_w_0()
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .text_ellipsis()
-                .font_family(font::MONO)
-                .text_size(px(text::LABEL_SIZE))
-                .text_color(if profile.enabled {
-                    tokens.muted.hsla()
-                } else {
-                    // A disabled instance is still listed, because its position
-                    // matters again the moment it is switched back on.
-                    tokens.line_strong.hsla()
+                .flex()
+                .items_center()
+                .gap(px(form::INLINE_GAP))
+                .child(
+                    Button::new("cancel-search-engine")
+                        .label(tr(state, "cancel"))
+                        .outline()
+                        .small()
+                        .on_click(move |_, window, cx| {
+                            cancel_button(SettingsEvent::CloseSearchEngineEditor, window, cx)
+                        }),
+                )
+                .child(
+                    Button::new("save-search-engine")
+                        .label(tr(state, "save-search-engine"))
+                        .primary()
+                        .small()
+                        .disabled(!can_save)
+                        .on_click(move |_, window, cx| {
+                            save_button(SettingsEvent::SaveSearchEngine, window, cx)
+                        }),
+                ),
+        );
+
+    div()
+        .child(
+            Dialog::new(cx)
+                .w(px(EDITOR_WIDTH))
+                .title(SharedString::from(title))
+                .footer(footer)
+                .on_ok(move |_, window, cx| {
+                    if can_save {
+                        confirm(SettingsEvent::SaveSearchEngine, window, cx);
+                    }
+                    can_save
                 })
-                .child(SharedString::from(profile.base_url.clone())),
+                .on_cancel(move |_, window, cx| {
+                    cancel(SettingsEvent::CloseSearchEngineEditor, window, cx);
+                    true
+                })
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_col()
+                        .child(form::row(
+                            tr(state, "provider-name"),
+                            None,
+                            tokens,
+                            Input::new(&fields.name).w_full(),
+                        ))
+                        .child(form::row(
+                            tr(state, "base-url"),
+                            Some(tr(state, "searxng-url-help")),
+                            tokens,
+                            Input::new(&fields.base_url).w_full(),
+                        ))
+                        .child(enabled_row(state, draft, tokens, emit))
+                        .when(!can_save, |this| {
+                            this.child(form::control_row(form::field_error(
+                                tr(state, "search-engine-incomplete"),
+                                tokens,
+                            )))
+                        }),
+                ),
         )
         .into_any_element()
 }
@@ -234,47 +383,5 @@ fn enabled_row(
                 emit(SettingsEvent::SetSearchEngineEnabled(checked), window, cx)
             },
         ),
-    )
-}
-
-/// Save, and testing the instance before trusting it.
-fn save_row(state: &AppState, draft: &SearchEngineDraft, tokens: Tokens, emit: Emit) -> AnyElement {
-    let can_save = draft.can_save();
-    let test = emit.clone();
-    form::control_row(
-        div()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap(px(form::INLINE_GAP))
-            .pt(px(6.0))
-            .child(
-                Button::new("save-search-engine")
-                    .label(tr(state, "save-search-engine"))
-                    .primary()
-                    .small()
-                    .disabled(!can_save)
-                    .on_click(move |_, window, cx| {
-                        emit(SettingsEvent::SaveSearchEngine, window, cx)
-                    }),
-            )
-            .child(
-                // Worth its own button: a URL that is reachable but not a SearXNG
-                // instance fails at search time, far from where it was entered.
-                Button::new("test-search-engine")
-                    .label(tr(state, "test-search-engine"))
-                    .outline()
-                    .small()
-                    .disabled(!can_save)
-                    .on_click(move |_, window, cx| {
-                        test(SettingsEvent::TestSearchEngine, window, cx)
-                    }),
-            )
-            .when(!can_save, |this| {
-                this.child(form::help_text(
-                    tr(state, "search-engine-incomplete"),
-                    tokens,
-                ))
-            }),
     )
 }
