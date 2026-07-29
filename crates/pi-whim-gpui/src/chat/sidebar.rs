@@ -6,7 +6,7 @@
 
 use std::{
     collections::{BTreeSet, HashMap},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use gpui::{
@@ -34,8 +34,7 @@ const SESSION_INDENT: f32 = 14.0;
 /// than as content.
 const ICON_SIZE: f32 = 13.0;
 const MARQUEE_DELAY: Duration = Duration::from_millis(350);
-const MARQUEE_FRAME: Duration = Duration::from_millis(16);
-const MARQUEE_SPEED: f32 = 38.0;
+const MARQUEE_SPEED: f32 = 48.0;
 
 /// What the sidebar asks the shell to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -207,7 +206,13 @@ impl Sidebar {
         &self.rows
     }
 
-    fn set_title_hovered(&mut self, key: String, hovered: bool, cx: &mut Context<Self>) {
+    fn set_title_hovered(
+        &mut self,
+        key: String,
+        hovered: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.marquee_epoch = self.marquee_epoch.wrapping_add(1);
         let epoch = self.marquee_epoch;
         let Some(scroll) = self.title_scrolls.get(&key).cloned() else {
@@ -231,32 +236,49 @@ impl Sidebar {
         if cx.reduce_motion() {
             return;
         }
-        cx.spawn(async move |sidebar, cx| {
+        cx.spawn_in(window, async move |sidebar, cx| {
             cx.background_executor().timer(MARQUEE_DELAY).await;
-            let mut elapsed = 0.0_f32;
-            loop {
-                let Ok(keep_running) = sidebar.update(cx, |sidebar, _| {
-                    if sidebar.marquee_epoch != epoch {
-                        return false;
-                    }
-                    let maximum = scroll.max_offset().x;
-                    if maximum <= px(0.0) {
-                        return false;
-                    }
-                    elapsed += MARQUEE_FRAME.as_secs_f32();
-                    let offset = px(elapsed * MARQUEE_SPEED).min(maximum);
-                    scroll.set_offset(point(-offset, px(0.0)));
-                    offset < maximum
-                }) else {
-                    return;
-                };
-                if !keep_running {
-                    return;
-                }
-                cx.background_executor().timer(MARQUEE_FRAME).await;
-            }
+            let started = Instant::now();
+            let _ = cx.update(|window, app| {
+                let _ = sidebar.update(app, |sidebar, cx| {
+                    sidebar.advance_marquee(epoch, scroll, started, window, cx);
+                });
+            });
         })
         .detach();
+    }
+
+    fn advance_marquee(
+        &mut self,
+        epoch: u64,
+        scroll: ScrollHandle,
+        started: Instant,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.marquee_epoch != epoch {
+            return;
+        }
+        let maximum = scroll.max_offset().x;
+        if maximum <= px(0.0) {
+            return;
+        }
+
+        // Use wall-clock progress on GPUI animation frames. A fixed timer step
+        // accumulates scheduling jitter and makes the text visibly stutter.
+        let duration = f32::from(maximum) / MARQUEE_SPEED;
+        let progress = (started.elapsed().as_secs_f32() / duration).clamp(0.0, 1.0);
+        let eased = progress * progress * (3.0 - 2.0 * progress);
+        let offset = maximum * eased;
+        scroll.set_offset(point(-offset, px(0.0)));
+        cx.notify();
+
+        if progress < 1.0 {
+            cx.on_next_frame(window, move |sidebar, window, cx| {
+                sidebar.advance_marquee(epoch, scroll, started, window, cx);
+            });
+            window.request_animation_frame();
+        }
     }
 
     /// The header above the list: what this column is, and how to add to it.
@@ -366,8 +388,8 @@ impl Sidebar {
                 tokens.muted.hsla()
             })
             .tooltip(move |window, cx| Tooltip::new(title_tooltip.clone()).build(window, cx))
-            .on_hover(cx.listener(move |sidebar, hovered, _, cx| {
-                sidebar.set_title_hovered(hover_key.clone(), *hovered, cx);
+            .on_hover(cx.listener(move |sidebar, hovered, window, cx| {
+                sidebar.set_title_hovered(hover_key.clone(), *hovered, window, cx);
             }))
             .when(title_hovered, |title| {
                 title
