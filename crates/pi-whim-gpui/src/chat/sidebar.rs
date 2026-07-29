@@ -4,18 +4,22 @@
 //! visible span, which is the native answer to the hand-rolled viewport clipping
 //! the egui build needed.
 
-use std::collections::BTreeSet;
+use std::{
+    collections::{BTreeSet, HashMap},
+    time::Duration,
+};
 
 use gpui::{
     AnyElement, AppContext, Context, Entity, EventEmitter, InteractiveElement, IntoElement,
-    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window, div,
-    prelude::FluentBuilder, px, uniform_list,
+    ParentElement, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Window,
+    div, point, prelude::FluentBuilder, px, uniform_list,
 };
 use gpui_component::{
     Icon, Sizable,
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
     menu::{ContextMenuExt, PopupMenuItem},
+    tooltip::Tooltip,
 };
 use pi_whim_core::{Language, ProjectId, SessionId, strings::text as translate};
 use pi_whim_theme::{Tokens, font, layout, radius, text};
@@ -29,6 +33,9 @@ const SESSION_INDENT: f32 = 14.0;
 /// Leading glyph size, kept below the row's text so icons read as marks rather
 /// than as content.
 const ICON_SIZE: f32 = 13.0;
+const MARQUEE_DELAY: Duration = Duration::from_millis(350);
+const MARQUEE_FRAME: Duration = Duration::from_millis(16);
+const MARQUEE_SPEED: f32 = 38.0;
 
 /// What the sidebar asks the shell to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -107,6 +114,9 @@ pub struct Sidebar {
     /// The language the column's headings, menus, and empty state are read in.
     language: Language,
     tokens: Tokens,
+    title_scrolls: HashMap<String, ScrollHandle>,
+    hovered_title: Option<String>,
+    marquee_epoch: u64,
 }
 
 impl EventEmitter<SidebarEvent> for Sidebar {}
@@ -130,6 +140,9 @@ impl Sidebar {
             search,
             language: Language::default(),
             tokens,
+            title_scrolls: HashMap::new(),
+            hovered_title: None,
+            marquee_epoch: 0,
         }
     }
 
@@ -158,6 +171,15 @@ impl Sidebar {
         search_rows: Vec<Row>,
         cx: &mut Context<Self>,
     ) {
+        let keys: BTreeSet<_> = default_rows
+            .iter()
+            .chain(&search_rows)
+            .map(row_key)
+            .collect();
+        self.title_scrolls.retain(|key, _| keys.contains(key));
+        for key in keys {
+            self.title_scrolls.entry(key).or_default();
+        }
         self.default_rows = default_rows;
         self.search_rows = search_rows;
         let query = self.search.read(cx).value().to_string();
@@ -183,6 +205,58 @@ impl Sidebar {
 
     pub fn rows(&self) -> &[Row] {
         &self.rows
+    }
+
+    fn set_title_hovered(&mut self, key: String, hovered: bool, cx: &mut Context<Self>) {
+        self.marquee_epoch = self.marquee_epoch.wrapping_add(1);
+        let epoch = self.marquee_epoch;
+        let Some(scroll) = self.title_scrolls.get(&key).cloned() else {
+            return;
+        };
+        if !hovered {
+            scroll.set_offset(point(px(0.0), px(0.0)));
+            if self.hovered_title.as_deref() == Some(&key) {
+                self.hovered_title = None;
+                cx.notify();
+            }
+            return;
+        }
+        for (other_key, other_scroll) in &self.title_scrolls {
+            if other_key != &key {
+                other_scroll.set_offset(point(px(0.0), px(0.0)));
+            }
+        }
+        self.hovered_title = Some(key);
+        cx.notify();
+        if cx.reduce_motion() {
+            return;
+        }
+        cx.spawn(async move |sidebar, cx| {
+            cx.background_executor().timer(MARQUEE_DELAY).await;
+            let mut elapsed = 0.0_f32;
+            loop {
+                let Ok(keep_running) = sidebar.update(cx, |sidebar, _| {
+                    if sidebar.marquee_epoch != epoch {
+                        return false;
+                    }
+                    let maximum = scroll.max_offset().x;
+                    if maximum <= px(0.0) {
+                        return false;
+                    }
+                    elapsed += MARQUEE_FRAME.as_secs_f32();
+                    let offset = px(elapsed * MARQUEE_SPEED).min(maximum);
+                    scroll.set_offset(point(-offset, px(0.0)));
+                    offset < maximum
+                }) else {
+                    return;
+                };
+                if !keep_running {
+                    return;
+                }
+                cx.background_executor().timer(MARQUEE_FRAME).await;
+            }
+        })
+        .detach();
     }
 
     /// The header above the list: what this column is, and how to add to it.
@@ -225,6 +299,10 @@ impl Sidebar {
         let Some(row) = self.rows.get(index) else {
             return div().into_any_element();
         };
+        let key = row_key(row);
+        let title_id = key.clone();
+        let title_hovered = self.hovered_title.as_deref() == Some(&key);
+        let title_scroll = self.title_scrolls.get(&key).cloned().unwrap_or_default();
 
         let (label, indent, running, selected) = match row {
             Row::Project {
@@ -265,6 +343,44 @@ impl Sidebar {
                 pi_path: pi_path.clone(),
             },
         };
+
+        let title_tooltip = label.clone();
+        let hover_key = key.clone();
+        let title = div()
+            .id(SharedString::from(format!("sidebar-title:{title_id}")))
+            .flex_1()
+            .min_w(px(0.0))
+            .h_full()
+            .flex()
+            .items_center()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .text_size(px(if indent > 0.0 {
+                text::MONO_DETAIL_SIZE
+            } else {
+                text::DETAIL_SIZE
+            }))
+            .text_color(if selected {
+                tokens.text.hsla()
+            } else {
+                tokens.muted.hsla()
+            })
+            .tooltip(move |window, cx| Tooltip::new(title_tooltip.clone()).build(window, cx))
+            .on_hover(cx.listener(move |sidebar, hovered, _, cx| {
+                sidebar.set_title_hovered(hover_key.clone(), *hovered, cx);
+            }))
+            .when(title_hovered, |title| {
+                title
+                    .overflow_x_scroll()
+                    .track_scroll(&title_scroll)
+                    .child(div().flex_none().child(SharedString::from(label.clone())))
+            })
+            .when(!title_hovered, |title| {
+                title
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .child(SharedString::from(label))
+            });
 
         // A project header carries its own "new session" button, revealed on
         // hover: one visible per project would be a column of plus signs down the
@@ -323,22 +439,7 @@ impl Sidebar {
                     tokens.muted.hsla()
                 }))
             })
-            .child(
-                div()
-                    .flex_1()
-                    .overflow_hidden()
-                    .text_size(px(if indent > 0.0 {
-                        text::MONO_DETAIL_SIZE
-                    } else {
-                        text::DETAIL_SIZE
-                    }))
-                    .text_color(if selected {
-                        tokens.text.hsla()
-                    } else {
-                        tokens.muted.hsla()
-                    })
-                    .child(SharedString::from(label)),
-            )
+            .child(title)
             .when(running, |this| {
                 // Same dot the status pill uses, so "working" reads the same
                 // wherever it appears.
@@ -372,6 +473,13 @@ impl Sidebar {
                 }
             })
             .into_any_element()
+    }
+}
+
+fn row_key(row: &Row) -> String {
+    match row {
+        Row::Project { id, .. } => format!("project:{id}"),
+        Row::Session { pi_path, .. } => format!("session:{pi_path}"),
     }
 }
 
