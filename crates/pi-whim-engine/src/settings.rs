@@ -262,18 +262,25 @@ impl ProviderDraft {
 pub struct SearchEngineDraft {
     pub id: Option<SearchEngineId>,
     pub name: String,
+    pub kind: SearchEngineKind,
     pub base_url: String,
     pub enabled: bool,
+    /// What was typed into the key field. Empty means "leave the stored one".
+    pub api_key: String,
+    /// Whether a key is already in Keychain for this engine.
+    pub has_api_key: bool,
 }
 
 impl Default for SearchEngineDraft {
     fn default() -> Self {
         Self {
             id: None,
-            // SearXNG is the only kind supported, so naming it saves a step.
-            name: "SearXNG".into(),
+            name: SearchEngineKind::Searxng.default_name().into(),
+            kind: SearchEngineKind::Searxng,
             base_url: String::new(),
             enabled: true,
+            api_key: String::new(),
+            has_api_key: false,
         }
     }
 }
@@ -283,8 +290,12 @@ impl SearchEngineDraft {
         Self {
             id: Some(profile.id),
             name: profile.name.clone(),
+            kind: profile.kind,
             base_url: profile.base_url.clone(),
             enabled: profile.enabled,
+            // Never read the secret back into an editable field.
+            api_key: String::new(),
+            has_api_key: profile.has_api_key,
         }
     }
 
@@ -292,16 +303,42 @@ impl SearchEngineDraft {
         SearchEngineProfile {
             id: self.id.unwrap_or_else(uuid::Uuid::new_v4),
             name: self.name.trim().to_owned(),
-            kind: SearchEngineKind::Searxng,
+            kind: self.kind,
             base_url: self.base_url.trim().trim_end_matches('/').to_owned(),
             enabled: self.enabled,
             position,
+            has_api_key: self.has_api_key || !self.api_key.trim().is_empty(),
+        }
+    }
+
+    pub fn typed_api_key(&self) -> Option<String> {
+        let trimmed = self.api_key.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    }
+
+    /// Change adapter, moving untouched defaults with it.
+    pub fn set_kind(&mut self, kind: SearchEngineKind) {
+        let previous = self.kind;
+        self.kind = kind;
+        if self.name.trim() == previous.default_name() {
+            self.name = kind.default_name().into();
+        }
+        if self.base_url.trim().trim_end_matches('/') == previous.default_base_url() {
+            self.base_url = kind.default_base_url().into();
+        }
+        if !kind.requires_api_key() {
+            self.api_key.clear();
+            self.has_api_key = false;
         }
     }
 
     /// Whether this draft is worth saving.
     pub fn can_save(&self) -> bool {
-        !self.name.trim().is_empty() && !self.base_url.trim().is_empty()
+        !self.name.trim().is_empty()
+            && !self.base_url.trim().is_empty()
+            && (!self.kind.requires_api_key()
+                || self.has_api_key
+                || !self.api_key.trim().is_empty())
     }
 }
 
@@ -388,6 +425,7 @@ mod tests {
             base_url: format!("https://{name}.example"),
             enabled: true,
             position,
+            has_api_key: false,
         }
     }
 
@@ -628,6 +666,39 @@ mod tests {
             }
             .can_save()
         );
+    }
+
+    #[test]
+    fn doubao_defaults_to_the_global_endpoint_and_requires_a_key() {
+        let mut draft = SearchEngineDraft::default();
+        draft.set_kind(SearchEngineKind::DoubaoGlobal);
+
+        assert_eq!(draft.name, SearchEngineKind::DoubaoGlobal.default_name());
+        assert_eq!(
+            draft.base_url,
+            "https://open.feedcoopapi.com/search_api/global_search"
+        );
+        assert!(!draft.can_save());
+
+        draft.api_key = "  secret  ".into();
+        assert_eq!(draft.typed_api_key().as_deref(), Some("secret"));
+        assert!(draft.can_save());
+        assert!(draft.to_profile(0).has_api_key);
+    }
+
+    #[test]
+    fn changing_back_to_searxng_drops_draft_key_metadata() {
+        let mut draft = SearchEngineDraft::default();
+        draft.set_kind(SearchEngineKind::DoubaoGlobal);
+        draft.api_key = "secret".into();
+        draft.has_api_key = true;
+
+        draft.set_kind(SearchEngineKind::Searxng);
+
+        assert_eq!(draft.name, "SearXNG");
+        assert!(draft.base_url.is_empty());
+        assert!(draft.api_key.is_empty());
+        assert!(!draft.has_api_key);
     }
 
     #[test]

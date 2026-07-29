@@ -415,6 +415,7 @@ impl SearchEngineRepository for SqliteStore {
                 })?;
                 let kind = match row.get::<_, String>(2)?.as_str() {
                     "searxng" => SearchEngineKind::Searxng,
+                    "doubao_global" => SearchEngineKind::DoubaoGlobal,
                     _ => SearchEngineKind::Searxng,
                 };
                 Ok(SearchEngineProfile {
@@ -424,6 +425,8 @@ impl SearchEngineRepository for SqliteStore {
                     base_url: row.get(3)?,
                     enabled: row.get(4)?,
                     position: row.get::<_, u32>(5)?,
+                    // Credential state is refreshed from Keychain after load.
+                    has_api_key: false,
                 }
                 .normalized())
             })?
@@ -445,7 +448,7 @@ impl SearchEngineRepository for SqliteStore {
                 params![
                     profile.id.to_string(),
                     profile.name,
-                    "searxng",
+                    profile.kind.as_str(),
                     profile.base_url,
                     profile.enabled,
                     position as u32,
@@ -879,10 +882,11 @@ mod tests {
         let first = SearchEngineProfile {
             id: Uuid::new_v4(),
             name: "Primary".into(),
-            kind: SearchEngineKind::Searxng,
+            kind: SearchEngineKind::DoubaoGlobal,
             base_url: "https://primary.example/".into(),
             enabled: true,
             position: 12,
+            has_api_key: true,
         };
         let second = SearchEngineProfile {
             id: Uuid::new_v4(),
@@ -891,6 +895,7 @@ mod tests {
             base_url: "http://localhost:8080".into(),
             enabled: false,
             position: 0,
+            has_api_key: false,
         };
 
         store
@@ -904,6 +909,45 @@ mod tests {
         assert_eq!(profiles[1].id, first.id);
         assert_eq!(profiles[1].position, 1);
         assert_eq!(profiles[1].base_url, "https://primary.example");
+        assert_eq!(profiles[1].kind, SearchEngineKind::DoubaoGlobal);
+        assert!(!profiles[1].has_api_key);
+    }
+
+    #[test]
+    fn legacy_search_engine_table_loads_without_credential_metadata() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("test.sqlite");
+        let id = Uuid::new_v4();
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE search_engine_profiles (
+                        id TEXT PRIMARY KEY NOT NULL,
+                        name TEXT NOT NULL,
+                        kind TEXT NOT NULL,
+                        base_url TEXT NOT NULL,
+                        enabled INTEGER NOT NULL,
+                        position INTEGER NOT NULL
+                    );",
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO search_engine_profiles
+                     (id, name, kind, base_url, enabled, position)
+                     VALUES (?1, 'Legacy', 'searxng', 'http://localhost:8080', 1, 0)",
+                    [id.to_string()],
+                )
+                .unwrap();
+        }
+
+        let store = SqliteStore::open(&path).unwrap();
+        let profiles = store.list_search_engine_profiles().unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].id, id);
+        assert_eq!(profiles[0].kind, SearchEngineKind::Searxng);
+        assert!(!profiles[0].has_api_key);
     }
 
     #[test]

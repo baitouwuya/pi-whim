@@ -6,13 +6,38 @@
 //! available models, and validate search-engine URLs.
 
 use pi_whim_core::{
-    ProviderId, ProviderModel, ProviderProfile, ProviderProtocol, SearchEngineProfile,
+    ProviderId, ProviderModel, ProviderProfile, ProviderProtocol, SearchEngineId,
+    SearchEngineProfile,
 };
+use pi_whim_runtime::SearchEngineApiKeys;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
 pub fn provider_keychain_account(id: ProviderId) -> String {
     format!("provider-api-key-{id}")
+}
+
+pub fn search_engine_keychain_account(id: SearchEngineId) -> String {
+    format!("search-engine-api-key-{id}")
+}
+
+pub fn configured_search_engine_api_keys(
+    profiles: &[SearchEngineProfile],
+    mut get_key: impl FnMut(SearchEngineId) -> Result<Option<String>, String>,
+) -> Result<SearchEngineApiKeys, String> {
+    let mut api_keys = SearchEngineApiKeys::default();
+    for profile in profiles
+        .iter()
+        .filter(|profile| profile.kind.requires_api_key())
+    {
+        if let Some(api_key) = get_key(profile.id)?
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+        {
+            api_keys.insert(profile.id, api_key);
+        }
+    }
+    Ok(api_keys)
 }
 
 fn provider_environment_name(id: ProviderId) -> String {
@@ -51,31 +76,6 @@ pub fn valid_search_engine_url(value: &str) -> bool {
         return false;
     };
     matches!(scheme, "http" | "https") && !rest.is_empty() && !rest.starts_with('/')
-}
-
-pub fn test_searxng_engine(profile: &SearchEngineProfile) -> Result<(), String> {
-    let endpoint = format!("{}/search", normalize_base_url(&profile.base_url));
-    let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_secs(6)))
-        .max_redirects(0)
-        .build()
-        .new_agent();
-    let mut response = agent
-        .get(&endpoint)
-        .query("q", "pi-whim")
-        .query("format", "json")
-        .query("categories", "general")
-        .header("Accept", "application/json")
-        .call()
-        .map_err(|error| error.to_string())?;
-    let body: Value = response
-        .body_mut()
-        .read_json()
-        .map_err(|error| format!("invalid JSON response: {error}"))?;
-    if body.get("results").and_then(Value::as_array).is_none() {
-        return Err("response has no results array".into());
-    }
-    Ok(())
 }
 
 pub(crate) fn pi_models_json(profiles: &[ProviderProfile]) -> Value {
@@ -313,5 +313,21 @@ mod tests {
         assert!(!valid_search_engine_url("search.example"));
         assert!(!valid_search_engine_url("ftp://search.example"));
         assert!(!valid_search_engine_url("https:///search.example"));
+    }
+
+    #[test]
+    fn search_engine_keys_use_a_separate_redacted_runtime_map() {
+        let profile = SearchEngineProfile::new_doubao_global();
+        let api_keys = configured_search_engine_api_keys(std::slice::from_ref(&profile), |id| {
+            Ok((id == profile.id).then(|| "  secret-key  ".to_owned()))
+        })
+        .unwrap();
+
+        assert_eq!(
+            search_engine_keychain_account(profile.id),
+            format!("search-engine-api-key-{}", profile.id)
+        );
+        assert_eq!(api_keys.len(), 1);
+        assert!(!format!("{api_keys:?}").contains("secret-key"));
     }
 }

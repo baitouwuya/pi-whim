@@ -94,6 +94,13 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ("search-engines", "Search engines", "搜索引擎"),
     ("add-search-engine", "Add search engine", "添加搜索引擎"),
     ("edit-search-engine", "Edit search engine", "编辑搜索引擎"),
+    ("search-engine-type", "Search engine type", "搜索引擎类型"),
+    ("search-engine-searxng", "SearXNG", "SearXNG"),
+    (
+        "search-engine-doubao-global",
+        "Doubao Search (Global)",
+        "豆包搜索（Global 版）",
+    ),
     (
         "search-engine-details",
         "Search engine details",
@@ -103,6 +110,12 @@ const STRINGS: &[(&str, &str, &str)] = &[
         "searxng-url-help",
         "Root URL of the SearXNG instance.",
         "SearXNG 实例根 URL。",
+    ),
+    ("endpoint-url", "Endpoint URL", "接口 URL"),
+    (
+        "doubao-url-help",
+        "Doubao Search Global API endpoint.",
+        "豆包搜索 Global 版 API 接口地址。",
     ),
     ("enabled", "Enabled", "启用"),
     ("disabled", "Disabled", "已停用"),
@@ -143,8 +156,8 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "search-engine-incomplete",
-        "A search engine needs a name and a base URL.",
-        "搜索引擎需要名称和基础 URL。",
+        "Complete all required search engine fields.",
+        "请完整填写搜索引擎的必填项。",
     ),
     (
         "no-providers",
@@ -235,8 +248,8 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "notice-key-missing",
-        "This provider has no API key in Keychain. Enter and save its API key before starting Pi.",
-        "该提供商在 Keychain 中没有 API Key。请先输入并保存，然后再启动 Pi。",
+        "No API key is stored in Keychain. Enter and save one before continuing.",
+        "Keychain 中没有已保存的 API Key。请先输入并保存，然后再继续。",
     ),
     (
         "notice-search-engine-untestable",
@@ -245,8 +258,8 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "notice-search-engine-ok",
-        "is reachable and returned valid SearXNG JSON.",
-        "可访问，并返回了有效的 SearXNG JSON。",
+        "is reachable and returned valid search results.",
+        "可访问，并返回了有效的搜索结果。",
     ),
     ("notice-test-failed", "test failed", "测试失败"),
     (

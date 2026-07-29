@@ -14,16 +14,16 @@ use std::{
 use pi_whim_core::{
     Action, AgentPermissionLevel, AppState, Attachment, ConversationItem, ConversationRole,
     Language, ModelOption, Project, ProjectId, ProviderId, ProviderProfile, ProviderProtocol,
-    QueueMode, SearchEngineProfile, SessionMetrics, SessionStatus, SessionSummary, SubmitMode,
-    ThinkingLevel, normalize_bash_patterns, normalize_provider_display_name, provider_name_key,
-    stable_session_id, strings,
+    QueueMode, SearchEngineId, SearchEngineProfile, SessionMetrics, SessionStatus, SessionSummary,
+    SubmitMode, ThinkingLevel, normalize_bash_patterns, normalize_provider_display_name,
+    provider_name_key, stable_session_id, strings,
 };
 use pi_whim_persistence::{
     AppPreferences, AttachmentStore, MacosKeychainStore, PreferencesRepository, ProjectRepository,
     ProviderRepository, SearchEngineRepository, SecretStore, SessionRepository, SqliteStore,
     session_summary_from_jsonl,
 };
-use pi_whim_runtime::{AgentRuntime, PiRpcRuntime, RuntimeEvent, RuntimeStart};
+use pi_whim_runtime::{AgentRuntime, PiRpcRuntime, RuntimeEvent, RuntimeStart, test_search_engine};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -32,8 +32,8 @@ use pi_whim_engine::mailbox::Delivery;
 use pi_whim_engine::pool::{SessionPool, SessionRuntime, is_draft};
 use pi_whim_engine::protocol::queue_mode_name;
 use pi_whim_engine::providers::{
-    discover_models, normalize_base_url, provider_keychain_account, test_searxng_engine,
-    valid_search_engine_url,
+    configured_search_engine_api_keys, discover_models, normalize_base_url,
+    provider_keychain_account, search_engine_keychain_account, valid_search_engine_url,
 };
 use pi_whim_engine::session::{
     attachment_from_path, bash_policy_name, canonical_path, ensure_agent_team_extension, now_ms,
@@ -147,9 +147,15 @@ impl Default for PiWhimApplication<PiRpcRuntime> {
             ));
             let _ = engine.apply(Action::SetAgentTeamConfig(preferences.agent_team_config));
         }
+        let mut search_engine_ids = Vec::new();
         if let Some(store) = store.as_ref()
             && let Ok(profiles) = store.list_search_engine_profiles()
         {
+            search_engine_ids = profiles
+                .iter()
+                .filter(|profile| profile.kind.requires_api_key())
+                .map(|profile| profile.id)
+                .collect();
             let _ = engine.apply(Action::SearchEngineProfilesLoaded(profiles));
         }
         let mut provider_ids = Vec::new();
@@ -185,6 +191,7 @@ impl Default for PiWhimApplication<PiRpcRuntime> {
         // the window opens, so profiles start with their stored status and a
         // worker corrects them.
         application.refresh_provider_key_status(provider_ids);
+        application.refresh_search_engine_key_status(search_engine_ids);
         application
     }
 }
@@ -383,8 +390,15 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             } => self.set_queue_modes(steering, follow_up),
             Request::RunCommand(command) => self.run_command(command),
             Request::DeleteProvider(profile_id) => self.delete_provider(profile_id),
-            Request::SaveSearchEngines(profiles) => self.save_search_engines(profiles),
-            Request::TestSearchEngine(profile) => self.test_search_engine(profile),
+            Request::SaveSearchEngines(profiles) => {
+                self.save_search_engines(profiles);
+            }
+            Request::SaveSearchEngine { profile, api_key } => {
+                self.save_search_engine(profile, api_key);
+            }
+            Request::TestSearchEngine { profile, api_key } => {
+                self.test_search_engine(profile, api_key)
+            }
             // Each of these either needs the window and the clipboard, or answers
             // with something a view has to be told, so the host keeps them.
             Request::CopyToClipboard(_)
@@ -586,6 +600,29 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         });
     }
 
+    fn refresh_search_engine_key_status(&self, ids: Vec<SearchEngineId>) {
+        if ids.is_empty() {
+            return;
+        }
+        let sender = self.control_updates.0.clone();
+        let key = self.sessions.active_key().map(str::to_owned);
+        let secrets = self.secrets.clone();
+        std::thread::spawn(move || {
+            let statuses = ids
+                .into_iter()
+                .map(|id| {
+                    let saved = secrets
+                        .get(&search_engine_keychain_account(id))
+                        .ok()
+                        .flatten()
+                        .is_some();
+                    (id, saved)
+                })
+                .collect();
+            let _ = sender.send((key, vec![Action::SearchEngineKeyStatusLoaded(statuses)]));
+        });
+    }
+
     fn reload_provider_profiles(&mut self) {
         let Some(store) = self.store.as_ref() else {
             return;
@@ -598,6 +635,24 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 let ids: Vec<ProviderId> = profiles.iter().map(|profile| profile.id).collect();
                 self.apply(Action::ProviderProfilesLoaded(profiles));
                 self.refresh_provider_key_status(ids);
+            }
+            Err(error) => self.notices.error(error.to_string()),
+        }
+    }
+
+    fn reload_search_engine_profiles(&mut self) {
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        match store.list_search_engine_profiles() {
+            Ok(profiles) => {
+                let ids = profiles
+                    .iter()
+                    .filter(|profile| profile.kind.requires_api_key())
+                    .map(|profile| profile.id)
+                    .collect();
+                self.apply(Action::SearchEngineProfilesLoaded(profiles));
+                self.refresh_search_engine_key_status(ids);
             }
             Err(error) => self.notices.error(error.to_string()),
         }
@@ -691,13 +746,13 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         self.restart_selected_project();
     }
 
-    fn save_search_engines(&mut self, profiles: Vec<SearchEngineProfile>) {
+    fn save_search_engines(&mut self, profiles: Vec<SearchEngineProfile>) -> bool {
         if let Some(invalid) = profiles.iter().find(|profile| {
             profile.name.trim().is_empty() || !valid_search_engine_url(&profile.base_url)
         }) {
             let message = format!("{}: {}", invalid.name, self.say("search-engine-incomplete"));
             self.notices.error(message);
-            return;
+            return false;
         }
         let profiles = profiles
             .into_iter()
@@ -708,22 +763,107 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 profile
             })
             .collect::<Vec<_>>();
+        let stale_key_ids = self
+            .state()
+            .search_engine_profiles
+            .iter()
+            .filter(|existing| {
+                existing.kind.requires_api_key()
+                    && !profiles
+                        .iter()
+                        .any(|profile| profile.id == existing.id && profile.kind.requires_api_key())
+            })
+            .map(|profile| profile.id)
+            .collect::<Vec<_>>();
         if let Some(store) = self.store.as_ref()
             && let Err(error) = store.save_search_engine_profiles(&profiles)
         {
             self.notices.error(error.to_string());
-            return;
+            return false;
         }
-        self.apply(Action::SearchEngineProfilesLoaded(profiles));
+        for id in stale_key_ids {
+            if let Err(error) = self.secrets.delete(&search_engine_keychain_account(id)) {
+                self.notices.error(error.to_string());
+            }
+        }
+        self.reload_search_engine_profiles();
         self.restart_selected_project();
+        true
     }
 
-    fn test_search_engine(&mut self, profile: SearchEngineProfile) {
+    /// Store one search engine while keeping credentials out of persisted metadata.
+    pub(crate) fn save_search_engine(
+        &mut self,
+        mut profile: SearchEngineProfile,
+        api_key: Option<String>,
+    ) -> bool {
+        profile = profile.normalized();
+        if profile.name.is_empty() || !valid_search_engine_url(&profile.base_url) {
+            self.report("search-engine-incomplete");
+            return false;
+        }
+
+        let account = search_engine_keychain_account(profile.id);
+        let requires_api_key = profile.kind.requires_api_key();
+        if requires_api_key {
+            if let Some(api_key) = api_key
+                && let Err(error) = self.secrets.set(&account, &api_key)
+            {
+                self.notices.error(error.to_string());
+                return false;
+            }
+            match self.secrets.get(&account) {
+                Ok(Some(value)) if !value.trim().is_empty() => profile.has_api_key = true,
+                Ok(_) => {
+                    self.report("notice-key-missing");
+                    return false;
+                }
+                Err(error) => {
+                    self.notices.error(error.to_string());
+                    return false;
+                }
+            }
+        } else {
+            profile.has_api_key = false;
+        }
+
+        let mut profiles = self.state().search_engine_profiles.clone();
+        if let Some(existing) = profiles
+            .iter_mut()
+            .find(|existing| existing.id == profile.id)
+        {
+            *existing = profile;
+        } else {
+            profiles.push(profile);
+        }
+        profiles.sort_by_key(|profile| profile.position);
+
+        if !self.save_search_engines(profiles) {
+            return false;
+        }
+        true
+    }
+
+    fn test_search_engine(&mut self, profile: SearchEngineProfile, supplied_key: Option<String>) {
         if profile.name.trim().is_empty() || !valid_search_engine_url(&profile.base_url) {
             self.report("notice-search-engine-untestable");
             return;
         }
-        match test_searxng_engine(&profile) {
+        let api_key = if supplied_key.is_some() || !profile.kind.requires_api_key() {
+            supplied_key
+        } else {
+            match self
+                .secrets
+                .get(&search_engine_keychain_account(profile.id))
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    self.notices.error(error.to_string());
+                    return;
+                }
+            }
+        };
+        match test_search_engine(&profile, api_key.as_deref()) {
             Ok(()) => {
                 let message = format!("{} {}", profile.name, self.say("notice-search-engine-ok"));
                 self.notices.info(message);
@@ -905,6 +1045,18 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             serde_json::to_string(&self.state().bash_blocked_patterns)
                 .unwrap_or_else(|_| "[]".into()),
         );
+        let search_engine_api_keys =
+            match configured_search_engine_api_keys(&self.state().search_engine_profiles, |id| {
+                self.secrets
+                    .get(&search_engine_keychain_account(id))
+                    .map_err(|error| error.to_string())
+            }) {
+                Ok(api_keys) => api_keys,
+                Err(error) => {
+                    self.notices.error(error);
+                    return None;
+                }
+            };
         let mut runtime = (self.runtime_factory)();
         if let Err(error) = runtime.start(RuntimeStart {
             project_path: project.path,
@@ -914,6 +1066,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             environment,
             agent_team_config: self.state().agent_team_config.clone(),
             search_engines: self.state().search_engine_profiles.clone(),
+            search_engine_api_keys,
         }) {
             if self.sessions.active_key().is_none() {
                 self.apply(Action::SetSessionStatus(SessionStatus::Failed(

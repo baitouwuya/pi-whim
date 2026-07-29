@@ -15,7 +15,7 @@ use gpui_component::{
     input::{Input, InputState},
 };
 use pi_whim_core::{
-    AppState, Language, SearchEngineProfile,
+    AppState, Language, SearchEngineKind, SearchEngineProfile,
     strings::{text as translate, tr},
 };
 use pi_whim_engine::settings::SearchEngineDraft;
@@ -23,7 +23,11 @@ use pi_whim_theme::{Tokens, font, radius, text};
 
 use crate::{
     icons,
-    settings::{Emit, SettingsEvent, form, toggle},
+    settings::{
+        Emit, SettingsEvent,
+        dropdown::{self, Choice, ChoiceState},
+        form, toggle,
+    },
     theme::IntoHsla,
 };
 
@@ -34,7 +38,10 @@ const STATUS_WIDTH: f32 = 76.0;
 /// The typed fields in the add/edit dialog.
 pub struct Fields {
     pub name: Entity<InputState>,
+    pub kind: Entity<ChoiceState<SearchEngineKind>>,
     pub base_url: Entity<InputState>,
+    /// Masked and never seeded from Keychain.
+    pub api_key: Entity<InputState>,
 }
 
 /// Build the list-first Web search page.
@@ -127,6 +134,11 @@ fn engine_row(
     let down = emit.clone();
     let enabled = profile.enabled;
     let status = translate(if enabled { "enabled" } else { "disabled" }, language);
+    let details = format!(
+        "{}  |  {}",
+        translate(kind_string(profile.kind), language),
+        profile.base_url
+    );
 
     div()
         .id(("search-engine-row", index))
@@ -170,7 +182,7 @@ fn engine_row(
                         .font_family(font::MONO)
                         .text_size(px(text::LABEL_SIZE))
                         .text_color(tokens.muted.hsla())
-                        .child(SharedString::from(profile.base_url.clone())),
+                        .child(SharedString::from(details)),
                 ),
         )
         .child(
@@ -278,6 +290,22 @@ pub fn render_editor(
     let save_button = emit.clone();
     let confirm = emit.clone();
     let cancel = emit.clone();
+    let endpoint_label = tr(
+        state,
+        if draft.kind == SearchEngineKind::Searxng {
+            "base-url"
+        } else {
+            "endpoint-url"
+        },
+    );
+    let endpoint_help = tr(
+        state,
+        if draft.kind == SearchEngineKind::Searxng {
+            "searxng-url-help"
+        } else {
+            "doubao-url-help"
+        },
+    );
 
     let footer = div()
         .w_full()
@@ -328,7 +356,10 @@ pub fn render_editor(
                     if can_save {
                         confirm(SettingsEvent::SaveSearchEngine, window, cx);
                     }
-                    can_save
+                    // The host closes the editor after SQLite and Keychain both
+                    // succeed. Keep it open so a failed credential write does
+                    // not discard the values the reader just entered.
+                    false
                 })
                 .on_cancel(move |_, window, cx| {
                     cancel(SettingsEvent::CloseSearchEngineEditor, window, cx);
@@ -340,17 +371,26 @@ pub fn render_editor(
                         .flex()
                         .flex_col()
                         .child(form::row(
+                            tr(state, "search-engine-type"),
+                            None,
+                            tokens,
+                            dropdown::dropdown(&fields.kind),
+                        ))
+                        .child(form::row(
                             tr(state, "provider-name"),
                             None,
                             tokens,
                             Input::new(&fields.name).w_full(),
                         ))
                         .child(form::row(
-                            tr(state, "base-url"),
-                            Some(tr(state, "searxng-url-help")),
+                            endpoint_label,
+                            Some(endpoint_help),
                             tokens,
                             Input::new(&fields.base_url).w_full(),
                         ))
+                        .when(draft.kind.requires_api_key(), |this| {
+                            this.child(api_key_row(state, draft, fields, tokens))
+                        })
                         .child(enabled_row(state, draft, tokens, emit))
                         .when(!can_save, |this| {
                             this.child(form::control_row(form::field_error(
@@ -361,6 +401,39 @@ pub fn render_editor(
                 ),
         )
         .into_any_element()
+}
+
+fn kind_string(kind: SearchEngineKind) -> &'static str {
+    match kind {
+        SearchEngineKind::Searxng => "search-engine-searxng",
+        SearchEngineKind::DoubaoGlobal => "search-engine-doubao-global",
+    }
+}
+
+pub fn kind_choices(state: &AppState) -> Vec<Choice<SearchEngineKind>> {
+    [SearchEngineKind::Searxng, SearchEngineKind::DoubaoGlobal]
+        .into_iter()
+        .map(|kind| Choice::new(kind, tr(state, kind_string(kind))))
+        .collect()
+}
+
+fn api_key_row(
+    state: &AppState,
+    draft: &SearchEngineDraft,
+    fields: &Fields,
+    tokens: Tokens,
+) -> AnyElement {
+    let status = if draft.has_api_key {
+        tr(state, "key-stored")
+    } else {
+        tr(state, "key-required")
+    };
+    form::row(
+        tr(state, "api-key"),
+        Some(status),
+        tokens,
+        Input::new(&fields.api_key).w_full(),
+    )
 }
 
 fn enabled_row(

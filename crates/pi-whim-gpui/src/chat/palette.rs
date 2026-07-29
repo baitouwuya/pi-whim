@@ -12,8 +12,7 @@
 
 use gpui::{
     Context, EventEmitter, InteractiveElement, IntoElement, KeyDownEvent, Keystroke, ParentElement,
-    Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Window, div,
-    prelude::FluentBuilder, px,
+    Render, ScrollHandle, SharedString, Styled, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::Icon;
 use pi_whim_core::{AppState, Language, strings::text as translate};

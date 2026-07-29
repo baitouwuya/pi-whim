@@ -280,6 +280,34 @@ pub struct ProviderProfile {
 pub enum SearchEngineKind {
     #[default]
     Searxng,
+    DoubaoGlobal,
+}
+
+impl SearchEngineKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Searxng => "searxng",
+            Self::DoubaoGlobal => "doubao_global",
+        }
+    }
+
+    pub const fn requires_api_key(self) -> bool {
+        matches!(self, Self::DoubaoGlobal)
+    }
+
+    pub const fn default_name(self) -> &'static str {
+        match self {
+            Self::Searxng => "SearXNG",
+            Self::DoubaoGlobal => "Doubao Search (Global)",
+        }
+    }
+
+    pub const fn default_base_url(self) -> &'static str {
+        match self {
+            Self::Searxng => "",
+            Self::DoubaoGlobal => "https://open.feedcoopapi.com/search_api/global_search",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -291,6 +319,9 @@ pub struct SearchEngineProfile {
     #[serde(default = "enabled_by_default")]
     pub enabled: bool,
     pub position: u32,
+    /// Metadata only. The API key itself is kept in the OS keychain.
+    #[serde(default)]
+    pub has_api_key: bool,
 }
 
 fn enabled_by_default() -> bool {
@@ -306,6 +337,19 @@ impl SearchEngineProfile {
             base_url: String::new(),
             enabled: true,
             position: 0,
+            has_api_key: false,
+        }
+    }
+
+    pub fn new_doubao_global() -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            name: SearchEngineKind::DoubaoGlobal.default_name().into(),
+            kind: SearchEngineKind::DoubaoGlobal,
+            base_url: SearchEngineKind::DoubaoGlobal.default_base_url().into(),
+            enabled: true,
+            position: 0,
+            has_api_key: false,
         }
     }
 
@@ -538,6 +582,8 @@ pub enum Action {
     /// block for a long time, so profiles render first and this fills in.
     ProviderKeyStatusLoaded(Vec<(ProviderId, bool)>),
     SearchEngineProfilesLoaded(Vec<SearchEngineProfile>),
+    /// Which search engines have a key in the OS keychain.
+    SearchEngineKeyStatusLoaded(Vec<(SearchEngineId, bool)>),
     RuntimeControlsUpdated {
         current_model: Option<ModelOption>,
         available_models: Vec<ModelOption>,
@@ -629,6 +675,17 @@ impl AppState {
                         .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
                 });
                 self.search_engine_profiles = profiles;
+            }
+            Action::SearchEngineKeyStatusLoaded(statuses) => {
+                for (id, has_api_key) in statuses {
+                    if let Some(profile) = self
+                        .search_engine_profiles
+                        .iter_mut()
+                        .find(|profile| profile.id == id)
+                    {
+                        profile.has_api_key = has_api_key;
+                    }
+                }
             }
             Action::RuntimeControlsUpdated {
                 current_model,
@@ -766,6 +823,29 @@ mod tests {
             true,
         )]));
         assert!(state.provider_profiles[0].has_api_key);
+    }
+
+    #[test]
+    fn search_engine_key_status_lands_on_loaded_metadata() {
+        let mut state = AppState::default();
+        let profile = SearchEngineProfile::new_doubao_global();
+        let id = profile.id;
+        state.dispatch(Action::SearchEngineProfilesLoaded(vec![profile]));
+        assert!(!state.search_engine_profiles[0].has_api_key);
+
+        state.dispatch(Action::SearchEngineKeyStatusLoaded(vec![(id, true)]));
+        assert!(state.search_engine_profiles[0].has_api_key);
+    }
+
+    #[test]
+    fn doubao_global_has_a_stable_kind_and_endpoint() {
+        let profile = SearchEngineProfile::new_doubao_global();
+        assert_eq!(profile.kind.as_str(), "doubao_global");
+        assert_eq!(
+            profile.base_url,
+            "https://open.feedcoopapi.com/search_api/global_search"
+        );
+        assert!(profile.kind.requires_api_key());
     }
 
     // Progressive reveal moved to pi_whim_engine::typewriter::Typewriter, and

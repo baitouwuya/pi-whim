@@ -13,6 +13,8 @@ mod routing;
 mod session_read;
 mod web_search;
 
+pub use web_search::test_engine as test_search_engine;
+
 use std::{
     collections::{HashMap, VecDeque},
     io::{BufRead, BufReader, Read, Write},
@@ -36,7 +38,7 @@ use model::{
 };
 use pi_whim_core::{
     AgentModelSelection, AgentPermissionLevel, AgentPermissionPolicy, AgentTeamConfig,
-    SearchEngineProfile, normalize_agent_policy, stable_session_id,
+    SearchEngineId, SearchEngineProfile, normalize_agent_policy, stable_session_id,
 };
 use pi_whim_tool_protocol::{
     ASK_USER_TOOL, BASH_TOOL, EDIT_FILE_TOOL, FETCH_TOOL, INTERRUPT_AGENT_TOOL, LIST_AGENTS_TOOL,
@@ -99,6 +101,40 @@ struct NewInteraction {
 
 pub(crate) type SharedState = Arc<(Mutex<TeamState>, Condvar)>;
 
+/// Runtime-only web-search credentials.
+///
+/// Values originate in Keychain and are deliberately kept out of profiles,
+/// environment variables, serialization, and debug output.
+#[derive(Clone, Default)]
+pub struct SearchEngineApiKeys(HashMap<SearchEngineId, String>);
+
+impl SearchEngineApiKeys {
+    pub fn insert(&mut self, id: SearchEngineId, api_key: String) {
+        self.0.insert(id, api_key);
+    }
+
+    fn get(&self, id: SearchEngineId) -> Option<&str> {
+        self.0.get(&id).map(String::as_str)
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl std::fmt::Debug for SearchEngineApiKeys {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SearchEngineApiKeys")
+            .field("entries", &self.0.len())
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct AgentLaunchConfig {
     pub executable: PathBuf,
@@ -108,6 +144,7 @@ pub struct AgentLaunchConfig {
     pub environment: HashMap<String, String>,
     pub team_config: AgentTeamConfig,
     pub search_engines: Vec<SearchEngineProfile>,
+    pub search_engine_api_keys: SearchEngineApiKeys,
 }
 
 #[derive(Debug, Error)]
@@ -468,7 +505,12 @@ fn dispatch_request_cancellable(
         WEB_SEARCH_TOOL => ensure_tool_enabled(host, actor_id, WEB_SEARCH_TOOL)
             .and_then(|_| parse_arguments::<web_search::WebSearchArguments>(&request.arguments))
             .and_then(|arguments| {
-                web_search::execute(&host.launch.search_engines, arguments, cancelled)
+                web_search::execute(
+                    &host.launch.search_engines,
+                    &host.launch.search_engine_api_keys,
+                    arguments,
+                    cancelled,
+                )
             }),
         LIST_PROCESSES_TOOL => bash_dispatch::list(host, actor_id),
         READ_PROCESS_TOOL => parse_arguments::<ProcessIdArguments>(&request.arguments)
@@ -2740,6 +2782,7 @@ mod tests {
             environment,
             team_config: config,
             search_engines: Vec::new(),
+            search_engine_api_keys: SearchEngineApiKeys::default(),
         })
         .unwrap();
         let capability = supervisor.root_capability.clone();

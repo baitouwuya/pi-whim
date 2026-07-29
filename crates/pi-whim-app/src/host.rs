@@ -190,6 +190,13 @@ impl<R: AgentRuntime + 'static> Host<R> {
                     });
                 }
             }
+            Request::SaveSearchEngine { profile, api_key } => {
+                if self.application.save_search_engine(profile, api_key) {
+                    self.shell.update(cx, |shell, cx| {
+                        shell.search_engine_saved(window, cx);
+                    });
+                }
+            }
             Request::AttachPaste(paste) => {
                 // A paste of several files is several attachments, so this is a
                 // list even though most pastes produce one.

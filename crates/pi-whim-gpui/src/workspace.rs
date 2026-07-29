@@ -148,8 +148,16 @@ pub enum Request {
     /// Store the whole search-engine list, which is how a reorder and a delete
     /// are saved too.
     SaveSearchEngines(Vec<SearchEngineProfile>),
-    /// Check that a URL really answers as a SearXNG instance.
-    TestSearchEngine(SearchEngineProfile),
+    /// Store one search engine and its newly typed credential, if any.
+    SaveSearchEngine {
+        profile: SearchEngineProfile,
+        api_key: Option<String>,
+    },
+    /// Check that a configured search adapter returns valid results.
+    TestSearchEngine {
+        profile: SearchEngineProfile,
+        api_key: Option<String>,
+    },
     /// Ask a provider which models it has.
     DiscoverProviderModels {
         profile_id: Option<ProviderId>,
@@ -705,6 +713,11 @@ impl Workspace {
                     settings.close_search_engine_editor(window, cx);
                 });
             }
+            SettingsEvent::SetSearchEngineKind(kind) => {
+                self.settings.update(cx, |settings, cx| {
+                    settings.set_search_engine_kind(kind, window, cx);
+                });
+            }
             SettingsEvent::SetSearchEngineEnabled(enabled) => {
                 self.settings.update(cx, |settings, cx| {
                     settings.set_search_engine_enabled(enabled, cx);
@@ -714,18 +727,37 @@ impl Workspace {
                 self.request(Request::SaveSearchEngines(profiles), cx);
             }
             SettingsEvent::SaveSearchEngine => {
-                let profiles = self.settings.read(cx).search_engines_with_draft();
-                self.request(Request::SaveSearchEngines(profiles), cx);
-                self.settings.update(cx, |settings, cx| {
-                    settings.close_search_engine_editor(window, cx);
-                });
+                let draft = self.settings.read(cx).search_engine_draft().clone();
+                let position = draft
+                    .id
+                    .and_then(|id| {
+                        self.state
+                            .search_engine_profiles
+                            .iter()
+                            .find(|profile| profile.id == id)
+                            .map(|profile| profile.position)
+                    })
+                    .unwrap_or(self.state.search_engine_profiles.len() as u32);
+                self.request(
+                    Request::SaveSearchEngine {
+                        profile: draft.to_profile(position),
+                        api_key: draft.typed_api_key(),
+                    },
+                    cx,
+                );
             }
             SettingsEvent::TestSearchEngine => {
                 // Tested as it would be stored — trimmed URL, chosen protocol —
                 // so a pass means the saved instance works, not just the typing.
                 let draft = self.settings.read(cx).search_engine_draft().clone();
                 let position = self.state.search_engine_profiles.len() as u32;
-                self.request(Request::TestSearchEngine(draft.to_profile(position)), cx);
+                self.request(
+                    Request::TestSearchEngine {
+                        profile: draft.to_profile(position),
+                        api_key: draft.typed_api_key(),
+                    },
+                    cx,
+                );
             }
             SettingsEvent::RemoveSearchEngine(index) => {
                 let profiles = self.settings.read(cx).search_engines_without(index);
@@ -876,6 +908,13 @@ impl Workspace {
         self.settings.update(cx, |settings, cx| {
             settings.provider_saved(id, cx);
             settings.set_provider_key_status(id, key_saved, window, cx);
+        });
+    }
+
+    /// Close the editor only after metadata and any credential were stored.
+    pub fn search_engine_saved(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings.update(cx, |settings, cx| {
+            settings.close_search_engine_editor(window, cx)
         });
     }
 

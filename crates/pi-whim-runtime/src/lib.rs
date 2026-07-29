@@ -11,6 +11,7 @@ use std::{
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use pi_whim_agent_team::{AgentLaunchConfig, AgentSupervisor};
+pub use pi_whim_agent_team::{SearchEngineApiKeys, test_search_engine};
 use pi_whim_core::{AgentPermissionLevel, AgentTeamConfig, SearchEngineProfile};
 use pi_whim_pi_rpc::{PiLaunch, PiRpcClient, PiRpcEvent, RpcError};
 use serde_json::{Value, json};
@@ -40,6 +41,7 @@ pub struct RuntimeStart {
     pub environment: HashMap<String, String>,
     pub agent_team_config: AgentTeamConfig,
     pub search_engines: Vec<SearchEngineProfile>,
+    pub search_engine_api_keys: SearchEngineApiKeys,
 }
 
 #[derive(Clone, Debug)]
@@ -236,6 +238,7 @@ impl AgentRuntime for PiRpcRuntime {
             environment: config.environment.clone(),
             team_config: config.agent_team_config,
             search_engines: config.search_engines,
+            search_engine_api_keys: config.search_engine_api_keys,
         })
         .map_err(|error| RuntimeError::AgentSupervisor(error.to_string()))?;
         if let Some(interactions) = supervisor.take_interaction_events() {

@@ -29,11 +29,11 @@ use gpui_component::{
 };
 use pi_whim_core::{
     AgentTeamConfig, AppState, BashPolicy, Language, MAX_AGENT_DEPTH, MAX_AGENTS_PER_LEVEL,
-    ProviderId, ProviderModel, ProviderProtocol, QueueMode, SearchEngineProfile, strings::tr,
+    ProviderId, ProviderModel, ProviderProtocol, QueueMode, SearchEngineKind, SearchEngineProfile,
+    strings::tr,
 };
 use pi_whim_engine::settings::{
     Preset, ProviderDraft, SearchEngineDraft, Section, move_search_engine, remove_search_engine,
-    upsert_search_engine,
 };
 use pi_whim_theme::{Tokens, font, layout, text};
 
@@ -95,6 +95,7 @@ pub enum SettingsEvent {
     NewSearchEngine,
     /// Dismiss the add/edit dialog without storing its draft.
     CloseSearchEngineEditor,
+    SetSearchEngineKind(SearchEngineKind),
     SetSearchEngineEnabled(bool),
     /// Store the whole list, which is how a reorder or a delete is saved too.
     SaveSearchEngines(Vec<SearchEngineProfile>),
@@ -236,14 +237,31 @@ impl Settings {
         };
         let search_fields = web_search::Fields {
             name: cx.new(|cx| InputState::new(window, cx).placeholder("SearXNG")),
+            kind: choice_picker(
+                web_search::kind_choices(&state),
+                search_engine.kind,
+                window,
+                cx,
+            ),
             base_url: cx
                 .new(|cx| InputState::new(window, cx).placeholder("https://search.example")),
+            api_key: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .masked(true)
+                    .placeholder("API Key")
+            }),
         };
 
         // The provider and search-engine drafts are edited into, then saved, so
         // their fields write into the draft rather than emitting.
         Self::watch_draft_fields(&provider_fields, &search_fields, window, cx);
-        Self::watch_choice_fields(&general_fields, &provider_fields, window, cx);
+        Self::watch_choice_fields(
+            &general_fields,
+            &provider_fields,
+            &search_fields,
+            window,
+            cx,
+        );
 
         let mut settings = Self {
             section: Section::default(),
@@ -334,6 +352,17 @@ impl Settings {
             },
         )
         .detach();
+        cx.subscribe_in(
+            &search.api_key,
+            window,
+            |settings, input, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    settings.search_engine.api_key = input.read(cx).value().to_string();
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
     }
 
     /// Route finite-choice dropdowns through the same settings events as the
@@ -341,6 +370,7 @@ impl Settings {
     fn watch_choice_fields(
         general: &general::Fields,
         provider: &providers::Fields,
+        search: &web_search::Fields,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -394,6 +424,12 @@ impl Settings {
             }
         })
         .detach();
+        cx.subscribe_in(&search.kind, window, |_, _, event, _, cx| {
+            if let SelectEvent::Confirm(Some(kind)) = event {
+                cx.emit(SettingsEvent::SetSearchEngineKind(*kind));
+            }
+        })
+        .detach();
     }
 
     pub fn section(&self) -> Section {
@@ -425,12 +461,22 @@ impl Settings {
         let patterns_changed = self.state.bash_blocked_patterns != state.bash_blocked_patterns;
         let team_changed = self.state.agent_team_config != state.agent_team_config;
         self.state = state.clone();
+        if let Some(id) = self.search_engine.id
+            && let Some(profile) = self
+                .state
+                .search_engine_profiles
+                .iter()
+                .find(|profile| profile.id == id)
+        {
+            self.search_engine.has_api_key = profile.has_api_key;
+        }
 
         // A language change replaces every translated menu label. Other snapshots
         // only move the picker whose domain value changed, so an unrelated stream
         // update cannot reset keyboard focus in an open menu.
         if language_changed {
             self.seed_general_choices(window, cx);
+            self.seed_search_kind(window, cx);
         } else {
             if bash_policy_changed {
                 sync_choice_selection(
@@ -595,14 +641,20 @@ impl Settings {
         cx.notify();
     }
 
+    /// Change adapter, carrying an untouched default name and endpoint with it.
+    pub fn set_search_engine_kind(
+        &mut self,
+        kind: SearchEngineKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.search_engine.set_kind(kind);
+        self.seed_search_fields(window, cx);
+    }
+
     /// The search-engine draft, for the shell to save.
     pub fn search_engine_draft(&self) -> &SearchEngineDraft {
         &self.search_engine
-    }
-
-    /// The list to store after saving the draft.
-    pub fn search_engines_with_draft(&self) -> Vec<SearchEngineProfile> {
-        upsert_search_engine(&self.state.search_engine_profiles, &self.search_engine)
     }
 
     /// The list to store after dropping the engine at `index`.
@@ -716,6 +768,23 @@ impl Settings {
         self.search_fields
             .base_url
             .update(cx, |input, cx| input.set_value(draft.base_url, window, cx));
+        if draft.api_key.is_empty() {
+            self.search_fields
+                .api_key
+                .update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        self.seed_search_kind(window, cx);
+        cx.notify();
+    }
+
+    fn seed_search_kind(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        sync_choice_picker(
+            &self.search_fields.kind,
+            web_search::kind_choices(&self.state),
+            self.search_engine.kind,
+            window,
+            cx,
+        );
         cx.notify();
     }
 
