@@ -5,19 +5,20 @@
 //! parts that need an `InputState`.
 
 use gpui::{
-    AnyElement, Entity, IntoElement, ParentElement, SharedString, Styled, div,
+    AnyElement, Entity, IntoElement, ParentElement, ScrollHandle, SharedString, Styled, div,
     prelude::FluentBuilder, px,
 };
 use gpui_component::{
-    Disableable, Sizable,
+    Disableable, Icon, Sizable,
     button::{Button, ButtonVariants},
     input::{Input, InputState},
 };
 use pi_whim_core::{AppState, ProviderModel, ProviderProtocol, strings::tr};
 use pi_whim_engine::settings::{Preset, ProviderDraft};
-use pi_whim_theme::{Tokens, font, text};
+use pi_whim_theme::{Tokens, font, radius, text};
 
 use crate::{
+    elements::isolated_vertical_scroll_area_with_scrollbar,
     icons,
     settings::{
         Emit, SettingsEvent,
@@ -26,6 +27,13 @@ use crate::{
     },
     theme::IntoHsla,
 };
+
+/// Cards wrap at these widths, giving the normal settings measure three
+/// provider columns and two wider model columns without a breakpoint system.
+const PROVIDER_CARD_MIN_WIDTH: f32 = 210.0;
+const MODEL_CELL_MIN_WIDTH: f32 = 300.0;
+const CARD_HEIGHT: f32 = 64.0;
+const MODEL_GRID_MAX_HEIGHT: f32 = 316.0;
 
 /// The typed fields on this page.
 pub struct Fields {
@@ -43,6 +51,7 @@ pub fn render(
     state: &AppState,
     draft: &ProviderDraft,
     fields: &Fields,
+    model_scroll: &ScrollHandle,
     tokens: Tokens,
     emit: Emit,
 ) -> AnyElement {
@@ -62,7 +71,7 @@ pub fn render(
                 tr(state, "configured-providers"),
                 None,
                 tokens,
-                vec![provider_list(state, draft, tokens, emit.clone())],
+                vec![provider_grid(state, draft, tokens, emit.clone())],
             ),
             // Where the key ends up is worth saying next to the field that takes
             // it: a reader typing a secret into a form wants to know it is not
@@ -85,7 +94,7 @@ pub fn render(
                 tokens,
                 vec![
                     model_tools(state, draft, fields, tokens, emit.clone()),
-                    model_list(state, draft, tokens, emit.clone()),
+                    model_grid(state, draft, model_scroll, tokens, emit.clone()),
                     save_row(state, draft, tokens, emit),
                 ],
             ),
@@ -98,76 +107,124 @@ fn field(state: &Entity<InputState>) -> AnyElement {
     Input::new(state).w_full().into_any_element()
 }
 
-/// The stored providers, plus a way to start a new one.
-fn provider_list(
+/// Stored providers are peers, so they use the whole content measure rather
+/// than being squeezed into the form's right-hand control column.
+fn provider_grid(
     state: &AppState,
     draft: &ProviderDraft,
     tokens: Tokens,
     emit: Emit,
 ) -> AnyElement {
-    let rows: Vec<AnyElement> = state
+    let cards: Vec<AnyElement> = state
         .provider_profiles
         .iter()
-        .enumerate()
-        .map(|(index, profile)| {
+        .map(|profile| {
             let selected = draft.id == Some(profile.id);
             let id = profile.id;
             let emit = emit.clone();
-            div()
+            let subtitle = format!(
+                "{}  ·  {} {}",
+                profile.protocol.label(),
+                profile.models.len(),
+                tr(state, "models")
+            );
+            Button::new(profile.id)
                 .w_full()
-                .flex()
-                .flex_col()
-                .gap(px(2.0))
-                .py(px(3.0))
-                .child(
-                    Button::new(("provider", index as u64))
-                        .label(SharedString::from(profile.name.clone()))
-                        .when(selected, |button| button.primary())
-                        .when(!selected, |button| button.ghost())
-                        .small()
-                        .on_click(move |_, window, cx| {
-                            emit(SettingsEvent::SelectProvider(id), window, cx)
-                        }),
-                )
+                .min_w(px(PROVIDER_CARD_MIN_WIDTH))
+                .flex_1()
+                .flex_basis(px(PROVIDER_CARD_MIN_WIDTH))
+                .h(px(CARD_HEIGHT))
+                .px(px(10.0))
+                .border_1()
+                .border_color(if selected {
+                    tokens.accent_border_strong().hsla()
+                } else {
+                    tokens.line.hsla()
+                })
+                .bg(if selected {
+                    tokens.accent_surface_subtle().hsla()
+                } else {
+                    tokens.control_background().hsla()
+                })
                 .child(
                     div()
                         .w_full()
                         .min_w_0()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .font_family(font::MONO)
-                        .text_size(px(text::LABEL_SIZE))
-                        .text_color(tokens.muted.hsla())
-                        .child(SharedString::from(profile.base_url.clone())),
+                        .flex()
+                        .items_center()
+                        .gap(px(9.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.0))
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .text_size(px(text::DETAIL_SIZE))
+                                        .text_color(tokens.text.hsla())
+                                        .child(SharedString::from(profile.name.clone())),
+                                )
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .font_family(font::MONO)
+                                        .text_size(px(text::LABEL_SIZE))
+                                        .text_color(tokens.muted.hsla())
+                                        .child(SharedString::from(subtitle)),
+                                ),
+                        ),
                 )
+                .on_click(move |_, window, cx| emit(SettingsEvent::SelectProvider(id), window, cx))
                 .into_any_element()
         })
         .collect();
 
-    let empty = rows.is_empty();
-    form::control_row(
-        div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap(px(4.0))
-            .children(rows)
-            .when(empty, |this| {
-                this.child(form::help_text(tr(state, "no-providers"), tokens))
-            })
-            .child(
-                div().flex().justify_end().pt(px(6.0)).child(
-                    Button::new("add-provider")
-                        .label(tr(state, "add-provider"))
-                        .outline()
-                        .small()
-                        .on_click(move |_, window, cx| {
-                            emit(SettingsEvent::NewProvider, window, cx)
-                        }),
-                ),
-            ),
-    )
+    let empty = cards.is_empty();
+    div()
+        .w_full()
+        .flex()
+        .flex_wrap()
+        .gap(px(8.0))
+        .children(cards)
+        .when(empty, |this| {
+            this.child(
+                div()
+                    .flex_1()
+                    .min_w(px(PROVIDER_CARD_MIN_WIDTH))
+                    .flex_basis(px(PROVIDER_CARD_MIN_WIDTH))
+                    .h(px(CARD_HEIGHT))
+                    .flex()
+                    .items_center()
+                    .px(px(12.0))
+                    .border_1()
+                    .border_color(tokens.line.hsla())
+                    .text_size(px(text::LABEL_SIZE))
+                    .text_color(tokens.muted.hsla())
+                    .child(tr(state, "no-providers")),
+            )
+        })
+        .child(
+            Button::new("add-provider")
+                .w_full()
+                .min_w(px(PROVIDER_CARD_MIN_WIDTH))
+                .flex_1()
+                .flex_basis(px(PROVIDER_CARD_MIN_WIDTH))
+                .h(px(CARD_HEIGHT))
+                .icon(icons::add())
+                .label(tr(state, "add-provider"))
+                .outline()
+                .on_click(move |_, window, cx| emit(SettingsEvent::NewProvider, window, cx)),
+        )
+        .into_any_element()
 }
 
 fn preset_row(state: &AppState, fields: &Fields, tokens: Tokens) -> AnyElement {
@@ -257,15 +314,24 @@ fn model_tools(
 ) -> AnyElement {
     let can_discover = draft.can_discover();
     let discover = emit.clone();
-    form::control_row(
-        div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap(px(8.0))
-            .child(
-                div().flex().justify_end().child(
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(7.0))
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(form::help_text(
+                    format!("{} · {}", tr(state, "models"), draft.models.len()),
+                    tokens,
+                ))
+                .child(
                     Button::new("discover-models")
+                        .icon(icons::search())
                         .label(tr(state, "discover-models"))
                         .outline()
                         .small()
@@ -274,52 +340,80 @@ fn model_tools(
                             discover(SettingsEvent::DiscoverModels, window, cx)
                         }),
                 ),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .gap(px(form::INLINE_GAP))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(Input::new(&fields.model_id).w_full()),
-                    )
-                    .child(
-                        Button::new("add-model")
-                            .label(tr(state, "add-model"))
-                            .outline()
-                            .small()
-                            .on_click(move |_, window, cx| {
-                                emit(SettingsEvent::AddManualModel, window, cx)
-                            }),
-                    ),
-            )
-            .child(form::help_text(tr(state, "model-id"), tokens)),
-    )
+        )
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .gap(px(form::INLINE_GAP))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(Input::new(&fields.model_id).w_full()),
+                )
+                .child(
+                    Button::new("add-model")
+                        .label(tr(state, "add-model"))
+                        .outline()
+                        .small()
+                        .on_click(move |_, window, cx| {
+                            emit(SettingsEvent::AddManualModel, window, cx)
+                        }),
+                ),
+        )
+        .child(form::help_text(tr(state, "model-id"), tokens))
+        .into_any_element()
 }
 
-/// The draft's models, each removable.
-fn model_list(state: &AppState, draft: &ProviderDraft, tokens: Tokens, emit: Emit) -> AnyElement {
-    if draft.models.is_empty() {
-        return form::control_row(form::help_text(tr(state, "no-models"), tokens));
-    }
-    form::control_row(div().w_full().flex().flex_col().gap(px(2.0)).children(
-        draft.models.iter().enumerate().map(|(index, model)| {
-            model_row(index, model, tr(state, "remove"), tokens, emit.clone())
-        }),
-    ))
-}
-
-fn model_row(
-    index: usize,
-    model: &ProviderModel,
-    remove_label: &'static str,
+/// Models use a wrapping two-column table: each cell keeps the same internal
+/// columns, while the outer grid contracts to one column on a narrow window.
+fn model_grid(
+    state: &AppState,
+    draft: &ProviderDraft,
+    scroll: &ScrollHandle,
     tokens: Tokens,
     emit: Emit,
 ) -> AnyElement {
+    if draft.models.is_empty() {
+        return div()
+            .w_full()
+            .min_h(px(58.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .border_1()
+            .border_color(tokens.line.hsla())
+            .bg(tokens.control_background().hsla())
+            .child(form::help_text(tr(state, "no-models"), tokens))
+            .into_any_element();
+    }
+    let content = div()
+        .w_full()
+        .pr(px(12.0))
+        .flex()
+        .flex_wrap()
+        .gap(px(1.0))
+        .p(px(1.0))
+        .bg(tokens.line.hsla())
+        .children(
+            draft
+                .models
+                .iter()
+                .map(|model| model_cell(model, state, tokens, emit.clone())),
+        );
+    isolated_vertical_scroll_area_with_scrollbar(
+        "provider-model-grid",
+        "provider-model-grid-scrollbar",
+        scroll,
+        px(MODEL_GRID_MAX_HEIGHT),
+        content,
+    )
+    .into_any_element()
+}
+
+fn model_cell(model: &ProviderModel, state: &AppState, tokens: Tokens, emit: Emit) -> AnyElement {
     let id = model.id.clone();
     // The thinking levels are listed because they are the reason a model is worth
     // picking over another, and they are not inferable from the id.
@@ -329,13 +423,47 @@ fn model_row(
         .map(|level| level.as_str())
         .collect::<Vec<_>>()
         .join(" · ");
+    let capabilities = match (model.reasoning, model.supports_images) {
+        (true, true) => format!(
+            "{} · {} · {levels}",
+            tr(state, "reasoning"),
+            tr(state, "vision")
+        ),
+        (true, false) => format!("{} · {levels}", tr(state, "reasoning")),
+        (false, true) => tr(state, "vision").to_owned(),
+        (false, false) => tr(state, "basic-model").to_owned(),
+    };
+    let details = if model.name == model.id {
+        capabilities
+    } else {
+        format!("{} · {capabilities}", model.id)
+    };
 
     div()
-        .w_full()
+        .min_w(px(MODEL_CELL_MIN_WIDTH))
+        .flex_1()
+        .flex_basis(px(MODEL_CELL_MIN_WIDTH))
+        .h(px(62.0))
         .flex()
         .items_center()
         .gap(px(form::INLINE_GAP))
-        .py(px(3.0))
+        .px(px(10.0))
+        .bg(tokens.panel.hsla())
+        .child(
+            div()
+                .size(px(28.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(radius::DOT))
+                .bg(tokens.accent_surface_faint().hsla())
+                .child(
+                    Icon::new(icons::model())
+                        .size(px(13.0))
+                        .text_color(tokens.accent.hsla()),
+                ),
+        )
         .child(
             div()
                 .flex_1()
@@ -355,17 +483,22 @@ fn model_row(
                 )
                 .child(
                     div()
+                        .w_full()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .font_family(font::MONO)
                         .text_size(px(text::LABEL_SIZE))
                         .text_color(tokens.muted.hsla())
-                        .child(SharedString::from(levels)),
+                        .child(SharedString::from(details)),
                 ),
         )
         .child(
-            Button::new(("remove-model", index as u64))
+            Button::new(SharedString::from(format!("remove-model:{}", model.id)))
                 .icon(icons::close())
                 .ghost()
                 .xsmall()
-                .tooltip(remove_label)
+                .tooltip(tr(state, "remove"))
                 .on_click(move |_, window, cx| {
                     emit(SettingsEvent::RemoveModel(id.clone()), window, cx)
                 }),
@@ -378,34 +511,48 @@ fn save_row(state: &AppState, draft: &ProviderDraft, tokens: Tokens, emit: Emit)
     let can_save = draft.can_save(&state.provider_profiles);
     let saved = draft.id;
     let save = emit.clone();
-    form::control_row(
-        div()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap(px(form::INLINE_GAP))
-            .pt(px(6.0))
-            .child(
-                Button::new("save-provider")
-                    .label(tr(state, "save-provider"))
-                    .primary()
+    div()
+        .w_full()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .justify_end()
+        .gap(px(form::INLINE_GAP))
+        .pt(px(8.0))
+        .child(
+            Button::new("save-provider")
+                .label(tr(state, "save-provider"))
+                .primary()
+                .small()
+                .disabled(!can_save)
+                .on_click(move |_, window, cx| save(SettingsEvent::SaveProvider, window, cx)),
+        )
+        .when_some(saved, |this, id| {
+            this.child(
+                Button::new("delete-provider")
+                    .label(tr(state, "remove"))
+                    .danger()
                     .small()
-                    .disabled(!can_save)
-                    .on_click(move |_, window, cx| save(SettingsEvent::SaveProvider, window, cx)),
+                    .on_click(move |_, window, cx| {
+                        emit(SettingsEvent::DeleteProvider(id), window, cx)
+                    }),
             )
-            .when_some(saved, |this, id| {
-                this.child(
-                    Button::new("delete-provider")
-                        .label(tr(state, "remove"))
-                        .danger()
-                        .small()
-                        .on_click(move |_, window, cx| {
-                            emit(SettingsEvent::DeleteProvider(id), window, cx)
-                        }),
-                )
-            })
-            .when(!can_save, |this| {
-                this.child(form::help_text(tr(state, "provider-incomplete"), tokens))
-            }),
-    )
+        })
+        .when(!can_save, |this| {
+            this.child(form::help_text(tr(state, "provider-incomplete"), tokens))
+        })
+        .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normal_settings_width_fits_dense_provider_and_model_grids() {
+        // The settings body applies 28px on each side inside its width cap.
+        let usable = form::CONTENT_WIDTH - 56.0;
+        assert!(usable >= PROVIDER_CARD_MIN_WIDTH * 3.0 + 16.0);
+        assert!(usable >= MODEL_CELL_MIN_WIDTH * 2.0 + 1.0);
+    }
 }

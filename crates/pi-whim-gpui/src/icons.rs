@@ -59,6 +59,11 @@ pub fn search() -> IconName {
     IconName::Search
 }
 
+/// One model offered by a provider.
+pub fn model() -> IconName {
+    IconName::Bot
+}
+
 /// Send the drafted prompt.
 pub fn send() -> IconName {
     IconName::ArrowUp

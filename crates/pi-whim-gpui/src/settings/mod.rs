@@ -142,6 +142,7 @@ pub struct Settings {
     provider_fields: providers::Fields,
     search_fields: web_search::Fields,
     scroll: ScrollHandle,
+    model_scroll: ScrollHandle,
 }
 
 impl EventEmitter<SettingsEvent> for Settings {}
@@ -294,6 +295,7 @@ impl Settings {
             provider_fields,
             search_fields,
             scroll: ScrollHandle::new(),
+            model_scroll: ScrollHandle::new(),
         };
         settings.seed_fields(window, cx);
         settings
@@ -550,12 +552,14 @@ impl Settings {
             return;
         };
         self.provider = ProviderDraft::from_profile(profile);
+        self.model_scroll.set_offset(point(px(0.0), px(0.0)));
         self.seed_provider_fields(window, cx);
     }
 
     /// Start a provider that has not been saved.
     pub fn new_provider(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.provider = ProviderDraft::default();
+        self.model_scroll.set_offset(point(px(0.0), px(0.0)));
         self.seed_provider_fields(window, cx);
     }
 
@@ -591,6 +595,7 @@ impl Settings {
     /// Replace the draft's models with what discovery found.
     pub fn set_discovered_models(&mut self, models: Vec<ProviderModel>, cx: &mut Context<Self>) {
         self.provider.models = models;
+        self.model_scroll.set_offset(point(px(0.0), px(0.0)));
         cx.notify();
     }
 
@@ -971,6 +976,7 @@ impl Render for Settings {
                 &self.state,
                 &self.provider,
                 &self.provider_fields,
+                &self.model_scroll,
                 tokens,
                 emit,
             ),

@@ -8,9 +8,10 @@
 //! vertical overflow, including after it reaches either boundary.
 
 use gpui::{
-    App, Div, ElementId, InteractiveElement, ScrollHandle, Stateful, StatefulInteractiveElement,
-    Styled, div, px,
+    App, Div, ElementId, InteractiveElement, IntoElement, ParentElement, Pixels, ScrollHandle,
+    Stateful, StatefulInteractiveElement, Styled, div, px,
 };
+use gpui_component::scroll::{Scrollbar, ScrollbarShow};
 
 /// A wrapper that leaves scrolling to its child but consumes any unhandled
 /// vertical wheel event while that child has overflow.
@@ -63,35 +64,50 @@ pub fn isolated_vertical_scroll_area(
         })
 }
 
-/// A non-scrolling surface that still owns wheel input while `scroll_handle`
-/// reports overflow.
+/// A bounded viewport with a fixed overlay scrollbar and isolated wheel input.
 ///
-/// This is useful when the caller needs to render an explicit scrollbar or a
-/// custom content mask and therefore cannot use the native overflow style.
-pub fn isolated_manual_vertical_scroll_area(
+/// The scrollbar must be a sibling of the tracked content layer. Putting it
+/// inside that layer applies the content offset to its own track, so the thumb
+/// appears frozen even though the content moves.
+pub fn isolated_vertical_scroll_area_with_scrollbar(
     id: impl Into<ElementId>,
+    scrollbar_id: impl Into<ElementId>,
     scroll_handle: &ScrollHandle,
+    max_height: Pixels,
+    content: impl IntoElement,
 ) -> Stateful<Div> {
     let wheel_scroll = scroll_handle.clone();
+    let id = id.into();
 
     div()
-        .id(id)
+        .id(id.clone())
         .relative()
         .w_full()
+        .max_h(max_height)
         .overflow_hidden()
-        .track_scroll(scroll_handle)
         .on_scroll_wheel(move |event, window, cx| {
             let delta = event.delta.pixel_delta(window.line_height()).y;
-            if delta == px(0.0) || wheel_scroll.max_offset().y <= px(0.0) {
-                return;
+            if delta != px(0.0) && wheel_scroll.max_offset().y > px(0.0) {
+                // The child viewport performs the native scroll first. The
+                // shell only owns the bubble phase so boundaries cannot leak
+                // into a parent transcript or settings page.
+                cx.stop_propagation();
             }
-
-            let mut offset = wheel_scroll.offset();
-            offset.y += delta;
-            wheel_scroll.set_offset(offset);
-            window.refresh();
-            cx.stop_propagation();
         })
+        .child(
+            div()
+                .id((id, "viewport"))
+                .w_full()
+                .max_h(max_height)
+                .overflow_y_scroll()
+                .track_scroll(scroll_handle)
+                .child(content),
+        )
+        .child(
+            Scrollbar::vertical(scroll_handle)
+                .id(scrollbar_id)
+                .scrollbar_show(ScrollbarShow::Always),
+        )
 }
 
 #[cfg(test)]
@@ -141,8 +157,21 @@ mod tests {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             let inner = if self.native {
                 isolated_vertical_scroll_area("nested-inner-scroll", &self.inner)
+                    .h(px(50.0))
+                    .flex_none()
+                    .children((0..self.inner_items).map(|_| div().h(px(40.0)).flex_none()))
             } else {
-                isolated_manual_vertical_scroll_area("nested-inner-scroll", &self.inner)
+                isolated_vertical_scroll_area_with_scrollbar(
+                    "nested-inner-scroll",
+                    "nested-inner-scrollbar",
+                    &self.inner,
+                    px(50.0),
+                    div()
+                        .w_full()
+                        .children((0..self.inner_items).map(|_| div().h(px(40.0)).flex_none())),
+                )
+                .h(px(50.0))
+                .flex_none()
             };
 
             div()
@@ -153,13 +182,7 @@ mod tests {
                 .flex_col()
                 .overflow_y_scroll()
                 .track_scroll(&self.outer)
-                .child(
-                    inner
-                        .h(px(50.0))
-                        .flex_none()
-                        .children((0..self.inner_items).map(|_| div().h(px(40.0)).flex_none()))
-                        .debug_selector(|| "nested-scroll-area".to_owned()),
-                )
+                .child(inner.debug_selector(|| "nested-scroll-area".to_owned()))
                 .child(div().h(px(200.0)).flex_none())
         }
     }
