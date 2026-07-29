@@ -22,7 +22,7 @@ use pi_whim_engine::slash_commands::{
 };
 use pi_whim_theme::{Tokens, text};
 
-use crate::{icons, theme::IntoHsla};
+use crate::{elements::isolated_vertical_scroll_area, icons, theme::IntoHsla};
 
 /// Width of the panel, and how tall the list grows before it scrolls.
 const PALETTE_WIDTH: f32 = 700.0;
@@ -266,11 +266,8 @@ impl Render for Palette {
                     ),
             )
             .child(
-                div()
-                    .id("palette-rows")
+                isolated_vertical_scroll_area("palette-rows", &self.scroll)
                     .max_h(px(PALETTE_MAX_HEIGHT))
-                    .overflow_y_scroll()
-                    .track_scroll(&self.scroll)
                     .children(self.options.iter().enumerate().map(|(index, option)| {
                         let is_selected = index == selection;
                         div()

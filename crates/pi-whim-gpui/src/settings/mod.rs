@@ -18,9 +18,8 @@ pub mod web_search;
 use std::rc::Rc;
 
 use gpui::{
-    App, AppContext, Context, Entity, EventEmitter, InteractiveElement, IntoElement, ParentElement,
-    Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Window, div, point,
-    prelude::FluentBuilder, px,
+    App, AppContext, Context, Entity, EventEmitter, IntoElement, ParentElement, Render,
+    ScrollHandle, SharedString, Styled, Window, div, point, prelude::FluentBuilder, px,
 };
 use gpui_component::{
     IndexPath, Sizable,
@@ -38,7 +37,7 @@ use pi_whim_engine::settings::{
 };
 use pi_whim_theme::{Tokens, font, layout, text};
 
-use crate::theme::IntoHsla;
+use crate::{elements::isolated_vertical_scroll_area, theme::IntoHsla};
 use dropdown::{Choice, ChoiceState};
 
 /// Width of the section list.
@@ -810,11 +809,8 @@ impl Render for Settings {
             .child(self.render_nav(cx))
             .child(
                 div().flex_1().h_full().overflow_hidden().child(
-                    div()
-                        .id("settings-body")
+                    isolated_vertical_scroll_area("settings-body", &self.scroll)
                         .size_full()
-                        .overflow_y_scroll()
-                        .track_scroll(&self.scroll)
                         .child(
                             // Centred and width-limited: a form field spanning
                             // a wide window loses the eye between the label

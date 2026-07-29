@@ -1,8 +1,8 @@
 //! A tool invocation with two independent levels of disclosure.
 
 use gpui::{
-    App, Entity, InteractiveElement, IntoElement, ParentElement, RenderOnce, ScrollHandle,
-    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
+    App, Entity, IntoElement, ParentElement, RenderOnce, ScrollHandle, Styled, Window, div,
+    prelude::FluentBuilder, px,
 };
 use gpui_component::{
     Icon,
@@ -16,6 +16,7 @@ use crate::{
         Conversation, ConversationEvent, message_card::opaque_over,
         message_disclosure::disclosure_button,
     },
+    elements::isolated_manual_vertical_scroll_area,
     icons,
     theme::IntoHsla,
 };
@@ -154,23 +155,20 @@ impl RenderOnce for ToolCard {
             .when(self.report_expanded, |this| {
                 this.when_some(self.message.tool_report, |this, report| {
                     this.child(
-                        div()
-                            .id(("tool-report", self.index))
-                            .relative()
-                            .w_full()
-                            .max_h(px(TOOL_REPORT_MAX_HEIGHT))
-                            .overflow_y_scroll()
-                            .overflow_x_hidden()
-                            .track_scroll(&report_scroll)
-                            .pr(px(18.0))
-                            .text_size(px(text::MONO_DETAIL_SIZE))
-                            .text_color(tokens.muted.hsla())
-                            .child(report)
-                            .child(
-                                Scrollbar::vertical(&report_scroll)
-                                    .id(("tool-report-scrollbar", self.index))
-                                    .scrollbar_show(ScrollbarShow::Always),
-                            ),
+                        isolated_manual_vertical_scroll_area(
+                            ("tool-report", self.index),
+                            &report_scroll,
+                        )
+                        .max_h(px(TOOL_REPORT_MAX_HEIGHT))
+                        .pr(px(18.0))
+                        .text_size(px(text::MONO_DETAIL_SIZE))
+                        .text_color(tokens.muted.hsla())
+                        .child(report)
+                        .child(
+                            Scrollbar::vertical(&report_scroll)
+                                .id(("tool-report-scrollbar", self.index))
+                                .scrollbar_show(ScrollbarShow::Always),
+                        ),
                     )
                 })
                 .when_some(self.message.tool_details, |this, details| {
@@ -191,32 +189,29 @@ impl RenderOnce for ToolCard {
                             ))
                             .when(self.details_expanded, |this| {
                                 this.child(
-                                    div()
-                                        .id(("raw-tool-details", self.index))
-                                        .relative()
-                                        .w_full()
-                                        .max_h(px(RAW_DETAILS_MAX_HEIGHT))
-                                        .overflow_y_scroll()
-                                        .overflow_x_hidden()
-                                        .track_scroll(&raw_scroll)
-                                        .pl(px(6.0))
-                                        .pr(px(18.0))
-                                        .py(px(6.0))
-                                        .bg(opaque_over(tokens.panel_soft, tokens))
-                                        .font_family(font::MONO)
-                                        .text_size(px(text::MONO_DETAIL_SIZE))
-                                        .text_color(tokens.muted.hsla())
-                                        .child(details)
-                                        // Raw JSON is diagnostic content: its
-                                        // bounded height is otherwise mistaken
-                                        // for truncation. Keep the thumb visible
-                                        // even when macOS hides ordinary system
-                                        // scrollbars until scrolling begins.
-                                        .child(
-                                            Scrollbar::vertical(&raw_scroll)
-                                                .id(("raw-tool-scrollbar", self.index))
-                                                .scrollbar_show(ScrollbarShow::Always),
-                                        ),
+                                    isolated_manual_vertical_scroll_area(
+                                        ("raw-tool-details", self.index),
+                                        &raw_scroll,
+                                    )
+                                    .max_h(px(RAW_DETAILS_MAX_HEIGHT))
+                                    .pl(px(6.0))
+                                    .pr(px(18.0))
+                                    .py(px(6.0))
+                                    .bg(opaque_over(tokens.panel_soft, tokens))
+                                    .font_family(font::MONO)
+                                    .text_size(px(text::MONO_DETAIL_SIZE))
+                                    .text_color(tokens.muted.hsla())
+                                    .child(details)
+                                    // Raw JSON is diagnostic content: its
+                                    // bounded height is otherwise mistaken
+                                    // for truncation. Keep the thumb visible
+                                    // even when macOS hides ordinary system
+                                    // scrollbars until scrolling begins.
+                                    .child(
+                                        Scrollbar::vertical(&raw_scroll)
+                                            .id(("raw-tool-scrollbar", self.index))
+                                            .scrollbar_show(ScrollbarShow::Always),
+                                    ),
                                 )
                             }),
                     )

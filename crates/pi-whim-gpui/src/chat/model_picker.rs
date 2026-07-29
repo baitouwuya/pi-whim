@@ -21,6 +21,7 @@ use pi_whim_theme::{Tokens, text};
 
 use crate::{
     chat::dropdown::{DROPDOWN_ROW_HEIGHT, dropdown_panel, dropdown_trigger},
+    elements::isolated_vertical_scroll_area,
     icons,
     theme::IntoHsla,
 };
@@ -416,11 +417,8 @@ impl ModelPicker {
                     ),
             )
             .child(
-                div()
-                    .id("model-picker-rows")
+                isolated_vertical_scroll_area("model-picker-rows", &self.scroll)
                     .max_h(px(LIST_MAX_HEIGHT))
-                    .overflow_y_scroll()
-                    .track_scroll(&self.scroll)
                     .when(self.visible.is_empty(), |rows| {
                         rows.child(
                             div()
