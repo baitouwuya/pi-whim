@@ -15,11 +15,14 @@ use pi_whim_core::{
 };
 use pi_whim_theme::Tokens;
 
+use crate::elements::isolated_vertical_wheel_region;
 use crate::settings::{
     Emit, SettingsEvent,
     dropdown::{self, Choice, ChoiceState},
     form, toggle,
 };
+
+pub(super) const BLOCKED_PATTERN_ROWS: usize = 3;
 
 /// The typed fields on this page.
 ///
@@ -124,12 +127,18 @@ pub fn render_execution(
 /// explicit button below crosses the application boundary.
 fn blocked_patterns_control(fields: &Fields, emit: Emit, language: Language) -> AnyElement {
     let field = fields.blocked_patterns.clone();
+    let overflow_field = field.clone();
     div()
         .w_full()
         .flex()
         .flex_col()
         .gap(px(6.0))
-        .child(Input::new(&field).w_full().h(px(72.0)))
+        .child(
+            isolated_vertical_wheel_region("blocked-patterns-scroll", move |cx| {
+                overflow_field.read(cx).value().split('\n').count() > BLOCKED_PATTERN_ROWS
+            })
+            .child(Input::new(&field).w_full().h(px(72.0))),
+        )
         .child(
             div().flex().justify_end().child(
                 Button::new("apply-blocked-patterns")

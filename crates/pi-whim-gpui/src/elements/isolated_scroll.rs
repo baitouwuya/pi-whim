@@ -8,9 +8,31 @@
 //! vertical overflow, including after it reaches either boundary.
 
 use gpui::{
-    Div, ElementId, InteractiveElement, ScrollHandle, Stateful, StatefulInteractiveElement, Styled,
-    div, px,
+    App, Div, ElementId, InteractiveElement, ScrollHandle, Stateful, StatefulInteractiveElement,
+    Styled, div, px,
 };
+
+/// A wrapper that leaves scrolling to its child but consumes any unhandled
+/// vertical wheel event while that child has overflow.
+///
+/// Components with their own scroll implementation commonly propagate at the
+/// top and bottom boundary. Put one inside this wrapper and report whether it
+/// has overflow; ordinary, non-scrollable content still leaves the wheel event
+/// to its parent.
+pub fn isolated_vertical_wheel_region(
+    id: impl Into<ElementId>,
+    has_vertical_overflow: impl Fn(&App) -> bool + 'static,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .w_full()
+        .on_scroll_wheel(move |event, window, cx| {
+            let delta = event.delta.pixel_delta(window.line_height()).y;
+            if delta != px(0.0) && has_vertical_overflow(cx) {
+                cx.stop_propagation();
+            }
+        })
+}
 
 /// A vertically scrollable viewport that consumes wheel input while it has
 /// vertical overflow.
@@ -76,8 +98,8 @@ pub fn isolated_manual_vertical_scroll_area(
 mod tests {
     use super::*;
     use gpui::{
-        Context, IntoElement, ParentElement, Render, ScrollDelta, ScrollWheelEvent, TestAppContext,
-        VisualTestContext, Window, point,
+        Context, IntoElement, ParentElement, Pixels, Render, ScrollDelta, ScrollWheelEvent,
+        TestAppContext, VisualTestContext, Window, point,
     };
 
     struct NestedScrollHarness {
@@ -85,6 +107,34 @@ mod tests {
         outer: ScrollHandle,
         native: bool,
         inner_items: usize,
+    }
+
+    struct BoundaryWheelHarness {
+        outer: ScrollHandle,
+        nested_has_overflow: bool,
+    }
+
+    impl Render for BoundaryWheelHarness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let nested_has_overflow = self.nested_has_overflow;
+            div()
+                .id("boundary-wheel-outer")
+                .w(px(100.0))
+                .h(px(100.0))
+                .flex()
+                .flex_col()
+                .overflow_y_scroll()
+                .track_scroll(&self.outer)
+                .child(
+                    isolated_vertical_wheel_region("boundary-wheel-region", move |_| {
+                        nested_has_overflow
+                    })
+                    .h(px(50.0))
+                    .flex_none()
+                    .debug_selector(|| "boundary-wheel-region".to_owned()),
+                )
+                .child(div().h(px(200.0)).flex_none())
+        }
     }
 
     impl Render for NestedScrollHarness {
@@ -236,5 +286,42 @@ mod tests {
 
         assert_eq!(inner.offset().y, px(0.0));
         assert!(outer.offset().y < px(0.0));
+    }
+
+    fn boundary_wheel_result(cx: &mut TestAppContext, nested_has_overflow: bool) -> Pixels {
+        cx.update(gpui_component::init);
+        let outer = ScrollHandle::new();
+        let (_, cx) = cx.add_window_view({
+            let outer = outer.clone();
+            move |_, _| BoundaryWheelHarness {
+                outer: outer.clone(),
+                nested_has_overflow,
+            }
+        });
+        let cx: &mut VisualTestContext = cx;
+        draw(cx);
+        let bounds = cx
+            .debug_bounds("boundary-wheel-region")
+            .expect("wheel region bounds");
+
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(bounds.left() + px(25.0), bounds.top() + px(25.0)),
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-40.0))),
+            ..Default::default()
+        });
+        draw(cx);
+        outer.offset().y
+    }
+
+    #[gpui::test]
+    fn child_owned_overflow_consumes_a_boundary_wheel_event(cx: &mut TestAppContext) {
+        assert_eq!(boundary_wheel_result(cx, true), px(0.0));
+    }
+
+    #[gpui::test]
+    fn child_without_overflow_leaves_the_boundary_wheel_event_to_its_parent(
+        cx: &mut TestAppContext,
+    ) {
+        assert!(boundary_wheel_result(cx, false) < px(0.0));
     }
 }

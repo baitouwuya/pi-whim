@@ -181,6 +181,11 @@ impl Settings {
                     // Multi-line, because the patterns are a list and a
                     // comma-separated single line hides which one is malformed.
                     .multi_line(true)
+                    .rows(general::BLOCKED_PATTERN_ROWS)
+                    // Each pattern is one logical row. Keeping wrapping off lets
+                    // the wheel boundary use that row count as an exact overflow
+                    // signal instead of guessing from text width.
+                    .soft_wrap(false)
                     .placeholder("rm -rf /")
             }),
             max_depth: cx.new(|cx| {
