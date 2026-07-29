@@ -122,6 +122,8 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ("cancel", "Cancel", "取消"),
     ("save-search-engine", "Save search engine", "保存搜索引擎"),
     ("test-search-engine", "Test connection", "测试连接"),
+    ("testing-connection", "Testing…", "测试中…"),
+    ("connection-ok", "Connected", "连接成功"),
     (
         "providers-help",
         "Configure model providers used by Pi.",

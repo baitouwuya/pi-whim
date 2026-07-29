@@ -26,6 +26,9 @@ use crate::{
     },
 };
 
+const EMPTY_PROVIDER_RESPONSE: &str =
+    "The provider returned an empty response. Retry the request or switch models.";
+
 /// Work the translation cannot do itself.
 ///
 /// Each of these needs something the translation deliberately has no handle on:
@@ -134,21 +137,10 @@ pub fn translate(event: &Value, context: Context<'_>, turn: &mut Turn) -> Outcom
                     to: id.clone(),
                 });
             }
-            outcome.act(Action::UpsertConversation(ConversationItem {
-                id,
-                role: ConversationRole::Assistant,
-                full_text: assistant_text(&message),
-                streaming: true,
-                tool_name: None,
-                tool_report: None,
-                tool_details: None,
-                is_error: false,
-                model: message
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                attachments: Vec::new(),
-            }));
+            let text = assistant_text(&message);
+            outcome.act(Action::UpsertConversation(assistant_item(
+                &message, id, text, true, false,
+            )));
         }
 
         Some("message_end")
@@ -158,13 +150,31 @@ pub fn translate(event: &Value, context: Context<'_>, turn: &mut Turn) -> Outcom
                 .and_then(Value::as_str)
                 == Some("assistant") =>
         {
+            let message = event.get("message").unwrap_or(&Value::Null);
+            let empty_response = empty_successful_assistant(message);
             // Left in place for a background session: whichever event ends its
             // turn will clear it, and until then the id is what a resumed
             // stream appends to.
             if context.is_active
                 && let Some(id) = turn.assistant_message_id.take()
             {
-                outcome.act(Action::FinishMessage(id));
+                if empty_response {
+                    outcome.act(Action::UpsertConversation(assistant_item(
+                        message,
+                        id,
+                        EMPTY_PROVIDER_RESPONSE.to_owned(),
+                        false,
+                        true,
+                    )));
+                    outcome.act(Action::SetSessionStatus(SessionStatus::Failed(
+                        EMPTY_PROVIDER_RESPONSE.to_owned(),
+                    )));
+                } else {
+                    outcome.act(Action::FinishMessage(id));
+                }
+            }
+            if empty_response {
+                turn.reply_error = Some(EMPTY_PROVIDER_RESPONSE.to_owned());
             }
         }
 
@@ -186,8 +196,13 @@ pub fn translate(event: &Value, context: Context<'_>, turn: &mut Turn) -> Outcom
             turn.running = false;
             outcome.session_running(&context, false);
             outcome.effect(Effect::SyncSessionFile);
+            let reply_error = turn.reply_error.take();
             if context.is_active {
-                outcome.act(Action::SetSessionStatus(SessionStatus::Ready));
+                outcome.act(Action::SetSessionStatus(
+                    reply_error
+                        .map(SessionStatus::Failed)
+                        .unwrap_or(SessionStatus::Ready),
+                ));
                 // The agent's own transcript is the record of the turn; the
                 // streamed entries were a preview of it.
                 outcome.effect(Effect::ReloadEntries);
@@ -378,11 +393,15 @@ pub fn session_entry_action(entry: &Value) -> Option<Action> {
         .get("toolName")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let is_error = message
+    let mut is_error = message
         .get("isError")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let text = match role {
+        ConversationRole::Assistant if empty_successful_assistant(message) => {
+            is_error = true;
+            EMPTY_PROVIDER_RESPONSE.to_owned()
+        }
         ConversationRole::Assistant => assistant_text(message),
         ConversationRole::Tool => {
             tool_result_summary(tool_name.as_deref(), message.get("content"), is_error)
@@ -418,6 +437,51 @@ pub fn session_entry_action(entry: &Value) -> Option<Action> {
             .map(str::to_owned),
         attachments: Vec::new(),
     }))
+}
+
+/// A successful stop with neither visible text nor a tool call is not a reply.
+///
+/// Some OpenAI-compatible gateways emit only a final `finish_reason=stop` chunk.
+/// Pi correctly preserves that wire result, but treating it as success leaves the
+/// reader with no response and no error.
+fn empty_successful_assistant(message: &Value) -> bool {
+    if message.get("stopReason").and_then(Value::as_str) != Some("stop")
+        || !assistant_text(message).trim().is_empty()
+    {
+        return false;
+    }
+    !message
+        .get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|parts| {
+            parts
+                .iter()
+                .any(|part| matches!(part.get("type").and_then(Value::as_str), Some("toolCall")))
+        })
+}
+
+fn assistant_item(
+    message: &Value,
+    id: String,
+    full_text: String,
+    streaming: bool,
+    is_error: bool,
+) -> ConversationItem {
+    ConversationItem {
+        id,
+        role: ConversationRole::Assistant,
+        full_text,
+        streaming,
+        tool_name: None,
+        tool_report: None,
+        tool_details: None,
+        is_error,
+        model: message
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        attachments: Vec::new(),
+    }
 }
 
 /// The compaction card shared by live events and persisted transcript entries.
@@ -726,6 +790,67 @@ mod tests {
 
         assert_eq!(outcome.actions, vec![Action::FinishMessage("m1".into())]);
         assert_eq!(turn.assistant_message_id, None);
+    }
+
+    #[test]
+    fn an_empty_successful_reply_becomes_a_visible_provider_error() {
+        let mut turn = Turn {
+            assistant_message_id: Some("m1".into()),
+            ..Turn::default()
+        };
+        let outcome = translate(
+            &json!({
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "model": "deepseek-v4-flash",
+                    "content": [],
+                    "stopReason": "stop",
+                    "usage": {"input": 0, "output": 0, "totalTokens": 0},
+                }
+            }),
+            active(),
+            &mut turn,
+        );
+
+        let item = upserted(&outcome)[0];
+        assert!(item.is_error);
+        assert!(!item.streaming);
+        assert_eq!(item.full_text, EMPTY_PROVIDER_RESPONSE);
+        assert_eq!(item.model.as_deref(), Some("deepseek-v4-flash"));
+        assert_eq!(
+            status(&outcome),
+            Some(&SessionStatus::Failed(EMPTY_PROVIDER_RESPONSE.into()))
+        );
+        assert_eq!(turn.reply_error.as_deref(), Some(EMPTY_PROVIDER_RESPONSE));
+    }
+
+    #[test]
+    fn settling_does_not_overwrite_an_empty_reply_failure_with_ready() {
+        let mut turn = Turn {
+            running: true,
+            reply_error: Some(EMPTY_PROVIDER_RESPONSE.into()),
+            ..Turn::default()
+        };
+
+        let outcome = translate(&json!({"type": "agent_settled"}), active(), &mut turn);
+
+        assert_eq!(
+            status(&outcome),
+            Some(&SessionStatus::Failed(EMPTY_PROVIDER_RESPONSE.into()))
+        );
+        assert_eq!(turn.reply_error, None);
+    }
+
+    #[test]
+    fn a_tool_call_without_text_is_not_an_empty_reply() {
+        let message = json!({
+            "role": "assistant",
+            "content": [{"type": "toolCall", "id": "t1", "name": "web_search"}],
+            "stopReason": "stop",
+        });
+
+        assert!(!empty_successful_assistant(&message));
     }
 
     #[test]
@@ -1154,6 +1279,26 @@ mod tests {
             session_entry_action(&json!({"message": {"role": "modelChange"}})).is_none(),
             "an unrenderable role should be skipped"
         );
+    }
+
+    #[test]
+    fn replaying_an_empty_successful_reply_keeps_the_error_visible() {
+        let Action::UpsertConversation(item) = session_entry_action(&json!({
+            "id": "empty-reply",
+            "message": {
+                "role": "assistant",
+                "content": [],
+                "stopReason": "stop",
+                "usage": {"input": 0, "output": 0, "totalTokens": 0},
+            }
+        }))
+        .expect("assistant entries are renderable") else {
+            panic!("expected a conversation item");
+        };
+
+        assert_eq!(item.full_text, EMPTY_PROVIDER_RESPONSE);
+        assert!(item.is_error);
+        assert!(!item.streaming);
     }
 
     #[test]

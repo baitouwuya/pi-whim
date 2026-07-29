@@ -157,6 +157,8 @@ pub enum Request {
     TestSearchEngine {
         profile: SearchEngineProfile,
         api_key: Option<String>,
+        /// Whether the result belongs in the open editor or a stored list row.
+        editor: bool,
     },
     /// Ask a provider which models it has.
     DiscoverProviderModels {
@@ -751,10 +753,28 @@ impl Workspace {
                 // so a pass means the saved instance works, not just the typing.
                 let draft = self.settings.read(cx).search_engine_draft().clone();
                 let position = self.state.search_engine_profiles.len() as u32;
+                let profile = draft.to_profile(position);
+                self.settings.update(cx, |settings, cx| {
+                    settings.start_search_engine_test(profile.id, true, cx);
+                });
                 self.request(
                     Request::TestSearchEngine {
-                        profile: draft.to_profile(position),
+                        profile,
                         api_key: draft.typed_api_key(),
+                        editor: true,
+                    },
+                    cx,
+                );
+            }
+            SettingsEvent::QuickTestSearchEngine(profile) => {
+                self.settings.update(cx, |settings, cx| {
+                    settings.start_search_engine_test(profile.id, false, cx);
+                });
+                self.request(
+                    Request::TestSearchEngine {
+                        profile: profile.clone(),
+                        api_key: None,
+                        editor: false,
                     },
                     cx,
                 );
@@ -915,6 +935,20 @@ impl Workspace {
     pub fn search_engine_saved(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.settings.update(cx, |settings, cx| {
             settings.close_search_engine_editor(window, cx)
+        });
+    }
+
+    /// Hand an asynchronous connection-test result back to the control that
+    /// launched it. Stored rows and the editor intentionally keep separate state.
+    pub fn search_engine_test_finished(
+        &mut self,
+        id: pi_whim_core::SearchEngineId,
+        editor: bool,
+        result: Result<(), String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings.update(cx, |settings, cx| {
+            settings.finish_search_engine_test(id, editor, result, cx);
         });
     }
 
@@ -1495,10 +1529,40 @@ mod tests {
         shell
             .update(cx, |workspace, window, cx| {
                 workspace.handle_settings_event(SettingsEvent::TestSearchEngine, window, cx);
+                assert!(matches!(
+                    workspace.take_requests().as_slice(),
+                    [Request::TestSearchEngine { editor: true, .. }]
+                ));
             })
             .expect("the workspace window is open");
 
         assert_eq!(raised.get(), 1);
+    }
+
+    #[gpui::test]
+    async fn a_quick_search_test_targets_the_saved_row(cx: &mut gpui::TestAppContext) {
+        let shell = shell(cx);
+        let profile = SearchEngineProfile::new_doubao_global();
+        let expected = profile.clone();
+
+        shell
+            .update(cx, |workspace, window, cx| {
+                workspace.handle_settings_event(
+                    SettingsEvent::QuickTestSearchEngine(profile),
+                    window,
+                    cx,
+                );
+
+                assert!(matches!(
+                    workspace.take_requests().as_slice(),
+                    [Request::TestSearchEngine {
+                        profile,
+                        api_key: None,
+                        editor: false,
+                    }] if profile == &expected
+                ));
+            })
+            .expect("the workspace window is open");
     }
 
     #[gpui::test]

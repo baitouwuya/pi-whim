@@ -15,7 +15,7 @@ pub mod providers;
 pub mod toggle;
 pub mod web_search;
 
-use std::rc::Rc;
+use std::{collections::BTreeMap, rc::Rc};
 
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, Focusable, IntoElement, ParentElement, Render,
@@ -29,8 +29,8 @@ use gpui_component::{
 };
 use pi_whim_core::{
     AgentTeamConfig, AppState, BashPolicy, Language, MAX_AGENT_DEPTH, MAX_AGENTS_PER_LEVEL,
-    ProviderId, ProviderModel, ProviderProtocol, QueueMode, SearchEngineKind, SearchEngineProfile,
-    strings::tr,
+    ProviderId, ProviderModel, ProviderProtocol, QueueMode, SearchEngineId, SearchEngineKind,
+    SearchEngineProfile, strings::tr,
 };
 use pi_whim_engine::settings::{
     Preset, ProviderDraft, SearchEngineDraft, Section, move_search_engine, remove_search_engine,
@@ -52,6 +52,21 @@ pub const NAV_WIDTH: f32 = layout::SIDEBAR_WIDTH;
 /// functions returning `AnyElement` — a section builds dozens of handlers, and
 /// each one needs its own clone.
 pub type Emit = Rc<dyn Fn(SettingsEvent, &mut Window, &mut App)>;
+
+/// Visible state for one connection test. Results stay local to settings; the
+/// configured engine profile remains pure persisted metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SearchEngineTestStatus {
+    Testing,
+    Succeeded,
+    Failed(String),
+}
+
+impl SearchEngineTestStatus {
+    pub fn is_testing(&self) -> bool {
+        matches!(self, Self::Testing)
+    }
+}
 
 /// What the settings page asks the shell to do.
 ///
@@ -101,6 +116,7 @@ pub enum SettingsEvent {
     SaveSearchEngines(Vec<SearchEngineProfile>),
     SaveSearchEngine,
     TestSearchEngine,
+    QuickTestSearchEngine(SearchEngineProfile),
     RemoveSearchEngine(usize),
     MoveSearchEngine {
         index: usize,
@@ -120,6 +136,8 @@ pub struct Settings {
     provider: ProviderDraft,
     search_engine: SearchEngineDraft,
     search_engine_editor_open: bool,
+    editor_search_test: Option<SearchEngineTestStatus>,
+    search_engine_tests: BTreeMap<SearchEngineId, SearchEngineTestStatus>,
     general_fields: general::Fields,
     provider_fields: providers::Fields,
     search_fields: web_search::Fields,
@@ -270,6 +288,8 @@ impl Settings {
             provider,
             search_engine,
             search_engine_editor_open: false,
+            editor_search_test: None,
+            search_engine_tests: BTreeMap::new(),
             general_fields,
             provider_fields,
             search_fields,
@@ -336,6 +356,7 @@ impl Settings {
             |settings, input, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Change) {
                     settings.search_engine.name = input.read(cx).value().to_string();
+                    settings.editor_search_test = None;
                     cx.notify();
                 }
             },
@@ -347,6 +368,7 @@ impl Settings {
             |settings, input, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Change) {
                     settings.search_engine.base_url = input.read(cx).value().to_string();
+                    settings.editor_search_test = None;
                     cx.notify();
                 }
             },
@@ -358,6 +380,7 @@ impl Settings {
             |settings, input, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Change) {
                     settings.search_engine.api_key = input.read(cx).value().to_string();
+                    settings.editor_search_test = None;
                     cx.notify();
                 }
             },
@@ -461,6 +484,12 @@ impl Settings {
         let patterns_changed = self.state.bash_blocked_patterns != state.bash_blocked_patterns;
         let team_changed = self.state.agent_team_config != state.agent_team_config;
         self.state = state.clone();
+        self.search_engine_tests.retain(|id, _| {
+            self.state
+                .search_engine_profiles
+                .iter()
+                .any(|profile| profile.id == *id)
+        });
         if let Some(id) = self.search_engine.id
             && let Some(profile) = self
                 .state
@@ -620,6 +649,7 @@ impl Settings {
 
     fn open_search_engine_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.search_engine_editor_open = true;
+        self.editor_search_test = None;
         self.seed_search_fields(window, cx);
         let focus = self
             .search_fields
@@ -632,12 +662,14 @@ impl Settings {
     /// Close the editor and discard anything that was not saved.
     pub fn close_search_engine_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.search_engine_editor_open = false;
+        self.editor_search_test = None;
         self.search_engine = SearchEngineDraft::default();
         self.seed_search_fields(window, cx);
     }
 
     pub fn set_search_engine_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.search_engine.enabled = enabled;
+        self.editor_search_test = None;
         cx.notify();
     }
 
@@ -649,7 +681,42 @@ impl Settings {
         cx: &mut Context<Self>,
     ) {
         self.search_engine.set_kind(kind);
+        self.editor_search_test = None;
         self.seed_search_fields(window, cx);
+    }
+
+    pub fn start_search_engine_test(
+        &mut self,
+        id: SearchEngineId,
+        editor: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if editor {
+            self.editor_search_test = Some(SearchEngineTestStatus::Testing);
+        } else {
+            self.search_engine_tests
+                .insert(id, SearchEngineTestStatus::Testing);
+        }
+        cx.notify();
+    }
+
+    pub fn finish_search_engine_test(
+        &mut self,
+        id: SearchEngineId,
+        editor: bool,
+        result: Result<(), String>,
+        cx: &mut Context<Self>,
+    ) {
+        let status = match result {
+            Ok(()) => SearchEngineTestStatus::Succeeded,
+            Err(error) => SearchEngineTestStatus::Failed(error),
+        };
+        if editor {
+            self.editor_search_test = Some(status);
+        } else {
+            self.search_engine_tests.insert(id, status);
+        }
+        cx.notify();
     }
 
     /// The search-engine draft, for the shell to save.
@@ -887,6 +954,7 @@ impl Render for Settings {
                 &self.state,
                 &self.search_engine,
                 &self.search_fields,
+                self.editor_search_test.as_ref(),
                 tokens,
                 emit.clone(),
                 cx,
@@ -906,7 +974,9 @@ impl Render for Settings {
                 tokens,
                 emit,
             ),
-            Section::WebSearch => web_search::render(&self.state, tokens, emit),
+            Section::WebSearch => {
+                web_search::render(&self.state, &self.search_engine_tests, tokens, emit)
+            }
         };
 
         div()
@@ -1073,6 +1143,44 @@ mod tests {
                 settings.close_search_engine_editor(window, cx);
                 assert!(!settings.search_engine_editor_open);
                 assert_eq!(settings.search_engine, SearchEngineDraft::default());
+            })
+            .expect("the settings window is open");
+    }
+
+    #[gpui::test]
+    async fn editor_and_row_connection_tests_keep_independent_status(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| crate::init(ThemePreference::default(), cx).unwrap());
+        let profile = SearchEngineProfile::new_doubao_global();
+        let id = profile.id;
+        let settings = cx.add_window(move |window, cx| {
+            Settings::new(
+                Tokens::light(),
+                AppState {
+                    search_engine_profiles: vec![profile],
+                    ..AppState::default()
+                },
+                window,
+                cx,
+            )
+        });
+
+        settings
+            .update(cx, |settings, _, cx| {
+                settings.start_search_engine_test(id, false, cx);
+                settings.start_search_engine_test(id, true, cx);
+                settings.finish_search_engine_test(id, false, Ok(()), cx);
+                settings.finish_search_engine_test(id, true, Err("401".into()), cx);
+
+                assert_eq!(
+                    settings.search_engine_tests.get(&id),
+                    Some(&SearchEngineTestStatus::Succeeded)
+                );
+                assert_eq!(
+                    settings.editor_search_test,
+                    Some(SearchEngineTestStatus::Failed("401".into()))
+                );
             })
             .expect("the settings window is open");
     }

@@ -12,7 +12,7 @@
 
 use gpui::{ClipboardItem, Context, Entity, IntoElement, PathPromptOptions, Render, Task, Window};
 use pi_whim_gpui::{Request, RequestsRaised, Workspace, pump};
-use pi_whim_runtime::AgentRuntime;
+use pi_whim_runtime::{AgentRuntime, test_search_engine};
 
 use crate::app::{PiWhimApplication, Picker};
 
@@ -195,6 +195,48 @@ impl<R: AgentRuntime + 'static> Host<R> {
                     self.shell.update(cx, |shell, cx| {
                         shell.search_engine_saved(window, cx);
                     });
+                }
+            }
+            Request::TestSearchEngine {
+                profile,
+                api_key,
+                editor,
+            } => {
+                let profile_id = profile.id;
+                let profile_name = profile.name.clone();
+                match self
+                    .application
+                    .search_engine_test_api_key(&profile, api_key)
+                {
+                    Ok(api_key) => {
+                        cx.spawn_in(window, async move |host, cx| {
+                            let result = cx
+                                .background_executor()
+                                .spawn(
+                                    async move { test_search_engine(&profile, api_key.as_deref()) },
+                                )
+                                .await;
+                            let _ = host.update_in(cx, |host, window, cx| {
+                                host.application
+                                    .report_search_engine_test(&profile_name, &result);
+                                host.shell.update(cx, |shell, cx| {
+                                    shell.search_engine_test_finished(
+                                        profile_id, editor, result, cx,
+                                    );
+                                });
+                                host.publish(window, cx);
+                            });
+                        })
+                        .detach();
+                    }
+                    Err(error) => {
+                        let result = Err(error);
+                        self.application
+                            .report_search_engine_test(&profile_name, &result);
+                        self.shell.update(cx, |shell, cx| {
+                            shell.search_engine_test_finished(profile_id, editor, result, cx);
+                        });
+                    }
                 }
             }
             Request::AttachPaste(paste) => {

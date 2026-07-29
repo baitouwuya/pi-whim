@@ -46,6 +46,10 @@ pub struct Turn {
     /// Conversation entry for the in-progress compaction card, so the result
     /// updates that card instead of adding a second one.
     pub compaction_item_id: Option<String>,
+    /// A provider may end a stream successfully without returning any content.
+    /// Keep that protocol failure through `agent_settled`, which would otherwise
+    /// overwrite the visible failure with `Ready` immediately.
+    pub reply_error: Option<String>,
     pub pending_prompt: Option<PendingPrompt>,
 }
 

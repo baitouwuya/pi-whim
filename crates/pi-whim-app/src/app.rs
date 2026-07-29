@@ -23,7 +23,7 @@ use pi_whim_persistence::{
     ProviderRepository, SearchEngineRepository, SecretStore, SessionRepository, SqliteStore,
     session_summary_from_jsonl,
 };
-use pi_whim_runtime::{AgentRuntime, PiRpcRuntime, RuntimeEvent, RuntimeStart, test_search_engine};
+use pi_whim_runtime::{AgentRuntime, PiRpcRuntime, RuntimeEvent, RuntimeStart};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -396,14 +396,12 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             Request::SaveSearchEngine { profile, api_key } => {
                 self.save_search_engine(profile, api_key);
             }
-            Request::TestSearchEngine { profile, api_key } => {
-                self.test_search_engine(profile, api_key)
-            }
             // Each of these either needs the window and the clipboard, or answers
             // with something a view has to be told, so the host keeps them.
             Request::CopyToClipboard(_)
             | Request::AttachPaste(_)
             | Request::SaveProvider { .. }
+            | Request::TestSearchEngine { .. }
             | Request::DiscoverProviderModels { .. } => {
                 unreachable!("handled by the host")
             }
@@ -844,34 +842,42 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         true
     }
 
-    fn test_search_engine(&mut self, profile: SearchEngineProfile, supplied_key: Option<String>) {
+    /// Resolve the credential for a connection test without performing network
+    /// I/O. The host runs the actual request on its background executor so a
+    /// slow endpoint cannot freeze the GPUI event loop.
+    pub(crate) fn search_engine_test_api_key(
+        &mut self,
+        profile: &SearchEngineProfile,
+        supplied_key: Option<String>,
+    ) -> Result<Option<String>, String> {
         if profile.name.trim().is_empty() || !valid_search_engine_url(&profile.base_url) {
-            self.report("notice-search-engine-untestable");
-            return;
+            return Err(self.say("notice-search-engine-untestable").to_owned());
         }
-        let api_key = if supplied_key.is_some() || !profile.kind.requires_api_key() {
-            supplied_key
+        if supplied_key.is_some() || !profile.kind.requires_api_key() {
+            Ok(supplied_key)
         } else {
-            match self
-                .secrets
+            self.secrets
                 .get(&search_engine_keychain_account(profile.id))
-            {
-                Ok(value) => value,
-                Err(error) => {
-                    self.notices.error(error.to_string());
-                    return;
-                }
-            }
-        };
-        match test_search_engine(&profile, api_key.as_deref()) {
+                .map_err(|error| error.to_string())
+        }
+    }
+
+    /// Preserve the existing global notification while the settings page also
+    /// shows its row-local result.
+    pub(crate) fn report_search_engine_test(
+        &mut self,
+        profile_name: &str,
+        result: &Result<(), String>,
+    ) {
+        match result {
             Ok(()) => {
-                let message = format!("{} {}", profile.name, self.say("notice-search-engine-ok"));
+                let message = format!("{} {}", profile_name, self.say("notice-search-engine-ok"));
                 self.notices.info(message);
             }
             Err(error) => {
                 let message = format!(
                     "{} {}: {error}",
-                    profile.name,
+                    profile_name,
                     self.say("notice-test-failed")
                 );
                 self.notices.error(message);

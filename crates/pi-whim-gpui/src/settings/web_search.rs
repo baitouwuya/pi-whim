@@ -4,6 +4,8 @@
 //! adding an engine or opening a stored row, so an empty form never competes
 //! with the collection it edits.
 
+use std::collections::BTreeMap;
+
 use gpui::{
     AnyElement, App, Entity, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px,
@@ -15,7 +17,7 @@ use gpui_component::{
     input::{Input, InputState},
 };
 use pi_whim_core::{
-    AppState, Language, SearchEngineKind, SearchEngineProfile,
+    AppState, Language, SearchEngineId, SearchEngineKind, SearchEngineProfile,
     strings::{text as translate, tr},
 };
 use pi_whim_engine::settings::SearchEngineDraft;
@@ -24,7 +26,7 @@ use pi_whim_theme::{Tokens, font, radius, text};
 use crate::{
     icons,
     settings::{
-        Emit, SettingsEvent,
+        Emit, SearchEngineTestStatus, SettingsEvent,
         dropdown::{self, Choice, ChoiceState},
         form, toggle,
     },
@@ -45,7 +47,12 @@ pub struct Fields {
 }
 
 /// Build the list-first Web search page.
-pub fn render(state: &AppState, tokens: Tokens, emit: Emit) -> AnyElement {
+pub fn render(
+    state: &AppState,
+    tests: &BTreeMap<SearchEngineId, SearchEngineTestStatus>,
+    tokens: Tokens,
+    emit: Emit,
+) -> AnyElement {
     let add = emit.clone();
 
     div()
@@ -85,13 +92,18 @@ pub fn render(state: &AppState, tokens: Tokens, emit: Emit) -> AnyElement {
                                 }),
                         ),
                 )
-                .child(engine_list(state, tokens, emit)),
+                .child(engine_list(state, tests, tokens, emit)),
         )
         .into_any_element()
 }
 
 /// The stored instances, in the order they are asked.
-fn engine_list(state: &AppState, tokens: Tokens, emit: Emit) -> AnyElement {
+fn engine_list(
+    state: &AppState,
+    tests: &BTreeMap<SearchEngineId, SearchEngineTestStatus>,
+    tokens: Tokens,
+    emit: Emit,
+) -> AnyElement {
     let profiles = &state.search_engine_profiles;
     if profiles.is_empty() {
         return div()
@@ -115,7 +127,15 @@ fn engine_list(state: &AppState, tokens: Tokens, emit: Emit) -> AnyElement {
         .border_t_1()
         .border_color(tokens.line.hsla())
         .children(profiles.iter().enumerate().map(|(index, profile)| {
-            engine_row(index, last, profile, state.language, tokens, emit.clone())
+            engine_row(
+                index,
+                last,
+                profile,
+                tests.get(&profile.id),
+                state.language,
+                tokens,
+                emit.clone(),
+            )
         }))
         .into_any_element()
 }
@@ -124,6 +144,7 @@ fn engine_row(
     index: usize,
     last: usize,
     profile: &SearchEngineProfile,
+    test_status: Option<&SearchEngineTestStatus>,
     language: Language,
     tokens: Tokens,
     emit: Emit,
@@ -132,8 +153,42 @@ fn engine_row(
     let select = emit.clone();
     let up = emit.clone();
     let down = emit.clone();
+    let quick_test = emit.clone();
+    let profile_for_test = profile.clone();
     let enabled = profile.enabled;
-    let status = translate(if enabled { "enabled" } else { "disabled" }, language);
+    let testing = test_status.is_some_and(SearchEngineTestStatus::is_testing);
+    let (status, status_color, dot_color) = match test_status {
+        Some(SearchEngineTestStatus::Testing) => (
+            translate("testing-connection", language),
+            tokens.accent,
+            tokens.accent,
+        ),
+        Some(SearchEngineTestStatus::Succeeded) => (
+            translate("connection-ok", language),
+            tokens.success,
+            tokens.success,
+        ),
+        Some(SearchEngineTestStatus::Failed(_)) => (
+            translate("notice-test-failed", language),
+            tokens.error,
+            tokens.error,
+        ),
+        None => (
+            translate(if enabled { "enabled" } else { "disabled" }, language),
+            tokens.muted,
+            if enabled {
+                tokens.success
+            } else {
+                tokens.line_strong
+            },
+        ),
+    };
+    let test_tooltip: SharedString = match test_status {
+        Some(SearchEngineTestStatus::Failed(error)) => {
+            format!("{}: {error}", translate("notice-test-failed", language)).into()
+        }
+        _ => translate("test-search-engine", language).into(),
+    };
     let details = format!(
         "{}  |  {}",
         translate(kind_string(profile.kind), language),
@@ -192,16 +247,17 @@ fn engine_row(
                 .flex()
                 .items_center()
                 .gap(px(6.0))
-                .child(div().size(px(6.0)).rounded(px(radius::DOT)).bg(if enabled {
-                    tokens.success.hsla()
-                } else {
-                    tokens.line_strong.hsla()
-                }))
+                .child(
+                    div()
+                        .size(px(6.0))
+                        .rounded(px(radius::DOT))
+                        .bg(dot_color.hsla()),
+                )
                 .child(
                     div()
                         .font_family(font::MONO)
                         .text_size(px(text::LABEL_SIZE))
-                        .text_color(tokens.muted.hsla())
+                        .text_color(status_color.hsla())
                         .child(status),
                 ),
         )
@@ -215,6 +271,23 @@ fn engine_row(
                 .items_center()
                 .gap(px(2.0))
                 .on_click(|_, _, cx| cx.stop_propagation())
+                .child(
+                    Button::new(("engine-test", index as u64))
+                        .icon(icons::search())
+                        .loading_icon(gpui_component::IconName::LoaderCircle)
+                        .loading(testing)
+                        .ghost()
+                        .xsmall()
+                        .disabled(testing)
+                        .tooltip(test_tooltip)
+                        .on_click(move |_, window, cx| {
+                            quick_test(
+                                SettingsEvent::QuickTestSearchEngine(profile_for_test.clone()),
+                                window,
+                                cx,
+                            )
+                        }),
+                )
                 .child(
                     Button::new(("engine-up", index as u64))
                         .icon(icons::move_up())
@@ -272,11 +345,13 @@ pub fn render_editor(
     state: &AppState,
     draft: &SearchEngineDraft,
     fields: &Fields,
+    test_status: Option<&SearchEngineTestStatus>,
     tokens: Tokens,
     emit: Emit,
     cx: &mut App,
 ) -> AnyElement {
     let can_save = draft.can_save();
+    let testing = test_status.is_some_and(SearchEngineTestStatus::is_testing);
     let title = tr(
         state,
         if draft.id.is_some() {
@@ -307,18 +382,50 @@ pub fn render_editor(
         },
     );
 
+    let footer_status = test_status.and_then(|status| match status {
+        SearchEngineTestStatus::Testing => None,
+        SearchEngineTestStatus::Succeeded => Some((tr(state, "connection-ok"), tokens.success)),
+        SearchEngineTestStatus::Failed(_) => Some((tr(state, "notice-test-failed"), tokens.error)),
+    });
     let footer = div()
         .w_full()
         .flex()
         .items_center()
         .justify_between()
         .child(
-            Button::new("test-search-engine")
-                .label(tr(state, "test-search-engine"))
-                .outline()
-                .small()
-                .disabled(!can_save)
-                .on_click(move |_, window, cx| test(SettingsEvent::TestSearchEngine, window, cx)),
+            div()
+                .flex()
+                .items_center()
+                .gap(px(form::INLINE_GAP))
+                .child(
+                    Button::new("test-search-engine")
+                        .label(tr(
+                            state,
+                            if testing {
+                                "testing-connection"
+                            } else {
+                                "test-search-engine"
+                            },
+                        ))
+                        .loading_icon(gpui_component::IconName::LoaderCircle)
+                        .loading(testing)
+                        .outline()
+                        .small()
+                        .disabled(!can_save || testing)
+                        .on_click(move |_, window, cx| {
+                            test(SettingsEvent::TestSearchEngine, window, cx)
+                        }),
+                )
+                .when_some(footer_status, |this, (label, color)| {
+                    this.child(
+                        div()
+                            .whitespace_nowrap()
+                            .font_family(font::MONO)
+                            .text_size(px(text::LABEL_SIZE))
+                            .text_color(color.hsla())
+                            .child(label),
+                    )
+                }),
         )
         .child(
             div()
