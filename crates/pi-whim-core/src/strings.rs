@@ -238,6 +238,16 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ("background-ai-select-model", "Select a model", "选择模型"),
     ("background-ai-thinking", "Thinking level", "思考级别"),
     (
+        "background-ai-max-output-tokens",
+        "Maximum output tokens",
+        "最大输出 Token",
+    ),
+    (
+        "background-ai-max-output-tokens-help",
+        "Output budget for reasoning and the final result (32-8192).",
+        "模型推理和最终结果共用的输出预算（32-8192）。",
+    ),
+    (
         "background-ai-concurrency",
         "Maximum concurrency",
         "最大并发数",

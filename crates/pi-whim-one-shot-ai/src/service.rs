@@ -11,9 +11,9 @@ use std::{
 
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use pi_whim_core::{
-    MAX_ONE_SHOT_AI_CONCURRENCY, MAX_ONE_SHOT_AI_QUEUE_CAPACITY, MAX_ONE_SHOT_AI_TIMEOUT_SECS,
-    MIN_ONE_SHOT_AI_TIMEOUT_SECS, OneShotAiConfig, ProviderModel, ProviderProfile,
-    ProviderProtocol, ThinkingLevel,
+    MAX_ONE_SHOT_AI_CONCURRENCY, MAX_ONE_SHOT_AI_MAX_OUTPUT_TOKENS, MAX_ONE_SHOT_AI_QUEUE_CAPACITY,
+    MAX_ONE_SHOT_AI_TIMEOUT_SECS, MIN_ONE_SHOT_AI_MAX_OUTPUT_TOKENS, MIN_ONE_SHOT_AI_TIMEOUT_SECS,
+    OneShotAiConfig, ProviderModel, ProviderProfile, ProviderProtocol, ThinkingLevel,
 };
 use uuid::Uuid;
 
@@ -57,6 +57,7 @@ pub enum OneShotServiceError {
     InvalidConcurrency,
     InvalidQueueCapacity,
     InvalidTimeout,
+    InvalidMaxOutputTokens,
     InvalidBaseUrl,
 }
 
@@ -132,6 +133,7 @@ pub struct ResolvedOneShotAiConfig {
     max_concurrency: usize,
     queue_capacity: usize,
     timeout: Duration,
+    max_output_tokens: u32,
 }
 
 impl fmt::Debug for ResolvedOneShotAiConfig {
@@ -143,6 +145,7 @@ impl fmt::Debug for ResolvedOneShotAiConfig {
             .field("max_concurrency", &self.max_concurrency)
             .field("queue_capacity", &self.queue_capacity)
             .field("timeout", &self.timeout)
+            .field("max_output_tokens", &self.max_output_tokens)
             .finish()
     }
 }
@@ -172,6 +175,11 @@ impl ResolvedOneShotAiConfig {
             .contains(&config.timeout_secs)
         {
             return Err(OneShotServiceError::InvalidTimeout);
+        }
+        if !(MIN_ONE_SHOT_AI_MAX_OUTPUT_TOKENS..=MAX_ONE_SHOT_AI_MAX_OUTPUT_TOKENS)
+            .contains(&task.max_output_tokens)
+        {
+            return Err(OneShotServiceError::InvalidMaxOutputTokens);
         }
         let model_id = task
             .model_id
@@ -214,6 +222,7 @@ impl ResolvedOneShotAiConfig {
             max_concurrency: config.max_concurrency.into(),
             queue_capacity: config.queue_capacity.into(),
             timeout: Duration::from_secs(config.timeout_secs.into()),
+            max_output_tokens: task.max_output_tokens,
         })
     }
 
@@ -257,6 +266,7 @@ struct WorkerShared {
     generation: u64,
     provider: ProviderRuntime,
     timeout: Duration,
+    max_output_tokens: u32,
     agent: ureq::Agent,
     completions: Sender<OneShotCompletion>,
     cancelled: Mutex<HashSet<OneShotRequestId>>,
@@ -323,6 +333,7 @@ impl OneShotAiService {
             generation: config.generation,
             provider: config.provider,
             timeout: config.timeout,
+            max_output_tokens: config.max_output_tokens,
             agent,
             completions: completion_sender,
             cancelled: Mutex::new(HashSet::new()),
@@ -549,7 +560,7 @@ fn process(item: &WorkItem, shared: &WorkerShared) -> Result<String, OneShotErro
         &shared.provider,
         &item.task.system_prompt(),
         item.task.input(),
-        item.task.max_output_tokens(),
+        shared.max_output_tokens,
         remaining,
     )
     .and_then(|value| item.task.normalize_output(&value));
@@ -664,6 +675,7 @@ mod tests {
                 enabled: true,
                 provider_id: Some(provider_id),
                 model_id: Some("test/model".into()),
+                max_output_tokens: 777,
                 ..Default::default()
             },
         );
@@ -704,6 +716,7 @@ mod tests {
         let (_, body) = request.split_once("\r\n\r\n").unwrap();
         let body: serde_json::Value = serde_json::from_str(body).unwrap();
         assert_eq!(body["stream"], false);
+        assert_eq!(body["max_tokens"], 777);
         assert!(body.get("tools").is_none());
         assert!(body.get("functions").is_none());
         assert!(!body.to_string().contains("top-secret"));

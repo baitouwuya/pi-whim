@@ -843,6 +843,7 @@ mod tests {
                 enabled: true,
                 provider_id: Some(Uuid::new_v4()),
                 model_id: Some("example-model".into()),
+                max_output_tokens: 768,
                 ..Default::default()
             },
         );

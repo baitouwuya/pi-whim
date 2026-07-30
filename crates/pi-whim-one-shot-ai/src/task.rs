@@ -5,7 +5,6 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::OneShotErrorKind;
 
 pub const MAX_ONE_SHOT_INPUT_BYTES: usize = 8 * 1024;
-pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 128;
 pub const MAX_SESSION_TITLE_GRAPHEMES: usize = 52;
 
 /// A small, self-contained task. Implementations own their input and must not
@@ -14,10 +13,6 @@ pub trait OneShotTask: Send + 'static {
     fn kind(&self) -> &'static str;
     fn system_prompt(&self) -> Cow<'static, str>;
     fn input(&self) -> &str;
-
-    fn max_output_tokens(&self) -> u32 {
-        DEFAULT_MAX_OUTPUT_TOKENS
-    }
 
     fn normalize_output(&self, output: &str) -> Result<String, OneShotErrorKind>;
 }

@@ -8,7 +8,7 @@ use gpui_component::{
     Disableable, Sizable,
     button::{Button, ButtonVariants},
     dialog::Dialog,
-    input::{Input, InputState},
+    input::{InputState, NumberInput},
 };
 use pi_whim_core::{
     AppState, OneShotAiConfig, OneShotAiTaskConfig, ProviderId, SESSION_TITLE_TASK_KIND,
@@ -47,6 +47,7 @@ const TASKS: [TaskDefinition; 1] = [TaskDefinition {
 pub struct Fields {
     pub model: Entity<ChoiceState<Option<(ProviderId, String)>>>,
     pub thinking: Entity<ChoiceState<ThinkingLevel>>,
+    pub max_output_tokens: Entity<InputState>,
     pub concurrency: Entity<InputState>,
     pub queue_capacity: Entity<InputState>,
     pub timeout: Entity<InputState>,
@@ -265,8 +266,10 @@ fn task_details(state: &AppState, task: &OneShotAiTaskConfig) -> String {
         task.thinking_level.as_str().to_owned()
     };
     format!(
-        "{model}  |  {}: {thinking}",
-        tr(state, "background-ai-thinking")
+        "{model}  |  {}: {thinking}  |  {}: {}",
+        tr(state, "background-ai-thinking"),
+        tr(state, "info-tokens"),
+        task.max_output_tokens,
     )
 }
 
@@ -350,6 +353,12 @@ pub fn render_editor(
                             tokens,
                             dropdown::dropdown(&fields.thinking),
                         ))
+                        .child(form::row(
+                            tr(state, "background-ai-max-output-tokens"),
+                            Some(tr(state, "background-ai-max-output-tokens-help")),
+                            tokens,
+                            numeric(&fields.max_output_tokens),
+                        ))
                         .when(!can_save, |this| {
                             this.child(form::control_row(form::field_error(
                                 tr(state, "background-ai-task-incomplete"),
@@ -392,7 +401,10 @@ fn enabled_row(
 }
 
 fn numeric(state: &Entity<InputState>) -> AnyElement {
-    Input::new(state).small().into_any_element()
+    div()
+        .w(px(132.0))
+        .child(NumberInput::new(state))
+        .into_any_element()
 }
 
 fn limits_apply(fields: &Fields, state: &AppState, emit: Emit) -> AnyElement {

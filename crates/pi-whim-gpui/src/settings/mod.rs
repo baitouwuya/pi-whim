@@ -30,10 +30,10 @@ use gpui_component::{
 };
 use pi_whim_core::{
     AgentTeamConfig, AppState, BashPolicy, Language, MAX_AGENT_DEPTH, MAX_AGENTS_PER_LEVEL,
-    MAX_ONE_SHOT_AI_CONCURRENCY, MAX_ONE_SHOT_AI_QUEUE_CAPACITY, MAX_ONE_SHOT_AI_TIMEOUT_SECS,
-    MIN_ONE_SHOT_AI_TIMEOUT_SECS, OneShotAiConfig, OneShotAiTaskConfig, ProviderId, ProviderModel,
-    ProviderProtocol, QueueMode, SESSION_TITLE_TASK_KIND, SearchEngineId, SearchEngineKind,
-    SearchEngineProfile, strings::tr,
+    MAX_ONE_SHOT_AI_CONCURRENCY, MAX_ONE_SHOT_AI_MAX_OUTPUT_TOKENS, MAX_ONE_SHOT_AI_QUEUE_CAPACITY,
+    MAX_ONE_SHOT_AI_TIMEOUT_SECS, MIN_ONE_SHOT_AI_MAX_OUTPUT_TOKENS, MIN_ONE_SHOT_AI_TIMEOUT_SECS,
+    OneShotAiConfig, OneShotAiTaskConfig, ProviderId, ProviderModel, ProviderProtocol, QueueMode,
+    SESSION_TITLE_TASK_KIND, SearchEngineId, SearchEngineKind, SearchEngineProfile, strings::tr,
 };
 use pi_whim_engine::settings::{
     Preset, ProviderDraft, SearchEngineDraft, Section, move_search_engine, remove_search_engine,
@@ -272,6 +272,11 @@ impl Settings {
                 window,
                 cx,
             ),
+            max_output_tokens: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .min(MIN_ONE_SHOT_AI_MAX_OUTPUT_TOKENS as f64)
+                    .max(MAX_ONE_SHOT_AI_MAX_OUTPUT_TOKENS as f64)
+            }),
             concurrency: cx.new(|cx| {
                 InputState::new(window, cx)
                     .min(1.0)
@@ -316,7 +321,13 @@ impl Settings {
 
         // The provider and search-engine drafts are edited into, then saved, so
         // their fields write into the draft rather than emitting.
-        Self::watch_draft_fields(&provider_fields, &search_fields, window, cx);
+        Self::watch_draft_fields(
+            &background_ai_fields,
+            &provider_fields,
+            &search_fields,
+            window,
+            cx,
+        );
         Self::watch_choice_fields(
             &general_fields,
             &background_ai_fields,
@@ -351,11 +362,25 @@ impl Settings {
 
     /// Keep the draft in step with what is typed.
     fn watch_draft_fields(
+        background_ai: &background_ai::Fields,
         provider: &providers::Fields,
         search: &web_search::Fields,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        cx.subscribe_in(
+            &background_ai.max_output_tokens,
+            window,
+            |settings, input, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change)
+                    && let Ok(value) = input.read(cx).value().parse::<u32>()
+                {
+                    settings.background_ai_task.max_output_tokens = value;
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
         cx.subscribe_in(
             &provider.name,
             window,
@@ -574,6 +599,7 @@ impl Settings {
                 .as_deref()
                 .unwrap_or(SESSION_TITLE_TASK_KIND);
             self.background_ai_task = self.state.one_shot_ai_config.task(kind);
+            self.seed_background_ai_task_inputs(window, cx);
         }
         self.search_engine_tests.retain(|id, _| {
             self.state
@@ -741,6 +767,7 @@ impl Settings {
         self.background_ai_task = self.state.one_shot_ai_config.task(&kind);
         self.background_ai_task_kind = Some(kind);
         self.background_ai_editor_open = true;
+        self.seed_background_ai_task_inputs(window, cx);
         self.seed_background_ai_choices(window, cx);
         cx.notify();
     }
@@ -753,6 +780,7 @@ impl Settings {
             .as_deref()
             .unwrap_or(SESSION_TITLE_TASK_KIND);
         self.background_ai_task = self.state.one_shot_ai_config.task(kind);
+        self.seed_background_ai_task_inputs(window, cx);
         self.seed_background_ai_choices(window, cx);
         cx.notify();
     }
@@ -885,6 +913,7 @@ impl Settings {
         self.seed_general_inputs(window, cx);
         self.seed_general_choices(window, cx);
         self.seed_background_ai_inputs(window, cx);
+        self.seed_background_ai_task_inputs(window, cx);
         self.seed_background_ai_choices(window, cx);
         self.seed_provider_fields(window, cx);
         self.seed_search_fields(window, cx);
@@ -922,6 +951,16 @@ impl Settings {
         self.background_ai_fields.timeout.update(cx, |input, cx| {
             input.set_value(one_shot.timeout_secs.to_string(), window, cx)
         });
+        cx.notify();
+    }
+
+    fn seed_background_ai_task_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let max_output_tokens = self.background_ai_task.max_output_tokens;
+        self.background_ai_fields
+            .max_output_tokens
+            .update(cx, |input, cx| {
+                input.set_value(max_output_tokens.to_string(), window, cx)
+            });
         cx.notify();
     }
 

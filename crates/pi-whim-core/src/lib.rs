@@ -37,16 +37,33 @@ pub const MAX_ONE_SHOT_AI_QUEUE_CAPACITY: u16 = 1024;
 pub const DEFAULT_ONE_SHOT_AI_TIMEOUT_SECS: u8 = 15;
 pub const MIN_ONE_SHOT_AI_TIMEOUT_SECS: u8 = 3;
 pub const MAX_ONE_SHOT_AI_TIMEOUT_SECS: u8 = 60;
+pub const DEFAULT_ONE_SHOT_AI_MAX_OUTPUT_TOKENS: u32 = 512;
+pub const MIN_ONE_SHOT_AI_MAX_OUTPUT_TOKENS: u32 = 32;
+pub const MAX_ONE_SHOT_AI_MAX_OUTPUT_TOKENS: u32 = 8192;
 pub const SESSION_TITLE_TASK_KIND: &str = "session_title";
 
 /// Provider and model selection for one lightweight background task.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OneShotAiTaskConfig {
     pub enabled: bool,
     pub provider_id: Option<ProviderId>,
     pub model_id: Option<String>,
     pub thinking_level: ThinkingLevel,
+    pub max_output_tokens: u32,
+}
+
+impl Default for OneShotAiTaskConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider_id: None,
+            model_id: None,
+            thinking_level: ThinkingLevel::default(),
+            // Reasoning models consume this budget before producing visible text.
+            max_output_tokens: DEFAULT_ONE_SHOT_AI_MAX_OUTPUT_TOKENS,
+        }
+    }
 }
 
 impl OneShotAiTaskConfig {
@@ -56,6 +73,10 @@ impl OneShotAiTaskConfig {
             .take()
             .map(|model| model.trim().to_owned())
             .filter(|model| !model.is_empty());
+        self.max_output_tokens = self.max_output_tokens.clamp(
+            MIN_ONE_SHOT_AI_MAX_OUTPUT_TOKENS,
+            MAX_ONE_SHOT_AI_MAX_OUTPUT_TOKENS,
+        );
         self
     }
 }
@@ -160,6 +181,7 @@ impl<'de> Deserialize<'de> for OneShotAiConfig {
                     provider_id: wire.provider_id,
                     model_id: wire.model_id,
                     thinking_level: wire.thinking_level.unwrap_or_default(),
+                    ..Default::default()
                 },
             );
         }
@@ -1033,6 +1055,10 @@ mod tests {
         assert!(!title.enabled);
         assert_eq!(title.provider_id, None);
         assert_eq!(title.model_id, None);
+        assert_eq!(
+            title.max_output_tokens,
+            DEFAULT_ONE_SHOT_AI_MAX_OUTPUT_TOKENS
+        );
         assert_eq!(defaults.max_concurrency, 4);
         assert_eq!(defaults.queue_capacity, 64);
         assert_eq!(defaults.timeout_secs, 15);
@@ -1047,6 +1073,7 @@ mod tests {
             SESSION_TITLE_TASK_KIND,
             OneShotAiTaskConfig {
                 model_id: Some("  model-name  ".into()),
+                max_output_tokens: u32::MAX,
                 ..Default::default()
             },
         );
@@ -1054,6 +1081,10 @@ mod tests {
         assert_eq!(
             normalized.task(SESSION_TITLE_TASK_KIND).model_id.as_deref(),
             Some("model-name")
+        );
+        assert_eq!(
+            normalized.task(SESSION_TITLE_TASK_KIND).max_output_tokens,
+            MAX_ONE_SHOT_AI_MAX_OUTPUT_TOKENS
         );
         assert_eq!(normalized.max_concurrency, 1);
         assert_eq!(normalized.queue_capacity, 1024);
@@ -1088,7 +1119,25 @@ mod tests {
         assert_eq!(title.provider_id, Some(provider_id));
         assert_eq!(title.model_id.as_deref(), Some("legacy-model"));
         assert_eq!(title.thinking_level, ThinkingLevel::High);
+        assert_eq!(
+            title.max_output_tokens,
+            DEFAULT_ONE_SHOT_AI_MAX_OUTPUT_TOKENS
+        );
         assert_eq!(config.max_concurrency, 6);
+    }
+
+    #[test]
+    fn task_configs_without_a_token_limit_receive_the_compatible_default() {
+        let task: OneShotAiTaskConfig = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "model_id": "example-model"
+        }))
+        .unwrap();
+
+        assert_eq!(
+            task.max_output_tokens,
+            DEFAULT_ONE_SHOT_AI_MAX_OUTPUT_TOKENS
+        );
     }
 
     #[test]
