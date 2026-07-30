@@ -138,7 +138,7 @@ pub fn launch_child(
     thread::spawn(move || {
         let mut interrupted = false;
         let mut force_kill_at = None;
-        let exit_status = loop {
+        let (exit_status, wait_error) = loop {
             match control_receiver.recv_timeout(Duration::from_millis(50)) {
                 Ok(ProcessCommand::Interrupt) => {
                     interrupted = true;
@@ -155,13 +155,17 @@ pub fn launch_child(
                 force_kill_at = None;
             }
             match child.try_wait() {
-                Ok(Some(status)) => break Some(status),
+                Ok(Some(status)) => break (Some(status), None),
                 Ok(None) => {}
-                Err(_) => break None,
+                Err(error) => break (None, Some(error.to_string())),
             }
         };
         let _ = stdout_reader.join();
-        let error = stderr_reader.join().unwrap_or_default();
+        let error = process_error(
+            stderr_reader.join().unwrap_or_default(),
+            exit_status.as_ref(),
+            wait_error.as_deref(),
+        );
         let output = capture
             .lock()
             .map(|capture| capture.final_output.clone())
@@ -176,7 +180,9 @@ pub fn launch_child(
             agent_id,
             AgentFinish {
                 interrupted,
-                exit_code: exit_status.and_then(|status| status.code()),
+                exit_code: exit_status
+                    .as_ref()
+                    .and_then(std::process::ExitStatus::code),
                 output,
                 error,
                 transcript_entries,
@@ -257,7 +263,7 @@ fn child_sandbox_profile(
         read_paths.push(format!("(subpath \"{}\")", quoted(extension)));
     }
     format!(
-        "(version 1) (deny default) (allow process*) (allow file-read* {}) (allow file-write* (subpath \"{}\")) {network_policy}",
+        "(version 1) (deny default) (import \"system.sb\") (allow process*) (allow file-read* {}) (allow file-write* (subpath \"{}\")) {network_policy}",
         read_paths.join(" "),
         quoted(project_root),
     )
@@ -429,6 +435,41 @@ fn drain_stderr(mut stderr: impl Read) -> String {
     truncate_utf8(output, MAX_CAPTURE_BYTES)
 }
 
+/// Keep an early crash diagnosable even when it occurs before the child writes stderr.
+fn process_error(
+    stderr: String,
+    exit_status: Option<&std::process::ExitStatus>,
+    wait_error: Option<&str>,
+) -> String {
+    let status_error = if let Some(error) = wait_error {
+        Some(format!("could not observe subagent exit status: {error}"))
+    } else if let Some(status) = exit_status {
+        if let Some(code) = status.code() {
+            (code != 0).then(|| format!("subagent exited with status {code}"))
+        } else {
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                status
+                    .signal()
+                    .map(|signal| format!("subagent terminated by signal {signal}"))
+            }
+            #[cfg(not(unix))]
+            {
+                Some("subagent exited without a status code".into())
+            }
+        }
+    } else {
+        Some("subagent exit status was unavailable".into())
+    };
+
+    match (stderr.trim(), status_error) {
+        ("", Some(status_error)) => status_error,
+        (stderr, Some(status_error)) => format!("{stderr}\n{status_error}"),
+        (stderr, None) => stderr.to_owned(),
+    }
+}
+
 #[cfg(unix)]
 fn request_graceful_termination(child: &mut std::process::Child) {
     // The PID comes directly from the live Child handle.
@@ -565,9 +606,20 @@ mod tests {
             &[std::path::PathBuf::from("/extensions/team.ts")],
             "(allow network-outbound (remote tcp))",
         );
+        assert!(profile.contains("(import \"system.sb\")"));
         assert!(profile.contains("(subpath \"/project\")"));
         assert!(profile.contains("(subpath \"/temporary-child\")"));
         assert!(profile.contains("(subpath \"/extensions/team.ts\")"));
         assert!(profile.contains("(allow network-outbound (remote tcp))"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_terminated_children_have_a_nonempty_diagnostic() {
+        let status = <std::process::ExitStatus as std::os::unix::process::ExitStatusExt>::from_raw(
+            libc::SIGABRT,
+        );
+
+        assert!(process_error(String::new(), Some(&status), None).contains("signal"));
     }
 }

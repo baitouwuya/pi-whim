@@ -2320,7 +2320,8 @@ fn session_readable_by(actor: &AgentDescriptor, target: &AgentDescriptor) -> boo
         return true;
     }
     if actor.level == 0 {
-        return target.level == 0 && actor.team_id == target.team_id;
+        return actor.team_id == target.team_id
+            && (target.level == 0 || target.parent_id == Some(actor.id));
     }
     actor.team_id == target.team_id
         && (target.parent_id == Some(actor.id)
@@ -3911,6 +3912,41 @@ mod tests {
         .unwrap();
         assert_eq!(result["access"]["read"], true);
         assert_eq!(result["access"]["send_message"], true);
+        supervisor.stop().unwrap();
+    }
+
+    #[test]
+    fn root_can_read_a_direct_child_session() {
+        let (mut supervisor, _) = test_host(AgentTeamConfig::default());
+        let child = reserve_child(
+            &supervisor.host,
+            supervisor.root_id,
+            &SpawnAgentArguments {
+                name: "child".into(),
+                role: String::new(),
+                task: "inspect this".into(),
+                provider: None,
+                model: None,
+                permission_level: None,
+                enabled_tools: None,
+                trusted_extensions: None,
+                preset: None,
+            },
+        )
+        .unwrap()
+        .0;
+        let child_session = supervisor.host.shared.0.lock().unwrap().actors[&child]
+            .descriptor
+            .session_id;
+
+        let result = read_session(
+            &supervisor.host,
+            supervisor.root_id,
+            &json!({ "session_id": child_session }),
+        )
+        .unwrap();
+
+        assert_eq!(result["access"]["read"], true);
         supervisor.stop().unwrap();
     }
 
