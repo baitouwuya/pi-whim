@@ -395,7 +395,17 @@ impl Sidebar {
                 title
                     .overflow_x_scroll()
                     .track_scroll(&title_scroll)
-                    .child(div().flex_none().child(SharedString::from(label.clone())))
+                    // The native horizontal scroller lays out its content from
+                    // the top unless the child carries the row height too.
+                    .child(
+                        div()
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .flex_none()
+                            .whitespace_nowrap()
+                            .child(SharedString::from(label.clone())),
+                    )
             })
             .when(!title_hovered, |title| {
                 title

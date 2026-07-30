@@ -127,7 +127,7 @@ pub struct PiWhimApplication<R: AgentRuntime = PiRpcRuntime> {
         crossbeam_channel::Receiver<OneShotCompletion>,
     ),
     pending_session_titles: HashMap<OneShotRequestId, PendingSessionTitle>,
-    staged_session_title_prompts: HashMap<SessionToken, String>,
+    expected_session_title_names: HashMap<SessionToken, String>,
     title_eligible: HashSet<SessionToken>,
     title_attempted: HashSet<SessionToken>,
 }
@@ -221,7 +221,7 @@ impl Default for PiWhimApplication<PiRpcRuntime> {
             one_shot_installs: crossbeam_channel::unbounded(),
             one_shot_completions: crossbeam_channel::unbounded(),
             pending_session_titles: HashMap::new(),
-            staged_session_title_prompts: HashMap::new(),
+            expected_session_title_names: HashMap::new(),
             title_eligible: HashSet::new(),
             title_attempted: HashSet::new(),
         };
@@ -1988,12 +1988,12 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             .sessions
             .token_for(key)
             .is_some_and(|token| self.title_eligible.remove(&token));
-        if should_title && let Some(token) = self.sessions.token_for(key) {
-            self.staged_session_title_prompts.insert(token, content);
+        if should_title {
+            self.start_session_title(key, content);
         }
     }
 
-    fn schedule_session_title(&mut self, key: &str, content: String, baseline: String) {
+    fn start_session_title(&mut self, key: &str, content: String) {
         let Some(token) = self.sessions.token_for(key) else {
             return;
         };
@@ -2001,8 +2001,49 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             return;
         }
         let fallback = fallback_session_title(&content);
+        let Some((project_id, session_file)) = self.sessions.get(key).and_then(|session| {
+            let state = session
+                .runtime
+                .command(json!({"type":"get_state"}))
+                .ok()
+                .unwrap_or(Value::Null);
+            if session
+                .runtime
+                .command(json!({"type":"set_session_name", "name": fallback}))
+                .is_err()
+            {
+                return None;
+            }
+            Some((
+                session.project_id,
+                state
+                    .get("sessionFile")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            ))
+        }) else {
+            return;
+        };
+        let baseline = fallback.clone();
+
+        // A matching session-info event is the acknowledgement of this name,
+        // not a manual rename that should cancel the background replacement.
+        self.expected_session_title_names
+            .insert(token, baseline.clone());
+        if let Some(path) = session_file {
+            self.index_session(project_id, &path, Some(&baseline));
+        }
+        self.schedule_session_title(token, content, fallback, baseline);
+    }
+
+    fn schedule_session_title(
+        &mut self,
+        token: SessionToken,
+        content: String,
+        fallback: String,
+        baseline: String,
+    ) {
         let Some(service) = self.one_shot_ai.as_ref() else {
-            self.apply_session_title(token, fallback, &baseline);
             return;
         };
         let generation = service.generation();
@@ -2039,6 +2080,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     }
 
     fn apply_session_title(&mut self, token: SessionToken, title: String, baseline: &str) {
+        self.expected_session_title_names.remove(&token);
         let Some(key) = self.sessions.key_for(token).map(str::to_owned) else {
             return;
         };
@@ -2069,7 +2111,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     }
 
     fn cancel_pending_title(&mut self, token: SessionToken) {
-        self.staged_session_title_prompts.remove(&token);
+        self.expected_session_title_names.remove(&token);
         let request_ids = self
             .pending_session_titles
             .iter()
@@ -2201,28 +2243,24 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 }
             }
             events::Effect::RenameSessionFile(name) => {
-                let staged_title = name
-                    .as_ref()
-                    .filter(|name| !name.trim().is_empty())
-                    .and_then(|baseline| {
-                        let token = self.sessions.token_for(key)?;
-                        self.staged_session_title_prompts
-                            .remove(&token)
-                            .map(|content| (content, baseline.clone()))
-                    });
-                // A later name change while AI is pending is manual or external;
-                // preserve it instead of letting the generated title win a race.
-                if staged_title.is_none()
-                    && name.as_ref().is_some_and(|name| !name.trim().is_empty())
-                    && let Some(token) = self.sessions.token_for(key)
+                if let Some(token) = self.sessions.token_for(key)
+                    && let Some(name) = name
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
                 {
-                    self.cancel_pending_title(token);
+                    let expected = self
+                        .expected_session_title_names
+                        .get(&token)
+                        .is_some_and(|expected| expected.trim() == name);
+                    if !expected {
+                        // Any other non-empty name is manual or external and wins
+                        // over a late background result.
+                        self.cancel_pending_title(token);
+                    }
                 }
                 if let Some((project_id, path, _)) = self.reported_session_file(key) {
                     self.index_session(project_id, &path, name.as_deref());
-                }
-                if let Some((content, baseline)) = staged_title {
-                    self.schedule_session_title(key, content, baseline);
                 }
             }
             events::Effect::ReloadEntries => {
