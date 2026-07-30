@@ -809,6 +809,7 @@ impl SecretStore for MacosKeychainStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pi_whim_core::{OneShotAiTaskConfig, SESSION_TITLE_TASK_KIND};
     use tempfile::tempdir;
 
     #[test]
@@ -830,6 +831,21 @@ mod tests {
     fn preferences_round_trip() {
         let directory = tempdir().unwrap();
         let store = SqliteStore::open(directory.path().join("test.sqlite")).unwrap();
+        let mut one_shot_ai_config = OneShotAiConfig {
+            max_concurrency: 7,
+            queue_capacity: 128,
+            timeout_secs: 30,
+            ..Default::default()
+        };
+        one_shot_ai_config.set_task(
+            SESSION_TITLE_TASK_KIND,
+            OneShotAiTaskConfig {
+                enabled: true,
+                provider_id: Some(Uuid::new_v4()),
+                model_id: Some("example-model".into()),
+                ..Default::default()
+            },
+        );
         let preferences = AppPreferences {
             language: Language::SimplifiedChinese,
             bash_policy: BashPolicy::Ask,
@@ -839,15 +855,7 @@ mod tests {
                 max_agents_per_level: 5,
                 ..Default::default()
             },
-            one_shot_ai_config: OneShotAiConfig {
-                enabled: true,
-                provider_id: Some(Uuid::new_v4()),
-                model_id: Some("example-model".into()),
-                max_concurrency: 7,
-                queue_capacity: 128,
-                timeout_secs: 30,
-                ..Default::default()
-            },
+            one_shot_ai_config,
         };
         store.save_preferences(preferences.clone()).unwrap();
         assert_eq!(store.load_preferences().unwrap(), preferences);
@@ -866,7 +874,7 @@ mod tests {
             .unwrap();
 
         let config = store.load_preferences().unwrap().one_shot_ai_config;
-        assert!(config.enabled);
+        assert!(config.task(SESSION_TITLE_TASK_KIND).enabled);
         assert_eq!(config.max_concurrency, 16);
         assert_eq!(config.queue_capacity, 64);
         assert_eq!(config.timeout_secs, 3);

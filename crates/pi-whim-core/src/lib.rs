@@ -37,15 +37,33 @@ pub const MAX_ONE_SHOT_AI_QUEUE_CAPACITY: u16 = 1024;
 pub const DEFAULT_ONE_SHOT_AI_TIMEOUT_SECS: u8 = 15;
 pub const MIN_ONE_SHOT_AI_TIMEOUT_SECS: u8 = 3;
 pub const MAX_ONE_SHOT_AI_TIMEOUT_SECS: u8 = 60;
+pub const SESSION_TITLE_TASK_KIND: &str = "session_title";
 
-/// Persisted resource and model selection for lightweight background AI work.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Provider and model selection for one lightweight background task.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct OneShotAiConfig {
+pub struct OneShotAiTaskConfig {
     pub enabled: bool,
     pub provider_id: Option<ProviderId>,
     pub model_id: Option<String>,
     pub thinking_level: ThinkingLevel,
+}
+
+impl OneShotAiTaskConfig {
+    pub fn normalized(mut self) -> Self {
+        self.model_id = self
+            .model_id
+            .take()
+            .map(|model| model.trim().to_owned())
+            .filter(|model| !model.is_empty());
+        self
+    }
+}
+
+/// Persisted task routing and shared resource limits for background AI work.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct OneShotAiConfig {
+    pub tasks: BTreeMap<String, OneShotAiTaskConfig>,
     pub max_concurrency: u8,
     pub queue_capacity: u16,
     pub timeout_secs: u8,
@@ -54,10 +72,10 @@ pub struct OneShotAiConfig {
 impl Default for OneShotAiConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            provider_id: None,
-            model_id: None,
-            thinking_level: ThinkingLevel::Off,
+            tasks: BTreeMap::from([(
+                SESSION_TITLE_TASK_KIND.to_owned(),
+                OneShotAiTaskConfig::default(),
+            )]),
             max_concurrency: DEFAULT_ONE_SHOT_AI_CONCURRENCY,
             queue_capacity: DEFAULT_ONE_SHOT_AI_QUEUE_CAPACITY,
             timeout_secs: DEFAULT_ONE_SHOT_AI_TIMEOUT_SECS,
@@ -67,17 +85,91 @@ impl Default for OneShotAiConfig {
 
 impl OneShotAiConfig {
     pub fn normalized(mut self) -> Self {
-        self.model_id = self
-            .model_id
-            .take()
-            .map(|model| model.trim().to_owned())
-            .filter(|model| !model.is_empty());
+        for task in self.tasks.values_mut() {
+            *task = std::mem::take(task).normalized();
+        }
+        self.tasks
+            .entry(SESSION_TITLE_TASK_KIND.to_owned())
+            .or_default();
         self.max_concurrency = self.max_concurrency.clamp(1, MAX_ONE_SHOT_AI_CONCURRENCY);
         self.queue_capacity = self.queue_capacity.min(MAX_ONE_SHOT_AI_QUEUE_CAPACITY);
         self.timeout_secs = self
             .timeout_secs
             .clamp(MIN_ONE_SHOT_AI_TIMEOUT_SECS, MAX_ONE_SHOT_AI_TIMEOUT_SECS);
         self
+    }
+
+    pub fn task(&self, kind: &str) -> OneShotAiTaskConfig {
+        self.tasks.get(kind).cloned().unwrap_or_default()
+    }
+
+    pub fn set_task(&mut self, kind: impl Into<String>, task: OneShotAiTaskConfig) {
+        self.tasks.insert(kind.into(), task.normalized());
+    }
+}
+
+/// Deserialization keeps the short-lived original schema compatible. New
+/// versions serialize only `tasks`; old top-level routing fields are folded into
+/// the session-title task when no task map is present.
+#[derive(Deserialize)]
+#[serde(default)]
+struct OneShotAiConfigWire {
+    tasks: BTreeMap<String, OneShotAiTaskConfig>,
+    max_concurrency: u8,
+    queue_capacity: u16,
+    timeout_secs: u8,
+    enabled: Option<bool>,
+    provider_id: Option<ProviderId>,
+    model_id: Option<String>,
+    thinking_level: Option<ThinkingLevel>,
+}
+
+impl Default for OneShotAiConfigWire {
+    fn default() -> Self {
+        let config = OneShotAiConfig::default();
+        Self {
+            tasks: BTreeMap::new(),
+            max_concurrency: config.max_concurrency,
+            queue_capacity: config.queue_capacity,
+            timeout_secs: config.timeout_secs,
+            enabled: None,
+            provider_id: None,
+            model_id: None,
+            thinking_level: None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for OneShotAiConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = OneShotAiConfigWire::deserialize(deserializer)?;
+        let mut tasks = wire.tasks;
+        if tasks.is_empty()
+            && (wire.enabled.is_some()
+                || wire.provider_id.is_some()
+                || wire.model_id.is_some()
+                || wire.thinking_level.is_some())
+        {
+            tasks.insert(
+                SESSION_TITLE_TASK_KIND.to_owned(),
+                OneShotAiTaskConfig {
+                    enabled: wire.enabled.unwrap_or(false),
+                    provider_id: wire.provider_id,
+                    model_id: wire.model_id,
+                    thinking_level: wire.thinking_level.unwrap_or_default(),
+                },
+            );
+        }
+        Ok(Self {
+            tasks,
+            max_concurrency: wire.max_concurrency,
+            queue_capacity: wire.queue_capacity,
+            timeout_secs: wire.timeout_secs,
+        }
+        .normalized())
     }
 }
 
@@ -937,22 +1029,32 @@ mod tests {
     #[test]
     fn one_shot_ai_config_is_safe_by_default_and_bounded() {
         let defaults = OneShotAiConfig::default();
-        assert!(!defaults.enabled);
-        assert_eq!(defaults.provider_id, None);
-        assert_eq!(defaults.model_id, None);
+        let title = defaults.task(SESSION_TITLE_TASK_KIND);
+        assert!(!title.enabled);
+        assert_eq!(title.provider_id, None);
+        assert_eq!(title.model_id, None);
         assert_eq!(defaults.max_concurrency, 4);
         assert_eq!(defaults.queue_capacity, 64);
         assert_eq!(defaults.timeout_secs, 15);
 
-        let normalized = OneShotAiConfig {
-            model_id: Some("  model-name  ".into()),
+        let mut normalized = OneShotAiConfig {
             max_concurrency: 0,
             queue_capacity: u16::MAX,
             timeout_secs: u8::MAX,
             ..Default::default()
-        }
-        .normalized();
-        assert_eq!(normalized.model_id.as_deref(), Some("model-name"));
+        };
+        normalized.set_task(
+            SESSION_TITLE_TASK_KIND,
+            OneShotAiTaskConfig {
+                model_id: Some("  model-name  ".into()),
+                ..Default::default()
+            },
+        );
+        let normalized = normalized.normalized();
+        assert_eq!(
+            normalized.task(SESSION_TITLE_TASK_KIND).model_id.as_deref(),
+            Some("model-name")
+        );
         assert_eq!(normalized.max_concurrency, 1);
         assert_eq!(normalized.queue_capacity, 1024);
         assert_eq!(normalized.timeout_secs, 60);
@@ -965,6 +1067,28 @@ mod tests {
         }));
         assert_eq!(state.one_shot_ai_config.max_concurrency, 16);
         assert_eq!(state.one_shot_ai_config.timeout_secs, 3);
+    }
+
+    #[test]
+    fn legacy_one_shot_routing_moves_into_the_session_title_task() {
+        let provider_id = ProviderId::new_v4();
+        let config: OneShotAiConfig = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "provider_id": provider_id,
+            "model_id": " legacy-model ",
+            "thinking_level": "high",
+            "max_concurrency": 6,
+            "queue_capacity": 80,
+            "timeout_secs": 20
+        }))
+        .unwrap();
+
+        let title = config.task(SESSION_TITLE_TASK_KIND);
+        assert!(title.enabled);
+        assert_eq!(title.provider_id, Some(provider_id));
+        assert_eq!(title.model_id.as_deref(), Some("legacy-model"));
+        assert_eq!(title.thinking_level, ThinkingLevel::High);
+        assert_eq!(config.max_concurrency, 6);
     }
 
     #[test]

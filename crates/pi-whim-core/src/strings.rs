@@ -196,6 +196,22 @@ const STRINGS: &[(&str, &str, &str)] = &[
         "Lightweight AI requests for automatic session titles and similar background work.",
         "为自动会话命名等后台工作发起轻量 AI 请求。",
     ),
+    ("background-ai-tasks", "Tasks", "场景"),
+    (
+        "background-ai-tasks-help",
+        "Each task can use its own provider, model, and thinking level.",
+        "每个场景可以分别配置提供商、模型和思考级别。",
+    ),
+    (
+        "edit-background-ai-task",
+        "Edit task settings",
+        "编辑场景设置",
+    ),
+    (
+        "background-ai-task-incomplete",
+        "Select a model before enabling this task.",
+        "启用此场景前需要选择模型。",
+    ),
     ("background-ai-session-title", "Session titles", "会话标题"),
     (
         "background-ai-session-title-help",

@@ -4,7 +4,7 @@ mod protocol;
 mod service;
 mod task;
 
-pub use pi_whim_core::OneShotAiConfig;
+pub use pi_whim_core::{OneShotAiConfig, OneShotAiTaskConfig};
 pub use service::{
     OneShotAiService, OneShotCompletion, OneShotErrorKind, OneShotRequestId, OneShotServiceError,
     OneShotStats, OneShotSubmitError, ResolvedOneShotAiConfig,

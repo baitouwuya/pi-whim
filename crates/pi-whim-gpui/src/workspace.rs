@@ -643,6 +643,29 @@ impl Workspace {
                     .update(cx, |settings, cx| settings.show(section, cx));
             }
 
+            SettingsEvent::EditBackgroundAiTask(kind) => {
+                self.settings.update(cx, |settings, cx| {
+                    settings.edit_background_ai_task(kind, window, cx);
+                });
+            }
+            SettingsEvent::CloseBackgroundAiTaskEditor => {
+                self.settings.update(cx, |settings, cx| {
+                    settings.close_background_ai_task_editor(window, cx);
+                });
+            }
+            SettingsEvent::SetBackgroundAiTaskEnabled(enabled) => {
+                self.settings.update(cx, |settings, cx| {
+                    settings.set_background_ai_task_enabled(enabled, cx);
+                });
+            }
+            SettingsEvent::SaveBackgroundAiTask => {
+                let config = self.settings.read(cx).background_ai_config_with_draft();
+                self.request(Request::SetOneShotAiConfig(config), cx);
+                self.settings.update(cx, |settings, cx| {
+                    settings.close_background_ai_task_editor(window, cx);
+                });
+            }
+
             SettingsEvent::SelectProvider(id) => {
                 self.settings.update(cx, |settings, cx| {
                     settings.edit_provider(id, window, cx);
@@ -1385,13 +1408,19 @@ mod tests {
 
     #[test]
     fn background_ai_config_is_forwarded_as_one_atomic_preference() {
-        let config = OneShotAiConfig {
-            enabled: true,
+        let mut config = OneShotAiConfig {
             max_concurrency: 8,
             queue_capacity: 128,
             timeout_secs: 20,
             ..OneShotAiConfig::default()
         };
+        config.set_task(
+            pi_whim_core::SESSION_TITLE_TASK_KIND,
+            pi_whim_core::OneShotAiTaskConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
 
         assert_eq!(
             preference_change(&SettingsEvent::SetOneShotAiConfig(config.clone())),

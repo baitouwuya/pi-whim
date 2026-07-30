@@ -31,8 +31,9 @@ use gpui_component::{
 use pi_whim_core::{
     AgentTeamConfig, AppState, BashPolicy, Language, MAX_AGENT_DEPTH, MAX_AGENTS_PER_LEVEL,
     MAX_ONE_SHOT_AI_CONCURRENCY, MAX_ONE_SHOT_AI_QUEUE_CAPACITY, MAX_ONE_SHOT_AI_TIMEOUT_SECS,
-    MIN_ONE_SHOT_AI_TIMEOUT_SECS, OneShotAiConfig, ProviderId, ProviderModel, ProviderProtocol,
-    QueueMode, SearchEngineId, SearchEngineKind, SearchEngineProfile, strings::tr,
+    MIN_ONE_SHOT_AI_TIMEOUT_SECS, OneShotAiConfig, OneShotAiTaskConfig, ProviderId, ProviderModel,
+    ProviderProtocol, QueueMode, SESSION_TITLE_TASK_KIND, SearchEngineId, SearchEngineKind,
+    SearchEngineProfile, strings::tr,
 };
 use pi_whim_engine::settings::{
     Preset, ProviderDraft, SearchEngineDraft, Section, move_search_engine, remove_search_engine,
@@ -81,6 +82,11 @@ pub enum SettingsEvent {
     Close,
     /// Show a different section.
     Show(Section),
+
+    EditBackgroundAiTask(String),
+    CloseBackgroundAiTaskEditor,
+    SetBackgroundAiTaskEnabled(bool),
+    SaveBackgroundAiTask,
 
     SetLanguage(Language),
     SetAutoCompaction(bool),
@@ -137,6 +143,9 @@ pub struct Settings {
     /// the drafts, and the shell owns the real one.
     state: AppState,
     provider: ProviderDraft,
+    background_ai_task_kind: Option<String>,
+    background_ai_task: OneShotAiTaskConfig,
+    background_ai_editor_open: bool,
     search_engine: SearchEngineDraft,
     search_engine_editor_open: bool,
     editor_search_test: Option<SearchEngineTestStatus>,
@@ -203,6 +212,7 @@ impl Settings {
         cx: &mut Context<Self>,
     ) -> Self {
         let provider = ProviderDraft::default();
+        let background_ai_task = state.one_shot_ai_config.task(SESSION_TITLE_TASK_KIND);
         let search_engine = SearchEngineDraft::default();
         let general_fields = general::Fields {
             blocked_patterns: cx.new(|cx| {
@@ -252,13 +262,13 @@ impl Settings {
         let background_ai_fields = background_ai::Fields {
             model: choice_picker(
                 background_ai::model_choices(&state),
-                background_ai::selected_model(&state),
+                background_ai::selected_model(&background_ai_task),
                 window,
                 cx,
             ),
             thinking: choice_picker(
-                background_ai::thinking_choices(&state),
-                state.one_shot_ai_config.thinking_level,
+                background_ai::thinking_choices(&state, &background_ai_task),
+                background_ai_task.thinking_level,
                 window,
                 cx,
             ),
@@ -321,6 +331,9 @@ impl Settings {
             tokens,
             state,
             provider,
+            background_ai_task_kind: None,
+            background_ai_task,
+            background_ai_editor_open: false,
             search_engine,
             search_engine_editor_open: false,
             editor_search_test: None,
@@ -473,32 +486,33 @@ impl Settings {
             },
         )
         .detach();
-        cx.subscribe_in(&background_ai.model, window, |settings, _, event, _, cx| {
-            if let SelectEvent::Confirm(Some(selection)) = event {
-                let (provider_id, model_id) = selection
-                    .clone()
-                    .map(|(provider, model)| (Some(provider), Some(model)))
-                    .unwrap_or((None, None));
-                cx.emit(SettingsEvent::SetOneShotAiConfig(OneShotAiConfig {
-                    provider_id,
-                    model_id,
+        cx.subscribe_in(
+            &background_ai.model,
+            window,
+            |settings, _, event, window, cx| {
+                if let SelectEvent::Confirm(Some(selection)) = event {
+                    let (provider_id, model_id) = selection
+                        .clone()
+                        .map(|(provider, model)| (Some(provider), Some(model)))
+                        .unwrap_or((None, None));
+                    settings.background_ai_task.provider_id = provider_id;
+                    settings.background_ai_task.model_id = model_id;
                     // Off is valid for every model; do not carry an unsupported
                     // reasoning level across a model change.
-                    thinking_level: pi_whim_core::ThinkingLevel::Off,
-                    ..settings.state.one_shot_ai_config.clone()
-                }));
-            }
-        })
+                    settings.background_ai_task.thinking_level = pi_whim_core::ThinkingLevel::Off;
+                    settings.seed_background_ai_choices(window, cx);
+                    cx.notify();
+                }
+            },
+        )
         .detach();
         cx.subscribe_in(
             &background_ai.thinking,
             window,
             |settings, _, event, _, cx| {
                 if let SelectEvent::Confirm(Some(thinking_level)) = event {
-                    cx.emit(SettingsEvent::SetOneShotAiConfig(OneShotAiConfig {
-                        thinking_level: *thinking_level,
-                        ..settings.state.one_shot_ai_config.clone()
-                    }));
+                    settings.background_ai_task.thinking_level = *thinking_level;
+                    cx.notify();
                 }
             },
         )
@@ -554,6 +568,13 @@ impl Settings {
         let one_shot_changed = self.state.one_shot_ai_config != state.one_shot_ai_config;
         let providers_changed = self.state.provider_profiles != state.provider_profiles;
         self.state = state.clone();
+        if one_shot_changed && !self.background_ai_editor_open {
+            let kind = self
+                .background_ai_task_kind
+                .as_deref()
+                .unwrap_or(SESSION_TITLE_TASK_KIND);
+            self.background_ai_task = self.state.one_shot_ai_config.task(kind);
+        }
         self.search_engine_tests.retain(|id, _| {
             self.state
                 .search_engine_profiles
@@ -708,6 +729,46 @@ impl Settings {
         self.provider.id = Some(id);
         self.provider.api_key.clear();
         cx.notify();
+    }
+
+    /// Open one fixed background-task profile in the shared editor.
+    pub fn edit_background_ai_task(
+        &mut self,
+        kind: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.background_ai_task = self.state.one_shot_ai_config.task(&kind);
+        self.background_ai_task_kind = Some(kind);
+        self.background_ai_editor_open = true;
+        self.seed_background_ai_choices(window, cx);
+        cx.notify();
+    }
+
+    /// Close the task editor and discard changes not sent to preferences.
+    pub fn close_background_ai_task_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.background_ai_editor_open = false;
+        let kind = self
+            .background_ai_task_kind
+            .as_deref()
+            .unwrap_or(SESSION_TITLE_TASK_KIND);
+        self.background_ai_task = self.state.one_shot_ai_config.task(kind);
+        self.seed_background_ai_choices(window, cx);
+        cx.notify();
+    }
+
+    pub fn set_background_ai_task_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.background_ai_task.enabled = enabled;
+        cx.notify();
+    }
+
+    /// Merge the open task draft into the latest shared limits.
+    pub fn background_ai_config_with_draft(&self) -> OneShotAiConfig {
+        let mut config = self.state.one_shot_ai_config.clone();
+        if let Some(kind) = self.background_ai_task_kind.as_deref() {
+            config.set_task(kind, self.background_ai_task.clone());
+        }
+        config.normalized()
     }
 
     /// Start a search engine that has not been saved and open its editor.
@@ -899,14 +960,14 @@ impl Settings {
         sync_choice_picker(
             &self.background_ai_fields.model,
             background_ai::model_choices(&self.state),
-            background_ai::selected_model(&self.state),
+            background_ai::selected_model(&self.background_ai_task),
             window,
             cx,
         );
         sync_choice_picker(
             &self.background_ai_fields.thinking,
-            background_ai::thinking_choices(&self.state),
-            self.state.one_shot_ai_config.thinking_level,
+            background_ai::thinking_choices(&self.state, &self.background_ai_task),
+            self.background_ai_task.thinking_level,
             window,
             cx,
         );
@@ -1066,7 +1127,20 @@ impl Render for Settings {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = self.tokens;
         let emit = self.emit(cx);
-        let editor = self.search_engine_editor_open.then(|| {
+        let background_ai_editor = self.background_ai_editor_open.then(|| {
+            background_ai::render_editor(
+                &self.state,
+                self.background_ai_task_kind
+                    .as_deref()
+                    .unwrap_or(SESSION_TITLE_TASK_KIND),
+                &self.background_ai_task,
+                &self.background_ai_fields,
+                tokens,
+                emit.clone(),
+                cx,
+            )
+        });
+        let search_engine_editor = self.search_engine_editor_open.then(|| {
             web_search::render_editor(
                 &self.state,
                 &self.search_engine,
@@ -1123,7 +1197,8 @@ impl Render for Settings {
                         ),
                 ),
             )
-            .when_some(editor, |this, editor| this.child(editor))
+            .when_some(background_ai_editor, |this, editor| this.child(editor))
+            .when_some(search_engine_editor, |this, editor| this.child(editor))
     }
 }
 

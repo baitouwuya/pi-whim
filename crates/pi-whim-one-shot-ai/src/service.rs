@@ -151,13 +151,15 @@ impl ResolvedOneShotAiConfig {
     pub fn new(
         generation: u64,
         config: &OneShotAiConfig,
+        task_kind: &str,
         profile: &ProviderProfile,
         api_key: String,
     ) -> Result<Self, OneShotServiceError> {
-        if !config.enabled {
+        let task = config.task(task_kind);
+        if !task.enabled {
             return Err(OneShotServiceError::Disabled);
         }
-        if config.provider_id != Some(profile.id) {
+        if task.provider_id != Some(profile.id) {
             return Err(OneShotServiceError::MissingProvider);
         }
         if !(1..=MAX_ONE_SHOT_AI_CONCURRENCY).contains(&config.max_concurrency) {
@@ -171,7 +173,7 @@ impl ResolvedOneShotAiConfig {
         {
             return Err(OneShotServiceError::InvalidTimeout);
         }
-        let model_id = config
+        let model_id = task
             .model_id
             .as_deref()
             .map(str::trim)
@@ -204,7 +206,7 @@ impl ResolvedOneShotAiConfig {
                 base_url,
                 protocol: profile.protocol,
                 model,
-                thinking_level: config.thinking_level,
+                thinking_level: task.thinking_level,
                 // Move the Keychain allocation directly into the redacted owner;
                 // avoid making a plaintext trim copy that could outlive it.
                 api_key: Secret::new(api_key),
@@ -590,7 +592,7 @@ fn is_cancelled(shared: &WorkerShared, request_id: OneShotRequestId) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pi_whim_core::{ProviderId, ProviderProfile};
+    use pi_whim_core::{OneShotAiTaskConfig, ProviderId, ProviderProfile, SESSION_TITLE_TASK_KIND};
     use serde_json::json;
     use std::{
         io::{Read, Write},
@@ -650,18 +652,31 @@ mod tests {
             updated_at_ms: 0,
             has_api_key: true,
         };
-        let config = OneShotAiConfig {
-            enabled: true,
-            provider_id: Some(provider_id),
-            model_id: Some("test/model".into()),
+        let mut config = OneShotAiConfig {
             max_concurrency: 1,
             queue_capacity: 1,
             timeout_secs: 3,
             ..Default::default()
         };
+        config.set_task(
+            SESSION_TITLE_TASK_KIND,
+            OneShotAiTaskConfig {
+                enabled: true,
+                provider_id: Some(provider_id),
+                model_id: Some("test/model".into()),
+                ..Default::default()
+            },
+        );
         Some((
             OneShotAiService::new(
-                ResolvedOneShotAiConfig::new(7, &config, &profile, "top-secret".into()).unwrap(),
+                ResolvedOneShotAiConfig::new(
+                    7,
+                    &config,
+                    SESSION_TITLE_TASK_KIND,
+                    &profile,
+                    "top-secret".into(),
+                )
+                .unwrap(),
             ),
             request_rx,
         ))

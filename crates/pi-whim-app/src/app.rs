@@ -14,9 +14,9 @@ use std::{
 use pi_whim_core::{
     Action, AgentPermissionLevel, AppState, Attachment, ConversationItem, ConversationRole,
     Language, ModelOption, Project, ProjectId, ProviderId, ProviderProfile, ProviderProtocol,
-    QueueMode, SearchEngineId, SearchEngineProfile, SessionMetrics, SessionStatus, SessionSummary,
-    SubmitMode, ThinkingLevel, normalize_bash_patterns, normalize_provider_display_name,
-    provider_name_key, stable_session_id, strings,
+    QueueMode, SESSION_TITLE_TASK_KIND, SearchEngineId, SearchEngineProfile, SessionMetrics,
+    SessionStatus, SessionSummary, SubmitMode, ThinkingLevel, normalize_bash_patterns,
+    normalize_provider_display_name, provider_name_key, stable_session_id, strings,
 };
 use pi_whim_one_shot_ai::{
     OneShotAiService, OneShotCompletion, OneShotRequestId, ResolvedOneShotAiConfig,
@@ -713,9 +713,10 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         }
 
         let config = self.state().one_shot_ai_config.clone().normalized();
-        let profile = config
+        let task = config.task(SESSION_TITLE_TASK_KIND);
+        let profile = task
             .enabled
-            .then_some(config.provider_id)
+            .then_some(task.provider_id)
             .flatten()
             .and_then(|id| {
                 self.state()
@@ -723,7 +724,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                     .iter()
                     .find(|profile| {
                         profile.id == id
-                            && config.model_id.as_ref().is_some_and(|model_id| {
+                            && task.model_id.as_ref().is_some_and(|model_id| {
                                 profile.models.iter().any(|model| &model.id == model_id)
                             })
                     })
@@ -737,7 +738,14 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                     .get(&provider_keychain_account(profile.id))
                     .ok()
                     .flatten()?;
-                ResolvedOneShotAiConfig::new(generation, &config, &profile, api_key).ok()
+                ResolvedOneShotAiConfig::new(
+                    generation,
+                    &config,
+                    SESSION_TITLE_TASK_KIND,
+                    &profile,
+                    api_key,
+                )
+                .ok()
             });
             let _ = sender.send((generation, resolved));
         });
