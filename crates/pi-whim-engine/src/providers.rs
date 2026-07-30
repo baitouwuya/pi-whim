@@ -126,24 +126,12 @@ pub fn discover_models(
     if base_url.is_empty() {
         return Err("Enter a base URL before discovering models.".into());
     }
-    let endpoint = match protocol {
-        ProviderProtocol::OpenAiCompletions | ProviderProtocol::OpenAiResponses => {
-            join_api_path(&base_url, "models")
-        }
-        ProviderProtocol::AnthropicMessages => join_api_path(&base_url, "v1/models"),
-        ProviderProtocol::GoogleGenerativeAi => join_api_path(&base_url, "models"),
-    };
+    let endpoint = protocol.discover_endpoint(&base_url);
     let mut request = ureq::get(&endpoint).header("Accept", "application/json");
     if let Some(api_key) = api_key.filter(|key| !key.trim().is_empty()) {
-        request = match protocol {
-            ProviderProtocol::OpenAiCompletions | ProviderProtocol::OpenAiResponses => {
-                request.header("Authorization", &format!("Bearer {api_key}"))
-            }
-            ProviderProtocol::AnthropicMessages => request
-                .header("x-api-key", api_key)
-                .header("anthropic-version", "2023-06-01"),
-            ProviderProtocol::GoogleGenerativeAi => request.header("x-goog-api-key", api_key),
-        };
+        for (name, value) in protocol.discovery_auth_headers(api_key) {
+            request = request.header(name, &value);
+        }
     }
     let mut response = request
         .call()
@@ -152,84 +140,10 @@ pub fn discover_models(
         .body_mut()
         .read_json()
         .map_err(|error| format!("Model discovery returned invalid JSON: {error}"))?;
-    let candidates = match protocol {
-        ProviderProtocol::OpenAiCompletions | ProviderProtocol::OpenAiResponses => body
-            .get("data")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|entry| {
-                entry.get("id").and_then(Value::as_str).map(|id| {
-                    let mut model = ProviderModel::new(id);
-                    model.name = entry
-                        .get("display_name")
-                        .or_else(|| entry.get("name"))
-                        .and_then(Value::as_str)
-                        .unwrap_or(id)
-                        .to_owned();
-                    model
-                })
-            })
-            .collect(),
-        ProviderProtocol::AnthropicMessages => body
-            .get("data")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|entry| {
-                entry.get("id").and_then(Value::as_str).map(|id| {
-                    let mut model = ProviderModel::new(id);
-                    model.name = entry
-                        .get("display_name")
-                        .and_then(Value::as_str)
-                        .unwrap_or(id)
-                        .to_owned();
-                    model
-                })
-            })
-            .collect(),
-        ProviderProtocol::GoogleGenerativeAi => body
-            .get("models")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|entry| {
-                entry.get("name").and_then(Value::as_str).map(|id| {
-                    let id = id.strip_prefix("models/").unwrap_or(id);
-                    let mut model = ProviderModel::new(id);
-                    model.name = entry
-                        .get("displayName")
-                        .and_then(Value::as_str)
-                        .unwrap_or(id)
-                        .to_owned();
-                    model.supports_images = entry
-                        .get("supportedGenerationMethods")
-                        .and_then(Value::as_array)
-                        .is_some_and(|methods| {
-                            methods.iter().any(|method| method == "generateContent")
-                        });
-                    model
-                })
-            })
-            .collect(),
-    };
-    let mut models: Vec<ProviderModel> = candidates;
+    let mut models = protocol.parse_models(&body);
     models.sort_by_key(|model| model.name.to_lowercase());
     models.dedup_by(|left, right| left.id == right.id);
     Ok(models)
-}
-
-pub fn join_api_path(base_url: &str, suffix: &str) -> String {
-    let base_url = base_url.trim_end_matches('/');
-    let suffix = suffix.trim_start_matches('/');
-    if base_url.ends_with("/v1") && suffix.starts_with("v1/") {
-        format!("{base_url}/{}", suffix.trim_start_matches("v1/"))
-    } else {
-        format!("{base_url}/{suffix}")
-    }
 }
 
 #[cfg(test)]

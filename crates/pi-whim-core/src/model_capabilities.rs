@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, fmt};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -225,6 +226,95 @@ fn same_usable_capability(left: &ModelCapability, right: &ModelCapability) -> bo
     left.reasoning == right.reasoning
         && left.supports_images == right.supports_images
         && left.thinking_level_map == right.thinking_level_map
+}
+
+/// Discovery shape for a custom Pi provider: how to reach its model-listing
+/// endpoint, how to authenticate that request, and how to parse the response.
+/// Centralising these per-protocol branches here means adding a new protocol
+/// only touches this `impl` block, not every discovery call site.
+impl crate::ProviderProtocol {
+    /// Append the protocol's model-listing path to a normalized base URL.
+    pub fn discover_endpoint(self, base_url: &str) -> String {
+        let suffix = match self {
+            Self::OpenAiCompletions | Self::OpenAiResponses => "models",
+            Self::AnthropicMessages => "v1/models",
+            Self::GoogleGenerativeAi => "models",
+        };
+        let base_url = base_url.trim_end_matches('/');
+        let suffix = suffix.trim_start_matches('/');
+        if base_url.ends_with("/v1") && suffix.starts_with("v1/") {
+            format!("{base_url}/{}", suffix.trim_start_matches("v1/"))
+        } else {
+            format!("{base_url}/{suffix}")
+        }
+    }
+
+    /// Auth headers a model-discovery request must carry for a non-empty key.
+    pub fn discovery_auth_headers(self, api_key: &str) -> Vec<(&'static str, String)> {
+        match self {
+            Self::OpenAiCompletions | Self::OpenAiResponses => {
+                vec![("Authorization", format!("Bearer {api_key}"))]
+            }
+            Self::AnthropicMessages => vec![
+                ("x-api-key", api_key.to_owned()),
+                ("anthropic-version", "2023-06-01".to_owned()),
+            ],
+            Self::GoogleGenerativeAi => vec![("x-goog-api-key", api_key.to_owned())],
+        }
+    }
+
+    /// Parse the protocol's model-listing response into local ProviderModel records.
+    pub fn parse_models(self, body: &Value) -> Vec<crate::ProviderModel> {
+        match self {
+            // OpenAI and Anthropic both list models under `data[].id` with an optional
+            // `display_name`; Anthropic's response carries no `name` field, so the
+            // fallback to `name` is inert for it but keeps the two branches aligned.
+            Self::OpenAiCompletions | Self::OpenAiResponses | Self::AnthropicMessages => body
+                .get("data")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|entry| {
+                    entry.get("id").and_then(Value::as_str).map(|id| {
+                        let mut model = crate::ProviderModel::new(id);
+                        model.name = entry
+                            .get("display_name")
+                            .or_else(|| entry.get("name"))
+                            .and_then(Value::as_str)
+                            .unwrap_or(id)
+                            .to_owned();
+                        model
+                    })
+                })
+                .collect(),
+            Self::GoogleGenerativeAi => body
+                .get("models")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|entry| {
+                    entry.get("name").and_then(Value::as_str).map(|id| {
+                        let id = id.strip_prefix("models/").unwrap_or(id);
+                        let mut model = crate::ProviderModel::new(id);
+                        model.name = entry
+                            .get("displayName")
+                            .and_then(Value::as_str)
+                            .unwrap_or(id)
+                            .to_owned();
+                        model.supports_images = entry
+                            .get("supportedGenerationMethods")
+                            .and_then(Value::as_array)
+                            .is_some_and(|methods| {
+                                methods.iter().any(|method| method == "generateContent")
+                            });
+                        model
+                    })
+                })
+                .collect(),
+        }
+    }
 }
 
 #[cfg(test)]
