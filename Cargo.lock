@@ -4666,6 +4666,7 @@ dependencies = [
  "pi-whim-core",
  "pi-whim-engine",
  "pi-whim-gpui",
+ "pi-whim-one-shot-ai",
  "pi-whim-persistence",
  "pi-whim-runtime",
  "pi-whim-theme",
@@ -4726,6 +4727,19 @@ dependencies = [
  "pi-whim-engine",
  "pi-whim-theme",
  "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "pi-whim-one-shot-ai"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "pi-whim-core",
+ "serde_json",
+ "unicode-segmentation",
+ "ureq",
+ "url",
  "uuid",
 ]
 

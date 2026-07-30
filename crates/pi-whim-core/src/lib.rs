@@ -30,6 +30,57 @@ pub fn stable_session_id(path: &str) -> SessionId {
 pub const MAX_AGENT_DEPTH: u8 = 8;
 pub const MAX_AGENTS_PER_LEVEL: u16 = 64;
 
+pub const DEFAULT_ONE_SHOT_AI_CONCURRENCY: u8 = 4;
+pub const MAX_ONE_SHOT_AI_CONCURRENCY: u8 = 16;
+pub const DEFAULT_ONE_SHOT_AI_QUEUE_CAPACITY: u16 = 64;
+pub const MAX_ONE_SHOT_AI_QUEUE_CAPACITY: u16 = 1024;
+pub const DEFAULT_ONE_SHOT_AI_TIMEOUT_SECS: u8 = 15;
+pub const MIN_ONE_SHOT_AI_TIMEOUT_SECS: u8 = 3;
+pub const MAX_ONE_SHOT_AI_TIMEOUT_SECS: u8 = 60;
+
+/// Persisted resource and model selection for lightweight background AI work.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OneShotAiConfig {
+    pub enabled: bool,
+    pub provider_id: Option<ProviderId>,
+    pub model_id: Option<String>,
+    pub thinking_level: ThinkingLevel,
+    pub max_concurrency: u8,
+    pub queue_capacity: u16,
+    pub timeout_secs: u8,
+}
+
+impl Default for OneShotAiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider_id: None,
+            model_id: None,
+            thinking_level: ThinkingLevel::Off,
+            max_concurrency: DEFAULT_ONE_SHOT_AI_CONCURRENCY,
+            queue_capacity: DEFAULT_ONE_SHOT_AI_QUEUE_CAPACITY,
+            timeout_secs: DEFAULT_ONE_SHOT_AI_TIMEOUT_SECS,
+        }
+    }
+}
+
+impl OneShotAiConfig {
+    pub fn normalized(mut self) -> Self {
+        self.model_id = self
+            .model_id
+            .take()
+            .map(|model| model.trim().to_owned())
+            .filter(|model| !model.is_empty());
+        self.max_concurrency = self.max_concurrency.clamp(1, MAX_ONE_SHOT_AI_CONCURRENCY);
+        self.queue_capacity = self.queue_capacity.min(MAX_ONE_SHOT_AI_QUEUE_CAPACITY);
+        self.timeout_secs = self
+            .timeout_secs
+            .clamp(MIN_ONE_SHOT_AI_TIMEOUT_SECS, MAX_ONE_SHOT_AI_TIMEOUT_SECS);
+        self
+    }
+}
+
 /// The externally visible permission level for a spawned agent.  The level grants
 /// a ceiling; the explicit tool/model lists in [`AgentPermissionPolicy`] can only
 /// make that ceiling smaller.
@@ -516,6 +567,7 @@ pub struct AppState {
     pub bash_policy: BashPolicy,
     pub bash_blocked_patterns: Vec<String>,
     pub agent_team_config: AgentTeamConfig,
+    pub one_shot_ai_config: OneShotAiConfig,
     pub session_status: SessionStatus,
     pub pending_steering: Vec<String>,
     pub pending_follow_up: Vec<String>,
@@ -575,6 +627,7 @@ pub enum Action {
     SetBashPolicy(BashPolicy),
     SetBashBlockedPatterns(Vec<String>),
     SetAgentTeamConfig(AgentTeamConfig),
+    SetOneShotAiConfig(OneShotAiConfig),
     ProviderProfilesLoaded(Vec<ProviderProfile>),
     /// Which providers have a key in the OS keychain.
     ///
@@ -650,6 +703,9 @@ impl AppState {
             }
             Action::SetAgentTeamConfig(config) => {
                 self.agent_team_config = config.normalized();
+            }
+            Action::SetOneShotAiConfig(config) => {
+                self.one_shot_ai_config = config.normalized();
             }
             Action::ProviderKeyStatusLoaded(statuses) => {
                 for (id, has_api_key) in statuses {
@@ -876,6 +932,39 @@ mod tests {
         assert_eq!(config.maximum_for_level(1), Some(1));
         assert_eq!(config.maximum_for_level(2), Some(1));
         assert_eq!(config.maximum_for_level(0), None);
+    }
+
+    #[test]
+    fn one_shot_ai_config_is_safe_by_default_and_bounded() {
+        let defaults = OneShotAiConfig::default();
+        assert!(!defaults.enabled);
+        assert_eq!(defaults.provider_id, None);
+        assert_eq!(defaults.model_id, None);
+        assert_eq!(defaults.max_concurrency, 4);
+        assert_eq!(defaults.queue_capacity, 64);
+        assert_eq!(defaults.timeout_secs, 15);
+
+        let normalized = OneShotAiConfig {
+            model_id: Some("  model-name  ".into()),
+            max_concurrency: 0,
+            queue_capacity: u16::MAX,
+            timeout_secs: u8::MAX,
+            ..Default::default()
+        }
+        .normalized();
+        assert_eq!(normalized.model_id.as_deref(), Some("model-name"));
+        assert_eq!(normalized.max_concurrency, 1);
+        assert_eq!(normalized.queue_capacity, 1024);
+        assert_eq!(normalized.timeout_secs, 60);
+
+        let mut state = AppState::default();
+        state.dispatch(Action::SetOneShotAiConfig(OneShotAiConfig {
+            max_concurrency: 100,
+            timeout_secs: 0,
+            ..Default::default()
+        }));
+        assert_eq!(state.one_shot_ai_config.max_concurrency, 16);
+        assert_eq!(state.one_shot_ai_config.timeout_secs, 3);
     }
 
     #[test]

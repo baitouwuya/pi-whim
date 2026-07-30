@@ -56,7 +56,7 @@ pub fn render_general(state: &AppState, fields: &Fields, tokens: Tokens, emit: E
                 tr(state, "context"),
                 Some(tr(state, "context-help")),
                 tokens,
-                vec![auto_compaction_row(state, tokens, emit)],
+                vec![auto_compaction_row(state, tokens, emit.clone())],
             ),
             form::group(
                 tr(state, "queue-mode"),

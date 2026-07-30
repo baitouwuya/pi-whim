@@ -13,9 +13,10 @@ use std::{
 
 use keyring::Entry;
 use pi_whim_core::{
-    AgentTeamConfig, BashPolicy, Language, Project, ProjectId, ProviderId, ProviderModel,
-    ProviderProfile, ProviderProtocol, SearchEngineKind, SearchEngineProfile, SessionId,
-    SessionSummary, normalize_bash_patterns, normalize_provider_display_name, provider_name_key,
+    AgentTeamConfig, BashPolicy, Language, OneShotAiConfig, Project, ProjectId, ProviderId,
+    ProviderModel, ProviderProfile, ProviderProtocol, SearchEngineKind, SearchEngineProfile,
+    SessionId, SessionSummary, normalize_bash_patterns, normalize_provider_display_name,
+    provider_name_key,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
@@ -69,6 +70,7 @@ pub struct AppPreferences {
     pub bash_policy: BashPolicy,
     pub bash_blocked_patterns: Vec<String>,
     pub agent_team_config: AgentTeamConfig,
+    pub one_shot_ai_config: OneShotAiConfig,
 }
 
 pub trait PreferencesRepository {
@@ -154,6 +156,10 @@ impl SqliteStore {
                 max_depth INTEGER NOT NULL,
                 max_agents_per_level_json TEXT NOT NULL,
                 policy_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS one_shot_ai_preferences (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                config_json TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS provider_profiles (
                 id TEXT PRIMARY KEY NOT NULL,
@@ -615,6 +621,7 @@ impl PreferencesRepository for SqliteStore {
                         },
                         bash_blocked_patterns: normalize_bash_patterns(bash_blocked_patterns),
                         agent_team_config: AgentTeamConfig::default(),
+                        one_shot_ai_config: OneShotAiConfig::default(),
                     })
                 },
             )
@@ -677,6 +684,22 @@ impl PreferencesRepository for SqliteStore {
                     rusqlite::Error::QueryReturnedNoRows => Ok(AgentTeamConfig::default()),
                     error => Err(error),
                 })?;
+        preferences.one_shot_ai_config = self
+            .connection
+            .query_row(
+                "SELECT config_json FROM one_shot_ai_preferences WHERE id = 1",
+                [],
+                |row| {
+                    let config_json = row.get::<_, String>(0)?;
+                    Ok(serde_json::from_str::<OneShotAiConfig>(&config_json)
+                        .unwrap_or_default()
+                        .normalized())
+                },
+            )
+            .or_else(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => Ok(OneShotAiConfig::default()),
+                error => Err(error),
+            })?;
         Ok(preferences)
     }
 
@@ -720,6 +743,17 @@ impl PreferencesRepository for SqliteStore {
              max_agents_per_level_json = excluded.max_agents_per_level_json,
              policy_json = excluded.policy_json",
             params![team_config.max_depth, limits_json, policy_json],
+        )?;
+        let one_shot_ai_config = serde_json::to_string(
+            &preferences.one_shot_ai_config.normalized(),
+        )
+        .map_err(|error| {
+            PersistenceError::Sql(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+        })?;
+        self.connection.execute(
+            "INSERT INTO one_shot_ai_preferences (id, config_json) VALUES (1, ?1)
+             ON CONFLICT(id) DO UPDATE SET config_json = excluded.config_json",
+            [one_shot_ai_config],
         )?;
         Ok(())
     }
@@ -805,9 +839,49 @@ mod tests {
                 max_agents_per_level: 5,
                 ..Default::default()
             },
+            one_shot_ai_config: OneShotAiConfig {
+                enabled: true,
+                provider_id: Some(Uuid::new_v4()),
+                model_id: Some("example-model".into()),
+                max_concurrency: 7,
+                queue_capacity: 128,
+                timeout_secs: 30,
+                ..Default::default()
+            },
         };
         store.save_preferences(preferences.clone()).unwrap();
         assert_eq!(store.load_preferences().unwrap(), preferences);
+    }
+
+    #[test]
+    fn legacy_or_invalid_one_shot_preferences_use_safe_defaults() {
+        let directory = tempdir().unwrap();
+        let store = SqliteStore::open(directory.path().join("test.sqlite")).unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO one_shot_ai_preferences (id, config_json) VALUES (1, ?1)",
+                [r#"{"enabled":true,"max_concurrency":99,"timeout_secs":1}"#],
+            )
+            .unwrap();
+
+        let config = store.load_preferences().unwrap().one_shot_ai_config;
+        assert!(config.enabled);
+        assert_eq!(config.max_concurrency, 16);
+        assert_eq!(config.queue_capacity, 64);
+        assert_eq!(config.timeout_secs, 3);
+
+        store
+            .connection
+            .execute(
+                "UPDATE one_shot_ai_preferences SET config_json = 'not-json' WHERE id = 1",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            store.load_preferences().unwrap().one_shot_ai_config,
+            OneShotAiConfig::default()
+        );
     }
 
     #[test]

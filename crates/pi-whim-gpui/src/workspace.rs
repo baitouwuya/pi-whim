@@ -13,8 +13,8 @@ use gpui::{
 use gpui_component::theme::{Theme as ComponentTheme, ThemeMode as ComponentMode};
 use pi_whim_core::{
     AgentPermissionLevel, AgentTeamConfig, AppState, Attachment, BashPolicy, Language, ModelOption,
-    ProjectId, ProviderId, ProviderProfile, ProviderProtocol, QueueMode, SearchEngineProfile,
-    SessionStatus, SubmitMode, ThinkingLevel, strings::text as translate,
+    OneShotAiConfig, ProjectId, ProviderId, ProviderProfile, ProviderProtocol, QueueMode,
+    SearchEngineProfile, SessionStatus, SubmitMode, ThinkingLevel, strings::text as translate,
 };
 use pi_whim_engine::dialogs::{Answer, Prompt};
 use pi_whim_engine::notice::Outbox;
@@ -138,6 +138,7 @@ pub enum Request {
     /// running supervisors without restarting Pi or disturbing a turn.
     SetPermissionLevel(AgentPermissionLevel),
     SetAgentTeamConfig(AgentTeamConfig),
+    SetOneShotAiConfig(OneShotAiConfig),
     SetAutoCompaction(bool),
     /// Store a provider, and its key if one was typed.
     SaveProvider {
@@ -798,6 +799,7 @@ impl Workspace {
             | SettingsEvent::SetBashPolicy(_)
             | SettingsEvent::SetBlockedPatterns(_)
             | SettingsEvent::SetAgentTeamConfig(_)
+            | SettingsEvent::SetOneShotAiConfig(_)
             | SettingsEvent::SetQueueModes { .. } => unreachable!("taken by preference_change"),
         }
         cx.notify();
@@ -1145,6 +1147,9 @@ fn preference_change(event: &SettingsEvent) -> Option<Request> {
         SettingsEvent::SetAgentTeamConfig(config) => {
             Some(Request::SetAgentTeamConfig(config.clone()))
         }
+        SettingsEvent::SetOneShotAiConfig(config) => {
+            Some(Request::SetOneShotAiConfig(config.clone()))
+        }
         // The controls bar sends the same request from beside the prompt.
         SettingsEvent::SetQueueModes {
             steering,
@@ -1376,6 +1381,22 @@ mod tests {
         let request =
             preference_change(&SettingsEvent::SetBashPolicy(BashPolicy::Deny)).expect("a change");
         assert_eq!(request, Request::SetBashPolicy(BashPolicy::Deny));
+    }
+
+    #[test]
+    fn background_ai_config_is_forwarded_as_one_atomic_preference() {
+        let config = OneShotAiConfig {
+            enabled: true,
+            max_concurrency: 8,
+            queue_capacity: 128,
+            timeout_secs: 20,
+            ..OneShotAiConfig::default()
+        };
+
+        assert_eq!(
+            preference_change(&SettingsEvent::SetOneShotAiConfig(config.clone())),
+            Some(Request::SetOneShotAiConfig(config))
+        );
     }
 
     #[test]

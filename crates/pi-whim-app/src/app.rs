@@ -6,7 +6,7 @@
 //! touching any of it.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -17,6 +17,10 @@ use pi_whim_core::{
     QueueMode, SearchEngineId, SearchEngineProfile, SessionMetrics, SessionStatus, SessionSummary,
     SubmitMode, ThinkingLevel, normalize_bash_patterns, normalize_provider_display_name,
     provider_name_key, stable_session_id, strings,
+};
+use pi_whim_one_shot_ai::{
+    OneShotAiService, OneShotCompletion, OneShotRequestId, ResolvedOneShotAiConfig,
+    SessionTitleTask, fallback_session_title,
 };
 use pi_whim_persistence::{
     AppPreferences, AttachmentStore, MacosKeychainStore, PreferencesRepository, ProjectRepository,
@@ -29,6 +33,7 @@ use uuid::Uuid;
 
 use pi_whim_catalog::ModelCapabilityResolver;
 use pi_whim_engine::mailbox::Delivery;
+use pi_whim_engine::mailbox::SessionToken;
 use pi_whim_engine::pool::{SessionPool, SessionRuntime, is_draft};
 use pi_whim_engine::protocol::queue_mode_name;
 use pi_whim_engine::providers::{
@@ -111,7 +116,29 @@ pub struct PiWhimApplication<R: AgentRuntime = PiRpcRuntime> {
         crossbeam_channel::Sender<(Option<String>, Vec<Action>)>,
         crossbeam_channel::Receiver<(Option<String>, Vec<Action>)>,
     ),
+    one_shot_ai: Option<OneShotAiService>,
+    one_shot_generation: u64,
+    one_shot_installs: (
+        crossbeam_channel::Sender<OneShotInstall>,
+        crossbeam_channel::Receiver<OneShotInstall>,
+    ),
+    one_shot_completions: (
+        crossbeam_channel::Sender<OneShotCompletion>,
+        crossbeam_channel::Receiver<OneShotCompletion>,
+    ),
+    pending_session_titles: HashMap<OneShotRequestId, PendingSessionTitle>,
+    title_eligible: HashSet<SessionToken>,
+    title_attempted: HashSet<SessionToken>,
 }
+
+#[derive(Clone)]
+struct PendingSessionTitle {
+    session: SessionToken,
+    generation: u64,
+    fallback: String,
+}
+
+type OneShotInstall = (u64, Option<ResolvedOneShotAiConfig>);
 
 impl Default for PiWhimApplication<PiRpcRuntime> {
     fn default() -> Self {
@@ -146,6 +173,7 @@ impl Default for PiWhimApplication<PiRpcRuntime> {
                 preferences.bash_blocked_patterns,
             ));
             let _ = engine.apply(Action::SetAgentTeamConfig(preferences.agent_team_config));
+            let _ = engine.apply(Action::SetOneShotAiConfig(preferences.one_shot_ai_config));
         }
         let mut search_engine_ids = Vec::new();
         if let Some(store) = store.as_ref()
@@ -169,7 +197,7 @@ impl Default for PiWhimApplication<PiRpcRuntime> {
             provider_ids = profiles.iter().map(|profile| profile.id).collect();
             let _ = engine.apply(Action::ProviderProfilesLoaded(profiles));
         }
-        let application = Self {
+        let mut application = Self {
             engine,
             store,
             secrets: MacosKeychainStore::default(),
@@ -186,12 +214,20 @@ impl Default for PiWhimApplication<PiRpcRuntime> {
             attachment_store: AttachmentStore::open_default(),
             notices: notice::Outbox::new(),
             control_updates: crossbeam_channel::unbounded(),
+            one_shot_ai: None,
+            one_shot_generation: 0,
+            one_shot_installs: crossbeam_channel::unbounded(),
+            one_shot_completions: crossbeam_channel::unbounded(),
+            pending_session_titles: HashMap::new(),
+            title_eligible: HashSet::new(),
+            title_attempted: HashSet::new(),
         };
         // Probing the keychain can block for a long time and this runs before
         // the window opens, so profiles start with their stored status and a
         // worker corrects them.
         application.refresh_provider_key_status(provider_ids);
         application.refresh_search_engine_key_status(search_engine_ids);
+        application.rebuild_one_shot_ai();
         application
     }
 }
@@ -237,6 +273,16 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         &self,
     ) -> crossbeam_channel::Receiver<(Option<String>, Vec<Action>)> {
         self.control_updates.1.clone()
+    }
+
+    pub(crate) fn one_shot_installs(
+        &self,
+    ) -> crossbeam_channel::Receiver<(u64, Option<ResolvedOneShotAiConfig>)> {
+        self.one_shot_installs.1.clone()
+    }
+
+    pub(crate) fn one_shot_completions(&self) -> crossbeam_channel::Receiver<OneShotCompletion> {
+        self.one_shot_completions.1.clone()
     }
 
     /// Messages bound for the user, taken off the queue.
@@ -380,6 +426,14 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                     self.apply(Action::SetAgentTeamConfig(config));
                     self.save_preferences();
                     self.restart_selected_project();
+                }
+            }
+            Request::SetOneShotAiConfig(config) => {
+                let config = config.normalized();
+                if self.state().one_shot_ai_config != config {
+                    self.apply(Action::SetOneShotAiConfig(config));
+                    self.save_preferences();
+                    self.rebuild_one_shot_ai();
                 }
             }
             Request::SetModel(model) => self.queue_model_switch(model),
@@ -562,6 +616,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             bash_policy: self.state().bash_policy,
             bash_blocked_patterns: self.state().bash_blocked_patterns.clone(),
             agent_team_config: self.state().agent_team_config.clone(),
+            one_shot_ai_config: self.state().one_shot_ai_config.clone(),
         };
         if let Some(store) = self.store.as_ref()
             && let Err(error) = store.save_preferences(preferences)
@@ -633,9 +688,83 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 let ids: Vec<ProviderId> = profiles.iter().map(|profile| profile.id).collect();
                 self.apply(Action::ProviderProfilesLoaded(profiles));
                 self.refresh_provider_key_status(ids);
+                self.rebuild_one_shot_ai();
             }
             Err(error) => self.notices.error(error.to_string()),
         }
+    }
+
+    /// Resolve the selected provider credential away from the UI thread. Every
+    /// call retires the prior generation immediately; only the latest result may
+    /// install a service when the keychain read returns.
+    fn rebuild_one_shot_ai(&mut self) {
+        let retired = self
+            .pending_session_titles
+            .drain()
+            .map(|(_, pending)| (pending.session, pending.fallback))
+            .collect::<Vec<_>>();
+        for (session, fallback) in retired {
+            self.apply_session_title(session, fallback);
+        }
+        self.one_shot_generation = self.one_shot_generation.wrapping_add(1);
+        let generation = self.one_shot_generation;
+        if let Some(service) = self.one_shot_ai.take() {
+            service.shutdown();
+        }
+
+        let config = self.state().one_shot_ai_config.clone().normalized();
+        let profile = config
+            .enabled
+            .then_some(config.provider_id)
+            .flatten()
+            .and_then(|id| {
+                self.state()
+                    .provider_profiles
+                    .iter()
+                    .find(|profile| {
+                        profile.id == id
+                            && config.model_id.as_ref().is_some_and(|model_id| {
+                                profile.models.iter().any(|model| &model.id == model_id)
+                            })
+                    })
+                    .cloned()
+            });
+        let sender = self.one_shot_installs.0.clone();
+        let secrets = self.secrets.clone();
+        std::thread::spawn(move || {
+            let resolved = profile.and_then(|profile| {
+                let api_key = secrets
+                    .get(&provider_keychain_account(profile.id))
+                    .ok()
+                    .flatten()?;
+                ResolvedOneShotAiConfig::new(generation, &config, &profile, api_key).ok()
+            });
+            let _ = sender.send((generation, resolved));
+        });
+    }
+
+    pub(crate) fn settle_one_shot_install(
+        &mut self,
+        generation: u64,
+        resolved: Option<ResolvedOneShotAiConfig>,
+    ) {
+        if generation != self.one_shot_generation {
+            return;
+        }
+        let Some(resolved) = resolved else {
+            return;
+        };
+        let service = OneShotAiService::new(resolved);
+        let source = service.completion_receiver();
+        let sink = self.one_shot_completions.0.clone();
+        std::thread::spawn(move || {
+            while let Ok(completion) = source.recv() {
+                if sink.send(completion).is_err() {
+                    return;
+                }
+            }
+        });
+        self.one_shot_ai = Some(service);
     }
 
     fn reload_search_engine_profiles(&mut self) {
@@ -1478,6 +1607,9 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     }
 
     fn rename_session(&mut self, path: String, title: String) {
+        if let Some(token) = self.sessions.token_for(&path) {
+            self.cancel_pending_title(token);
+        }
         // A live session renames through its own process so the name lands in
         // the session file; renaming a background session never disturbs it.
         // Without a live process the rename is store-only and may be
@@ -1586,6 +1718,9 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         // Stop the session's own process first so it cannot rewrite the file
         // after the delete; the conversation moves to another live session.
         let was_visible = self.sessions.active_key() == Some(path.as_str());
+        if let Some(token) = self.sessions.token_for(&path) {
+            self.cancel_pending_title(token);
+        }
         if let Some(mut session) = self.sessions.remove(&path) {
             let _ = session.runtime.stop();
             self.apply(Action::SessionRunning {
@@ -1740,6 +1875,14 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             .active_key()
             .expect("can_submit_prompt requires an active session")
             .to_owned();
+        let first_plain_prompt = matches!(mode, SubmitMode::Prompt)
+            && !content.trim().is_empty()
+            && !self.state().conversation.iter().any(|message| {
+                message.role == ConversationRole::User && !message.full_text.trim().is_empty()
+            });
+        if first_plain_prompt && let Some(token) = self.sessions.token_for(&key) {
+            self.title_eligible.insert(token);
+        }
         let item = ConversationItem {
             id: Uuid::new_v4().to_string(),
             role: ConversationRole::User,
@@ -1813,6 +1956,9 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             }
         };
         if let Err(error) = result {
+            if let Some(token) = self.sessions.token_for(key) {
+                self.title_eligible.remove(&token);
+            }
             self.notices.error(error.to_string());
             return;
         }
@@ -1826,37 +1972,114 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         });
         if is_active {
             self.apply(Action::SetSessionStatus(SessionStatus::Streaming));
-            self.ensure_session_title();
+        }
+        let should_title = self
+            .sessions
+            .token_for(key)
+            .is_some_and(|token| self.title_eligible.remove(&token));
+        if should_title {
+            self.schedule_session_title(key, content);
         }
     }
 
-    fn ensure_session_title(&mut self) {
-        let Some(project_id) = self.state().selected_project else {
+    fn schedule_session_title(&mut self, key: &str, content: String) {
+        let Some(token) = self.sessions.token_for(key) else {
             return;
         };
-        let Ok(state) = self.active_command(json!({"type":"get_state"})) else {
-            return;
-        };
-        if state.get("sessionName").and_then(Value::as_str).is_some() {
+        if !self.title_attempted.insert(token) {
             return;
         }
-        let Some(user_message) = self
-            .state()
-            .conversation
-            .iter()
-            .find(|message| message.role == ConversationRole::User)
-            .map(|message| message.full_text.clone())
-        else {
+        let Some(session) = self.sessions.get(key) else {
             return;
         };
-        let title: String = user_message.chars().take(52).collect();
-        if !title.trim().is_empty()
-            && self
-                .active_command(json!({"type":"set_session_name", "name": title}))
-                .is_ok()
-            && let Some(path) = state.get("sessionFile").and_then(Value::as_str)
+        let Ok(state) = session.runtime.command(json!({"type":"get_state"})) else {
+            return;
+        };
+        if state
+            .get("sessionName")
+            .and_then(Value::as_str)
+            .is_some_and(|name| !name.trim().is_empty())
         {
+            return;
+        }
+        let fallback = fallback_session_title(&content);
+        let Some(service) = self.one_shot_ai.as_ref() else {
+            self.apply_session_title(token, fallback);
+            return;
+        };
+        let generation = service.generation();
+        match service.try_submit(SessionTitleTask::new(content)) {
+            Ok(request_id) => {
+                self.pending_session_titles.insert(
+                    request_id,
+                    PendingSessionTitle {
+                        session: token,
+                        generation,
+                        fallback,
+                    },
+                );
+            }
+            Err(_) => self.apply_session_title(token, fallback),
+        }
+    }
+
+    pub(crate) fn settle_one_shot_completions(&mut self, completions: Vec<OneShotCompletion>) {
+        for completion in completions {
+            let Some(pending) = self.pending_session_titles.remove(&completion.request_id) else {
+                continue;
+            };
+            if completion.generation != pending.generation
+                || completion.generation != self.one_shot_generation
+                || completion.task_kind != "session_title"
+            {
+                continue;
+            }
+            let title = completion.result.unwrap_or(pending.fallback);
+            self.apply_session_title(pending.session, title);
+        }
+    }
+
+    fn apply_session_title(&mut self, token: SessionToken, title: String) {
+        let Some(key) = self.sessions.key_for(token).map(str::to_owned) else {
+            return;
+        };
+        let Some(session) = self.sessions.get(&key) else {
+            return;
+        };
+        let Ok(state) = session.runtime.command(json!({"type":"get_state"})) else {
+            return;
+        };
+        if state
+            .get("sessionName")
+            .and_then(Value::as_str)
+            .is_some_and(|name| !name.trim().is_empty())
+        {
+            return;
+        }
+        let project_id = session.project_id;
+        if session
+            .runtime
+            .command(json!({"type":"set_session_name", "name": title}))
+            .is_err()
+        {
+            return;
+        }
+        if let Some(path) = state.get("sessionFile").and_then(Value::as_str) {
             self.index_session(project_id, path, Some(&title));
+        }
+    }
+
+    fn cancel_pending_title(&mut self, token: SessionToken) {
+        let request_ids = self
+            .pending_session_titles
+            .iter()
+            .filter_map(|(request_id, pending)| (pending.session == token).then_some(*request_id))
+            .collect::<Vec<_>>();
+        for request_id in request_ids {
+            self.pending_session_titles.remove(&request_id);
+            if let Some(service) = self.one_shot_ai.as_ref() {
+                service.cancel(request_id);
+            }
         }
     }
 
@@ -1900,6 +2123,9 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                     .is_some_and(|session| session.runtime.generation() == generation);
                 if !current {
                     return;
+                }
+                if let Some(token) = self.sessions.token_for(key) {
+                    self.cancel_pending_title(token);
                 }
                 self.sessions.remove(key);
                 // Nothing is left to answer, and a dialog still up would ask the
@@ -1975,6 +2201,11 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 }
             }
             events::Effect::RenameSessionFile(name) => {
+                if name.as_ref().is_some_and(|name| !name.trim().is_empty())
+                    && let Some(token) = self.sessions.token_for(key)
+                {
+                    self.cancel_pending_title(token);
+                }
                 if let Some((project_id, path, _)) = self.reported_session_file(key) {
                     self.index_session(project_id, &path, name.as_deref());
                 }
@@ -2180,6 +2411,13 @@ mod tests {
             attachment_store: AttachmentStore::open(directory.path().join("attachments")).unwrap(),
             notices: notice::Outbox::new(),
             control_updates: crossbeam_channel::unbounded(),
+            one_shot_ai: None,
+            one_shot_generation: 0,
+            one_shot_installs: crossbeam_channel::unbounded(),
+            one_shot_completions: crossbeam_channel::unbounded(),
+            pending_session_titles: HashMap::new(),
+            title_eligible: HashSet::new(),
+            title_attempted: HashSet::new(),
         }
     }
 
@@ -2637,5 +2875,133 @@ mod tests {
                 .iter()
                 .any(|command| command.get("type").and_then(Value::as_str) == Some("set_model"))
         );
+    }
+
+    #[test]
+    fn session_title_fallback_uses_only_the_first_plain_prompt_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = FakeRuntime::default();
+        let observer = runtime.clone();
+        let mut app = test_application(&directory, runtime);
+        start_test_session(&mut app, &directory);
+        app.apply(Action::SetSessionStatus(SessionStatus::Ready));
+        let attachment = Attachment {
+            path: "/private/secret-image.png".into(),
+            name: "secret-image.png".into(),
+            kind: pi_whim_core::AttachmentKind::File,
+            generated_by_app: false,
+        };
+
+        app.submit_prompt(
+            "  给这个会话命名  ".into(),
+            vec![attachment],
+            SubmitMode::Prompt,
+        );
+        app.submit_prompt("second prompt".into(), Vec::new(), SubmitMode::Prompt);
+
+        let names = observer
+            .commands()
+            .into_iter()
+            .filter(|command| {
+                command.get("type").and_then(Value::as_str) == Some("set_session_name")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0]["name"], "给这个会话命名");
+        assert!(!names[0].to_string().contains("secret-image"));
+    }
+
+    #[test]
+    fn manual_naming_cancels_a_pending_background_title() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = FakeRuntime::default();
+        let observer = runtime.clone();
+        let mut app = test_application(&directory, runtime);
+        start_test_session(&mut app, &directory);
+        let key = app.sessions.active_key().unwrap().to_owned();
+        let token = app.sessions.token_for(&key).unwrap();
+        let request_id = Uuid::new_v4();
+        app.one_shot_generation = 9;
+        app.pending_session_titles.insert(
+            request_id,
+            PendingSessionTitle {
+                session: token,
+                generation: 9,
+                fallback: "fallback".into(),
+            },
+        );
+
+        app.rename_session(key, "Manual".into());
+        app.settle_one_shot_completions(vec![OneShotCompletion {
+            request_id,
+            generation: 9,
+            task_kind: "session_title".into(),
+            result: Ok("Late AI".into()),
+        }]);
+
+        let names = observer
+            .commands()
+            .into_iter()
+            .filter_map(|command| {
+                (command.get("type").and_then(Value::as_str) == Some("set_session_name"))
+                    .then(|| command["name"].as_str().unwrap().to_owned())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["Manual"]);
+    }
+
+    #[test]
+    fn a_background_title_follows_rekey_but_not_session_deletion() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = FakeRuntime::default();
+        let observer = runtime.clone();
+        let mut app = test_application(&directory, runtime);
+        start_test_session(&mut app, &directory);
+        let old_key = app.sessions.active_key().unwrap().to_owned();
+        let token = app.sessions.token_for(&old_key).unwrap();
+        app.one_shot_generation = 3;
+        let first = Uuid::new_v4();
+        app.pending_session_titles.insert(
+            first,
+            PendingSessionTitle {
+                session: token,
+                generation: 3,
+                fallback: "fallback".into(),
+            },
+        );
+        app.sessions.rekey(&old_key, "rekeyed.jsonl", now_ms());
+
+        app.settle_one_shot_completions(vec![OneShotCompletion {
+            request_id: first,
+            generation: 3,
+            task_kind: "session_title".into(),
+            result: Ok("After rekey".into()),
+        }]);
+        let late = Uuid::new_v4();
+        app.pending_session_titles.insert(
+            late,
+            PendingSessionTitle {
+                session: token,
+                generation: 3,
+                fallback: "fallback".into(),
+            },
+        );
+        app.sessions.remove("rekeyed.jsonl");
+        app.settle_one_shot_completions(vec![OneShotCompletion {
+            request_id: late,
+            generation: 3,
+            task_kind: "session_title".into(),
+            result: Ok("After delete".into()),
+        }]);
+
+        let names = observer
+            .commands()
+            .into_iter()
+            .filter_map(|command| {
+                (command.get("type").and_then(Value::as_str) == Some("set_session_name"))
+                    .then(|| command["name"].as_str().unwrap().to_owned())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["After rekey"]);
     }
 }

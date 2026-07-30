@@ -85,6 +85,7 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ("general", "General", "通用"),
     ("execution", "Execution", "执行"),
     ("providers", "Providers", "模型提供商"),
+    ("background-ai", "Background AI", "后台 AI"),
     ("web-search", "Web Search", "网页搜索"),
     (
         "web-search-help",
@@ -190,6 +191,58 @@ const STRINGS: &[(&str, &str, &str)] = &[
         "控制 Bash 工具的执行方式。",
     ),
     ("queue-mode", "Queue mode", "队列模式"),
+    (
+        "background-ai-help",
+        "Lightweight AI requests for automatic session titles and similar background work.",
+        "为自动会话命名等后台工作发起轻量 AI 请求。",
+    ),
+    ("background-ai-session-title", "Session titles", "会话标题"),
+    (
+        "background-ai-session-title-help",
+        "Generate a title from the first plain user prompt.",
+        "根据第一条普通用户提示生成标题。",
+    ),
+    ("background-ai-resources", "Resource limits", "资源限制"),
+    (
+        "background-ai-enabled",
+        "Enable background AI",
+        "启用后台 AI",
+    ),
+    (
+        "background-ai-enabled-help",
+        "Runs without starting a Pi process or loading tools.",
+        "无需启动 Pi 进程，也不会加载工具。",
+    ),
+    ("background-ai-model", "Dedicated model", "专用模型"),
+    (
+        "background-ai-model-help",
+        "Choose a configured provider and model. No model is selected by default.",
+        "选择已配置的提供商和模型；默认不选择模型。",
+    ),
+    ("background-ai-select-model", "Select a model", "选择模型"),
+    ("background-ai-thinking", "Thinking level", "思考级别"),
+    (
+        "background-ai-concurrency",
+        "Maximum concurrency",
+        "最大并发数",
+    ),
+    (
+        "background-ai-concurrency-help",
+        "Maximum number of requests running at once (1-16).",
+        "同时运行的最大请求数（1-16）。",
+    ),
+    ("background-ai-queue-capacity", "Queue capacity", "队列容量"),
+    (
+        "background-ai-queue-capacity-help",
+        "Waiting requests allowed before rejecting new work (0-1024).",
+        "拒绝新任务前允许等待的请求数（0-1024）。",
+    ),
+    ("background-ai-timeout", "Timeout (seconds)", "超时（秒）"),
+    (
+        "background-ai-timeout-help",
+        "Maximum duration of each request (3-60 seconds).",
+        "每个请求的最长运行时间（3-60 秒）。",
+    ),
     // The permission level, shown beside the prompt as well as in settings: it is
     // what the agent may reach without asking, so it belongs where a turn is sent.
     ("permission-level", "Permission", "权限"),

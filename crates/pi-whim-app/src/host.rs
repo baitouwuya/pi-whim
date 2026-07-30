@@ -68,6 +68,27 @@ impl<R: AgentRuntime + 'static> Host<R> {
                     host.publish(window, cx);
                 },
             ),
+            pump::spawn(
+                application.one_shot_installs(),
+                window,
+                cx,
+                |host, batch, window, cx| {
+                    for (generation, resolved) in batch {
+                        host.application
+                            .settle_one_shot_install(generation, resolved);
+                    }
+                    host.publish(window, cx);
+                },
+            ),
+            pump::spawn(
+                application.one_shot_completions(),
+                window,
+                cx,
+                |host, batch, window, cx| {
+                    host.application.settle_one_shot_completions(batch);
+                    host.publish(window, cx);
+                },
+            ),
             // Fires once, when the models.dev catalog lands. The egui build asked
             // every frame whether it had; here the arrival says so itself, and the
             // pump ends when the channel closes behind it.

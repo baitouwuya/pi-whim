@@ -1,6 +1,6 @@
 //! The settings page.
 //!
-//! One view owning the drafts and every `InputState`, and four render functions
+//! One view owning the drafts and every `InputState`, and section render functions
 //! over it. The sections are functions rather than entities because none of them
 //! has state of its own — the drafts are shared, and a provider's name field has
 //! to survive a switch to the web-search section and back.
@@ -8,6 +8,7 @@
 //! Validation is not here. `engine::settings` decides whether a draft can be
 //! saved and what a preset fills in; this module asks and arranges.
 
+pub mod background_ai;
 pub mod dropdown;
 pub mod form;
 pub mod general;
@@ -29,8 +30,9 @@ use gpui_component::{
 };
 use pi_whim_core::{
     AgentTeamConfig, AppState, BashPolicy, Language, MAX_AGENT_DEPTH, MAX_AGENTS_PER_LEVEL,
-    ProviderId, ProviderModel, ProviderProtocol, QueueMode, SearchEngineId, SearchEngineKind,
-    SearchEngineProfile, strings::tr,
+    MAX_ONE_SHOT_AI_CONCURRENCY, MAX_ONE_SHOT_AI_QUEUE_CAPACITY, MAX_ONE_SHOT_AI_TIMEOUT_SECS,
+    MIN_ONE_SHOT_AI_TIMEOUT_SECS, OneShotAiConfig, ProviderId, ProviderModel, ProviderProtocol,
+    QueueMode, SearchEngineId, SearchEngineKind, SearchEngineProfile, strings::tr,
 };
 use pi_whim_engine::settings::{
     Preset, ProviderDraft, SearchEngineDraft, Section, move_search_engine, remove_search_engine,
@@ -85,6 +87,7 @@ pub enum SettingsEvent {
     SetBashPolicy(BashPolicy),
     SetBlockedPatterns(Vec<String>),
     SetAgentTeamConfig(AgentTeamConfig),
+    SetOneShotAiConfig(OneShotAiConfig),
     SetQueueModes {
         steering: QueueMode,
         follow_up: QueueMode,
@@ -139,6 +142,7 @@ pub struct Settings {
     editor_search_test: Option<SearchEngineTestStatus>,
     search_engine_tests: BTreeMap<SearchEngineId, SearchEngineTestStatus>,
     general_fields: general::Fields,
+    background_ai_fields: background_ai::Fields,
     provider_fields: providers::Fields,
     search_fields: web_search::Fields,
     scroll: ScrollHandle,
@@ -245,6 +249,35 @@ impl Settings {
                 cx,
             ),
         };
+        let background_ai_fields = background_ai::Fields {
+            model: choice_picker(
+                background_ai::model_choices(&state),
+                background_ai::selected_model(&state),
+                window,
+                cx,
+            ),
+            thinking: choice_picker(
+                background_ai::thinking_choices(&state),
+                state.one_shot_ai_config.thinking_level,
+                window,
+                cx,
+            ),
+            concurrency: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .min(1.0)
+                    .max(MAX_ONE_SHOT_AI_CONCURRENCY as f64)
+            }),
+            queue_capacity: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .min(0.0)
+                    .max(MAX_ONE_SHOT_AI_QUEUE_CAPACITY as f64)
+            }),
+            timeout: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .min(MIN_ONE_SHOT_AI_TIMEOUT_SECS as f64)
+                    .max(MAX_ONE_SHOT_AI_TIMEOUT_SECS as f64)
+            }),
+        };
         let provider_fields = providers::Fields {
             name: cx.new(|cx| InputState::new(window, cx).placeholder("OpenAI")),
             base_url: cx
@@ -276,6 +309,7 @@ impl Settings {
         Self::watch_draft_fields(&provider_fields, &search_fields, window, cx);
         Self::watch_choice_fields(
             &general_fields,
+            &background_ai_fields,
             &provider_fields,
             &search_fields,
             window,
@@ -292,6 +326,7 @@ impl Settings {
             editor_search_test: None,
             search_engine_tests: BTreeMap::new(),
             general_fields,
+            background_ai_fields,
             provider_fields,
             search_fields,
             scroll: ScrollHandle::new(),
@@ -394,6 +429,7 @@ impl Settings {
     /// controls they replaced.
     fn watch_choice_fields(
         general: &general::Fields,
+        background_ai: &background_ai::Fields,
         provider: &providers::Fields,
         search: &web_search::Fields,
         window: &mut Window,
@@ -433,6 +469,36 @@ impl Settings {
                         steering: settings.state.steering_mode,
                         follow_up: *follow_up,
                     });
+                }
+            },
+        )
+        .detach();
+        cx.subscribe_in(&background_ai.model, window, |settings, _, event, _, cx| {
+            if let SelectEvent::Confirm(Some(selection)) = event {
+                let (provider_id, model_id) = selection
+                    .clone()
+                    .map(|(provider, model)| (Some(provider), Some(model)))
+                    .unwrap_or((None, None));
+                cx.emit(SettingsEvent::SetOneShotAiConfig(OneShotAiConfig {
+                    provider_id,
+                    model_id,
+                    // Off is valid for every model; do not carry an unsupported
+                    // reasoning level across a model change.
+                    thinking_level: pi_whim_core::ThinkingLevel::Off,
+                    ..settings.state.one_shot_ai_config.clone()
+                }));
+            }
+        })
+        .detach();
+        cx.subscribe_in(
+            &background_ai.thinking,
+            window,
+            |settings, _, event, _, cx| {
+                if let SelectEvent::Confirm(Some(thinking_level)) = event {
+                    cx.emit(SettingsEvent::SetOneShotAiConfig(OneShotAiConfig {
+                        thinking_level: *thinking_level,
+                        ..settings.state.one_shot_ai_config.clone()
+                    }));
                 }
             },
         )
@@ -485,6 +551,8 @@ impl Settings {
         let follow_up_changed = self.state.follow_up_mode != state.follow_up_mode;
         let patterns_changed = self.state.bash_blocked_patterns != state.bash_blocked_patterns;
         let team_changed = self.state.agent_team_config != state.agent_team_config;
+        let one_shot_changed = self.state.one_shot_ai_config != state.one_shot_ai_config;
+        let providers_changed = self.state.provider_profiles != state.provider_profiles;
         self.state = state.clone();
         self.search_engine_tests.retain(|id, _| {
             self.state
@@ -507,6 +575,7 @@ impl Settings {
         // update cannot reset keyboard focus in an open menu.
         if language_changed {
             self.seed_general_choices(window, cx);
+            self.seed_background_ai_choices(window, cx);
             self.seed_search_kind(window, cx);
         } else {
             if bash_policy_changed {
@@ -533,10 +602,16 @@ impl Settings {
                     cx,
                 );
             }
+            if one_shot_changed || providers_changed {
+                self.seed_background_ai_choices(window, cx);
+            }
         }
 
         if patterns_changed || team_changed {
             self.seed_general_inputs(window, cx);
+        }
+        if one_shot_changed {
+            self.seed_background_ai_inputs(window, cx);
         }
         cx.notify();
     }
@@ -748,6 +823,8 @@ impl Settings {
     fn seed_fields(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.seed_general_inputs(window, cx);
         self.seed_general_choices(window, cx);
+        self.seed_background_ai_inputs(window, cx);
+        self.seed_background_ai_choices(window, cx);
         self.seed_provider_fields(window, cx);
         self.seed_search_fields(window, cx);
     }
@@ -766,6 +843,24 @@ impl Settings {
             .update(cx, |input, cx| {
                 input.set_value(config.max_agents_per_level.to_string(), window, cx)
             });
+        cx.notify();
+    }
+
+    fn seed_background_ai_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let one_shot = self.state.one_shot_ai_config.clone();
+        self.background_ai_fields
+            .concurrency
+            .update(cx, |input, cx| {
+                input.set_value(one_shot.max_concurrency.to_string(), window, cx)
+            });
+        self.background_ai_fields
+            .queue_capacity
+            .update(cx, |input, cx| {
+                input.set_value(one_shot.queue_capacity.to_string(), window, cx)
+            });
+        self.background_ai_fields.timeout.update(cx, |input, cx| {
+            input.set_value(one_shot.timeout_secs.to_string(), window, cx)
+        });
         cx.notify();
     }
 
@@ -795,6 +890,23 @@ impl Settings {
             &self.general_fields.follow_up_mode,
             general::queue_mode_choices(&self.state),
             self.state.follow_up_mode,
+            window,
+            cx,
+        );
+    }
+
+    fn seed_background_ai_choices(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        sync_choice_picker(
+            &self.background_ai_fields.model,
+            background_ai::model_choices(&self.state),
+            background_ai::selected_model(&self.state),
+            window,
+            cx,
+        );
+        sync_choice_picker(
+            &self.background_ai_fields.thinking,
+            background_ai::thinking_choices(&self.state),
+            self.state.one_shot_ai_config.thinking_level,
             window,
             cx,
         );
@@ -980,6 +1092,9 @@ impl Render for Settings {
                 tokens,
                 emit,
             ),
+            Section::BackgroundAi => {
+                background_ai::render(&self.state, &self.background_ai_fields, tokens, emit)
+            }
             Section::WebSearch => {
                 web_search::render(&self.state, &self.search_engine_tests, tokens, emit)
             }

@@ -21,6 +21,7 @@ pub enum Section {
     General,
     Execution,
     Providers,
+    BackgroundAi,
     WebSearch,
 }
 
@@ -29,10 +30,11 @@ impl Section {
     ///
     /// General first because it is what most readers came for; execution follows
     /// because it controls local behavior; providers precede optional web search.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::General,
         Self::Execution,
         Self::Providers,
+        Self::BackgroundAi,
         Self::WebSearch,
     ];
 
@@ -42,6 +44,7 @@ impl Section {
             Self::General => "general",
             Self::Execution => "execution",
             Self::Providers => "providers",
+            Self::BackgroundAi => "background-ai",
             Self::WebSearch => "web-search",
         }
     }
@@ -781,6 +784,7 @@ mod tests {
                 Section::General,
                 Section::Execution,
                 Section::Providers,
+                Section::BackgroundAi,
                 Section::WebSearch
             ]
         );
