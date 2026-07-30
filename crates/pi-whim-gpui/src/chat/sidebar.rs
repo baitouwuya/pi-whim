@@ -372,7 +372,7 @@ impl Sidebar {
             .id(SharedString::from(format!("sidebar-title:{title_id}")))
             .flex_1()
             .min_w(px(0.0))
-            .h_full()
+            .h(px(ROW_HEIGHT))
             .flex()
             .items_center()
             .overflow_hidden()
@@ -395,11 +395,11 @@ impl Sidebar {
                 title
                     .overflow_x_scroll()
                     .track_scroll(&title_scroll)
-                    // The native horizontal scroller lays out its content from
-                    // the top unless the child carries the row height too.
+                    // A percentage height is unconstrained inside GPUI's scroll
+                    // content and can expand the otherwise fixed uniform row.
                     .child(
                         div()
-                            .h_full()
+                            .h(px(ROW_HEIGHT))
                             .flex()
                             .items_center()
                             .flex_none()
