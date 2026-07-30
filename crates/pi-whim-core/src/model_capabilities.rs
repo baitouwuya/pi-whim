@@ -403,4 +403,116 @@ mod tests {
             CapabilityMatch::NotFound
         );
     }
+
+    #[test]
+    fn discover_endpoint_appends_per_protocol_path() {
+        assert_eq!(
+            crate::ProviderProtocol::OpenAiCompletions
+                .discover_endpoint("https://api.openai.com/v1"),
+            "https://api.openai.com/v1/models"
+        );
+        assert_eq!(
+            crate::ProviderProtocol::AnthropicMessages
+                .discover_endpoint("https://api.anthropic.com"),
+            "https://api.anthropic.com/v1/models"
+        );
+        assert_eq!(
+            crate::ProviderProtocol::GoogleGenerativeAi
+                .discover_endpoint("https://generativelanguage.googleapis.com/v1beta"),
+            "https://generativelanguage.googleapis.com/v1beta/models"
+        );
+    }
+
+    #[test]
+    fn discover_endpoint_avoids_double_v1_segment() {
+        // base already ending in /v1 with a v1/ suffix must not produce /v1/v1/.
+        assert_eq!(
+            crate::ProviderProtocol::AnthropicMessages.discover_endpoint("https://x/v1"),
+            "https://x/v1/models"
+        );
+    }
+
+    #[test]
+    fn discover_endpoint_trims_trailing_slash() {
+        assert_eq!(
+            crate::ProviderProtocol::OpenAiCompletions.discover_endpoint("https://x/v1/"),
+            "https://x/v1/models"
+        );
+    }
+
+    #[test]
+    fn discovery_auth_headers_shape_per_protocol() {
+        assert_eq!(
+            crate::ProviderProtocol::OpenAiCompletions.discovery_auth_headers("sk-x"),
+            vec![("Authorization", "Bearer sk-x".to_string())]
+        );
+        assert_eq!(
+            crate::ProviderProtocol::AnthropicMessages.discovery_auth_headers("sk-a"),
+            vec![
+                ("x-api-key", "sk-a".to_string()),
+                ("anthropic-version", "2023-06-01".to_string()),
+            ]
+        );
+        assert_eq!(
+            crate::ProviderProtocol::GoogleGenerativeAi.discovery_auth_headers("key-g"),
+            vec![("x-goog-api-key", "key-g".to_string())]
+        );
+    }
+
+    #[test]
+    fn parse_models_openai_uses_display_name_then_name_fallback() {
+        let body = serde_json::json!({
+            "data": [
+                {"id": "gpt-x", "display_name": "GPT X"},
+                {"id": "plain", "name": "Plain Named"}
+            ]
+        });
+        let mut models = crate::ProviderProtocol::OpenAiCompletions.parse_models(&body);
+        models.sort_by_key(|model| model.id.clone());
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "gpt-x");
+        assert_eq!(models[0].name, "GPT X");
+        assert_eq!(models[1].id, "plain");
+        assert_eq!(models[1].name, "Plain Named");
+    }
+
+    #[test]
+    fn parse_models_anthropic_falls_back_to_id_when_display_name_absent() {
+        // Anthropic responses carry no `name` field, so the name fallback is inert
+        // and the model's display name is its id.
+        let body = serde_json::json!({"data": [{"id": "claude-x"}]});
+        let models = crate::ProviderProtocol::AnthropicMessages.parse_models(&body);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "claude-x");
+        assert_eq!(models[0].name, "claude-x");
+    }
+
+    #[test]
+    fn parse_models_google_strips_prefix_and_detects_image_support() {
+        let body = serde_json::json!({
+            "models": [
+                {"name": "models/gemini-x", "displayName": "Gemini X", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/embedding-y", "displayName": "Embedding Y", "supportedGenerationMethods": ["embedContent"]}
+            ]
+        });
+        let mut models = crate::ProviderProtocol::GoogleGenerativeAi.parse_models(&body);
+        models.sort_by_key(|model| model.id.clone());
+        assert_eq!(models[0].id, "embedding-y");
+        assert!(!models[0].supports_images);
+        assert_eq!(models[1].id, "gemini-x");
+        assert!(models[1].supports_images);
+    }
+
+    #[test]
+    fn parse_models_missing_or_non_array_field_returns_empty() {
+        assert_eq!(
+            crate::ProviderProtocol::OpenAiCompletions.parse_models(&serde_json::json!({})),
+            Vec::<crate::ProviderModel>::new()
+        );
+        assert_eq!(
+            crate::ProviderProtocol::GoogleGenerativeAi
+                .parse_models(&serde_json::json!({"models": "not-an-array"})),
+            Vec::<crate::ProviderModel>::new()
+        );
+    }
 }
