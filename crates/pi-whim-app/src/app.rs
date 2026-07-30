@@ -127,6 +127,7 @@ pub struct PiWhimApplication<R: AgentRuntime = PiRpcRuntime> {
         crossbeam_channel::Receiver<OneShotCompletion>,
     ),
     pending_session_titles: HashMap<OneShotRequestId, PendingSessionTitle>,
+    staged_session_title_prompts: HashMap<SessionToken, String>,
     title_eligible: HashSet<SessionToken>,
     title_attempted: HashSet<SessionToken>,
 }
@@ -136,6 +137,7 @@ struct PendingSessionTitle {
     session: SessionToken,
     generation: u64,
     fallback: String,
+    baseline: String,
 }
 
 type OneShotInstall = (u64, Option<ResolvedOneShotAiConfig>);
@@ -219,6 +221,7 @@ impl Default for PiWhimApplication<PiRpcRuntime> {
             one_shot_installs: crossbeam_channel::unbounded(),
             one_shot_completions: crossbeam_channel::unbounded(),
             pending_session_titles: HashMap::new(),
+            staged_session_title_prompts: HashMap::new(),
             title_eligible: HashSet::new(),
             title_attempted: HashSet::new(),
         };
@@ -701,10 +704,10 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         let retired = self
             .pending_session_titles
             .drain()
-            .map(|(_, pending)| (pending.session, pending.fallback))
+            .map(|(_, pending)| (pending.session, pending.fallback, pending.baseline))
             .collect::<Vec<_>>();
-        for (session, fallback) in retired {
-            self.apply_session_title(session, fallback);
+        for (session, fallback, baseline) in retired {
+            self.apply_session_title(session, fallback, &baseline);
         }
         self.one_shot_generation = self.one_shot_generation.wrapping_add(1);
         let generation = self.one_shot_generation;
@@ -1985,34 +1988,21 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             .sessions
             .token_for(key)
             .is_some_and(|token| self.title_eligible.remove(&token));
-        if should_title {
-            self.schedule_session_title(key, content);
+        if should_title && let Some(token) = self.sessions.token_for(key) {
+            self.staged_session_title_prompts.insert(token, content);
         }
     }
 
-    fn schedule_session_title(&mut self, key: &str, content: String) {
+    fn schedule_session_title(&mut self, key: &str, content: String, baseline: String) {
         let Some(token) = self.sessions.token_for(key) else {
             return;
         };
         if !self.title_attempted.insert(token) {
             return;
         }
-        let Some(session) = self.sessions.get(key) else {
-            return;
-        };
-        let Ok(state) = session.runtime.command(json!({"type":"get_state"})) else {
-            return;
-        };
-        if state
-            .get("sessionName")
-            .and_then(Value::as_str)
-            .is_some_and(|name| !name.trim().is_empty())
-        {
-            return;
-        }
         let fallback = fallback_session_title(&content);
         let Some(service) = self.one_shot_ai.as_ref() else {
-            self.apply_session_title(token, fallback);
+            self.apply_session_title(token, fallback, &baseline);
             return;
         };
         let generation = service.generation();
@@ -2024,10 +2014,11 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                         session: token,
                         generation,
                         fallback,
+                        baseline,
                     },
                 );
             }
-            Err(_) => self.apply_session_title(token, fallback),
+            Err(_) => self.apply_session_title(token, fallback, &baseline),
         }
     }
 
@@ -2043,11 +2034,11 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 continue;
             }
             let title = completion.result.unwrap_or(pending.fallback);
-            self.apply_session_title(pending.session, title);
+            self.apply_session_title(pending.session, title, &pending.baseline);
         }
     }
 
-    fn apply_session_title(&mut self, token: SessionToken, title: String) {
+    fn apply_session_title(&mut self, token: SessionToken, title: String, baseline: &str) {
         let Some(key) = self.sessions.key_for(token).map(str::to_owned) else {
             return;
         };
@@ -2060,7 +2051,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         if state
             .get("sessionName")
             .and_then(Value::as_str)
-            .is_some_and(|name| !name.trim().is_empty())
+            .is_none_or(|name| name.trim() != baseline.trim())
         {
             return;
         }
@@ -2078,6 +2069,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     }
 
     fn cancel_pending_title(&mut self, token: SessionToken) {
+        self.staged_session_title_prompts.remove(&token);
         let request_ids = self
             .pending_session_titles
             .iter()
@@ -2209,13 +2201,28 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 }
             }
             events::Effect::RenameSessionFile(name) => {
-                if name.as_ref().is_some_and(|name| !name.trim().is_empty())
+                let staged_title = name
+                    .as_ref()
+                    .filter(|name| !name.trim().is_empty())
+                    .and_then(|baseline| {
+                        let token = self.sessions.token_for(key)?;
+                        self.staged_session_title_prompts
+                            .remove(&token)
+                            .map(|content| (content, baseline.clone()))
+                    });
+                // A later name change while AI is pending is manual or external;
+                // preserve it instead of letting the generated title win a race.
+                if staged_title.is_none()
+                    && name.as_ref().is_some_and(|name| !name.trim().is_empty())
                     && let Some(token) = self.sessions.token_for(key)
                 {
                     self.cancel_pending_title(token);
                 }
                 if let Some((project_id, path, _)) = self.reported_session_file(key) {
                     self.index_session(project_id, &path, name.as_deref());
+                }
+                if let Some((content, baseline)) = staged_title {
+                    self.schedule_session_title(key, content, baseline);
                 }
             }
             events::Effect::ReloadEntries => {
@@ -2424,6 +2431,7 @@ mod tests {
             one_shot_installs: crossbeam_channel::unbounded(),
             one_shot_completions: crossbeam_channel::unbounded(),
             pending_session_titles: HashMap::new(),
+            staged_session_title_prompts: HashMap::new(),
             title_eligible: HashSet::new(),
             title_attempted: HashSet::new(),
         }
@@ -2886,7 +2894,7 @@ mod tests {
     }
 
     #[test]
-    fn session_title_fallback_uses_only_the_first_plain_prompt_once() {
+    fn session_title_waits_for_the_first_runtime_name_and_uses_only_the_first_prompt() {
         let directory = tempfile::tempdir().unwrap();
         let runtime = FakeRuntime::default();
         let observer = runtime.clone();
@@ -2906,6 +2914,16 @@ mod tests {
             SubmitMode::Prompt,
         );
         app.submit_prompt("second prompt".into(), Vec::new(), SubmitMode::Prompt);
+        assert!(!observer.commands().iter().any(|command| {
+            command.get("type").and_then(Value::as_str) == Some("set_session_name")
+        }));
+
+        observer.set_response("get_state", json!({"sessionName": "First default"}));
+        let key = app.sessions.active_key().unwrap().to_owned();
+        app.perform_effect(
+            &key,
+            events::Effect::RenameSessionFile(Some("First default".into())),
+        );
 
         let names = observer
             .commands()
@@ -2936,6 +2954,7 @@ mod tests {
                 session: token,
                 generation: 9,
                 fallback: "fallback".into(),
+                baseline: "Initial".into(),
             },
         );
 
@@ -2963,6 +2982,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let runtime = FakeRuntime::default();
         let observer = runtime.clone();
+        observer.set_response("get_state", json!({"sessionName": "Initial"}));
         let mut app = test_application(&directory, runtime);
         start_test_session(&mut app, &directory);
         let old_key = app.sessions.active_key().unwrap().to_owned();
@@ -2975,6 +2995,7 @@ mod tests {
                 session: token,
                 generation: 3,
                 fallback: "fallback".into(),
+                baseline: "Initial".into(),
             },
         );
         app.sessions.rekey(&old_key, "rekeyed.jsonl", now_ms());
@@ -2992,6 +3013,7 @@ mod tests {
                 session: token,
                 generation: 3,
                 fallback: "fallback".into(),
+                baseline: "Initial".into(),
             },
         );
         app.sessions.remove("rekeyed.jsonl");
