@@ -2218,11 +2218,17 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         let Ok(state) = session.runtime.command(json!({"type":"get_state"})) else {
             return;
         };
-        if state
-            .get("sessionName")
-            .and_then(Value::as_str)
-            .is_none_or(|name| name.trim() != baseline.trim())
-        {
+        let app_title_matches = self
+            .state()
+            .sessions
+            .get(&session.project_id)
+            .and_then(|sessions| sessions.iter().find(|summary| summary.pi_path == key))
+            .is_some_and(|summary| summary.title.trim() == baseline.trim());
+        if let Some(runtime_title) = state.get("sessionName").and_then(Value::as_str) {
+            if runtime_title.trim() != baseline.trim() {
+                return;
+            }
+        } else if !app_title_matches {
             return;
         }
         let project_id = session.project_id;
@@ -3239,6 +3245,52 @@ mod tests {
         assert!(observer.commands().iter().any(|command| {
             command.get("type").and_then(Value::as_str) == Some("set_session_name")
                 && command.get("name").and_then(Value::as_str) == Some("AI title")
+        }));
+    }
+
+    #[test]
+    fn live_smart_rename_works_when_pi_state_has_no_session_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = FakeRuntime::default();
+        let observer = runtime.clone();
+        let mut app = test_application(&directory, runtime);
+        start_test_session(&mut app, &directory);
+        let key = app.sessions.active_key().unwrap().to_owned();
+        let token = app.sessions.token_for(&key).unwrap();
+        let project_id = app.sessions.get(&key).unwrap().project_id;
+        app.apply(Action::SessionsLoaded {
+            project_id,
+            sessions: vec![SessionSummary {
+                id: stable_session_id(&key),
+                project_id,
+                pi_path: key.clone(),
+                title: "Initial".into(),
+                preview: "Prompt".into(),
+                updated_at_ms: now_ms(),
+            }],
+        });
+        let request_id = Uuid::new_v4();
+        app.one_shot_generation = 6;
+        app.pending_session_titles.insert(
+            request_id,
+            PendingSessionTitle {
+                target: SessionTitleTarget::Live(token),
+                generation: 6,
+                fallback: "Initial".into(),
+                baseline: "Initial".into(),
+            },
+        );
+
+        app.settle_one_shot_completions(vec![OneShotCompletion {
+            request_id,
+            generation: 6,
+            task_kind: "session_title".into(),
+            result: Ok("跨会话发送消息".into()),
+        }]);
+
+        assert!(observer.commands().iter().any(|command| {
+            command.get("type").and_then(Value::as_str) == Some("set_session_name")
+                && command.get("name").and_then(Value::as_str) == Some("跨会话发送消息")
         }));
     }
 
