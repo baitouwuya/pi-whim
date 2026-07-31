@@ -1,7 +1,7 @@
 # ToolSpec 注册表重设计提案（#1）
 
-> 状态：**设计阶段，待 `resolve_session` 功能落定后实施**。
-> 当前 worktree 有另一个会话正在端到端加入 `resolve_session` 工具，触及本提案要重构的全部 5 个 touch point。强行现在重构会与对方在每个文件正面冲突，故先固化设计，等其提交后在干净基础上据此实施。
+> 状态：**已实施**（commits `96ebdbd` / `88e7a46` / `3b258e7`）。
+> `resolve_session` 已落定并提交后，据此提案在干净基础上实施了 Rust 端单一注册（touch point #1/#3/#4）。#2 显示 match 按 option A 暂留；#5 TS 同步测试已加入。
 
 ## 一、现状与痛点
 
