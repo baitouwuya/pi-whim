@@ -3240,6 +3240,46 @@ mod tests {
         assert!(find_tool("not_a_real_tool").is_none());
     }
 
+    #[test]
+    fn rust_public_tools_match_typescript_register_tool_names() {
+        // Drift guard: the Rust TOOLS registry (public tools only) must expose
+        // the same names that extensions/agent-team/index.ts registers with
+        // Pi. The three internal tools (_reset_team, _prompt_context,
+        // _take_peer_messages) are invoked via callAgentHost directly, not
+        // registerTool, so they are excluded. Catches the Rust<->TS naming
+        // duplication the ToolSpec refactor targets
+        // (docs/tool-spec-redesign.md touch point #5).
+        let ts_source = include_str!("../../../extensions/agent-team/index.ts");
+        let mut ts_names: Vec<&str> = Vec::new();
+        let mut rest = ts_source;
+        while let Some(start) = rest.find("name: \"") {
+            rest = &rest[start + "name: \"".len()..];
+            let Some(end) = rest.find('"') else { break };
+            ts_names.push(&rest[..end]);
+            rest = &rest[end + 1..];
+        }
+        let ts_set: std::collections::HashSet<&str> = ts_names.into_iter().collect();
+
+        let rust_set: std::collections::HashSet<&str> = TOOLS
+            .iter()
+            .filter(|spec| !spec.internal)
+            .map(|spec| spec.name)
+            .collect();
+
+        let missing_in_ts: Vec<&&str> = rust_set
+            .iter()
+            .filter(|name| !ts_set.contains(**name))
+            .collect();
+        let missing_in_rust: Vec<&&str> = ts_set
+            .iter()
+            .filter(|name| !rust_set.contains(**name))
+            .collect();
+        assert!(
+            missing_in_ts.is_empty() && missing_in_rust.is_empty(),
+            "Rust<->TS tool name drift: in Rust not TS = {missing_in_ts:?}; in TS not Rust = {missing_in_rust:?}",
+        );
+    }
+
     fn test_host(config: AgentTeamConfig) -> (AgentSupervisor, String) {
         test_host_at(config, "/tmp")
     }
