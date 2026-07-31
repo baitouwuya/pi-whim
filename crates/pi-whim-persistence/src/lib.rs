@@ -51,6 +51,11 @@ pub trait SessionRepository {
     fn save_session(&self, session: &SessionSummary) -> Result<(), PersistenceError>;
     fn delete_session(&self, session_id: SessionId) -> Result<(), PersistenceError>;
     fn rename_session(&self, session_id: SessionId, title: &str) -> Result<(), PersistenceError>;
+    fn set_session_ai_title(
+        &self,
+        session_id: SessionId,
+        title: &str,
+    ) -> Result<(), PersistenceError>;
 }
 
 pub trait SecretStore: Send + Sync {
@@ -142,7 +147,9 @@ impl SqliteStore {
                 pi_path TEXT NOT NULL UNIQUE,
                 title TEXT NOT NULL,
                 preview TEXT NOT NULL,
-                updated_at_ms INTEGER NOT NULL
+                updated_at_ms INTEGER NOT NULL,
+                manual_title TEXT,
+                ai_title TEXT
             );
             CREATE INDEX IF NOT EXISTS sessions_project_updated_idx ON sessions(project_id, updated_at_ms DESC);
             CREATE TABLE IF NOT EXISTS credential_environment_names (
@@ -188,6 +195,7 @@ impl SqliteStore {
         self.migrate_provider_names()?;
         self.migrate_bash_preferences()?;
         self.migrate_agent_team_preferences()?;
+        self.migrate_session_title_sources()?;
         Ok(())
     }
 
@@ -220,6 +228,23 @@ impl SqliteStore {
                 "ALTER TABLE agent_team_preferences ADD COLUMN policy_json TEXT NOT NULL DEFAULT '{}'",
                 [],
             )?;
+        }
+        Ok(())
+    }
+
+    fn migrate_session_title_sources(&self) -> Result<(), PersistenceError> {
+        let columns = self
+            .connection
+            .prepare("PRAGMA table_info(sessions)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !columns.iter().any(|column| column == "manual_title") {
+            self.connection
+                .execute("ALTER TABLE sessions ADD COLUMN manual_title TEXT", [])?;
+        }
+        if !columns.iter().any(|column| column == "ai_title") {
+            self.connection
+                .execute("ALTER TABLE sessions ADD COLUMN ai_title TEXT", [])?;
         }
         Ok(())
     }
@@ -518,7 +543,10 @@ impl SessionRepository for SqliteStore {
         project_id: ProjectId,
     ) -> Result<Vec<SessionSummary>, PersistenceError> {
         let mut statement = self.connection.prepare(
-            "SELECT id, project_id, pi_path, title, preview, updated_at_ms FROM sessions WHERE project_id = ?1 ORDER BY updated_at_ms DESC",
+            "SELECT id, project_id, pi_path,
+                    COALESCE(NULLIF(manual_title, ''), NULLIF(ai_title, ''), title),
+                    preview, updated_at_ms
+             FROM sessions WHERE project_id = ?1 ORDER BY updated_at_ms DESC",
         )?;
         let sessions = statement
             .query_map([project_id.to_string()], |row| {
@@ -563,7 +591,19 @@ impl SessionRepository for SqliteStore {
 
     fn rename_session(&self, session_id: SessionId, title: &str) -> Result<(), PersistenceError> {
         self.connection.execute(
-            "UPDATE sessions SET title = ?1, updated_at_ms = ?2 WHERE id = ?3",
+            "UPDATE sessions SET title = ?1, manual_title = ?1, updated_at_ms = ?2 WHERE id = ?3",
+            params![title, now_ms(), session_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    fn set_session_ai_title(
+        &self,
+        session_id: SessionId,
+        title: &str,
+    ) -> Result<(), PersistenceError> {
+        self.connection.execute(
+            "UPDATE sessions SET ai_title = ?1, updated_at_ms = ?2 WHERE id = ?3",
             params![title, now_ms(), session_id.to_string()],
         )?;
         Ok(())
@@ -828,6 +868,84 @@ mod tests {
         };
         store.save_project(&project).unwrap();
         assert_eq!(store.list_projects().unwrap(), vec![project]);
+    }
+
+    #[test]
+    fn session_titles_keep_manual_over_ai_over_indexed_fallback() {
+        let directory = tempdir().unwrap();
+        let store = SqliteStore::open(directory.path().join("test.sqlite")).unwrap();
+        let project = Project {
+            id: Uuid::new_v4(),
+            name: "example".into(),
+            path: "/tmp/example".into(),
+            pinned: false,
+            last_opened_ms: 1,
+        };
+        let mut session = SessionSummary {
+            id: Uuid::new_v4(),
+            project_id: project.id,
+            pi_path: "/tmp/example/session.jsonl".into(),
+            title: "First prompt".into(),
+            preview: "First prompt".into(),
+            updated_at_ms: 1,
+        };
+        store.save_project(&project).unwrap();
+        store.save_session(&session).unwrap();
+
+        store
+            .set_session_ai_title(session.id, "Generated task title")
+            .unwrap();
+        assert_eq!(
+            store.list_sessions(project.id).unwrap()[0].title,
+            "Generated task title"
+        );
+
+        session.title = "Stale JSONL title".into();
+        store.save_session(&session).unwrap();
+        assert_eq!(
+            store.list_sessions(project.id).unwrap()[0].title,
+            "Generated task title"
+        );
+
+        store.rename_session(session.id, "User title").unwrap();
+        store
+            .set_session_ai_title(session.id, "Late generated title")
+            .unwrap();
+        assert_eq!(
+            store.list_sessions(project.id).unwrap()[0].title,
+            "User title"
+        );
+    }
+
+    #[test]
+    fn legacy_sessions_table_gains_title_source_columns() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("test.sqlite");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    project_id TEXT NOT NULL,
+                    pi_path TEXT NOT NULL UNIQUE,
+                    title TEXT NOT NULL,
+                    preview TEXT NOT NULL,
+                    updated_at_ms INTEGER NOT NULL
+                );",
+            )
+            .unwrap();
+
+        let store = SqliteStore::open(path).unwrap();
+        let columns = store
+            .connection
+            .prepare("PRAGMA table_info(sessions)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(columns.iter().any(|column| column == "manual_title"));
+        assert!(columns.iter().any(|column| column == "ai_title"));
     }
 
     #[test]

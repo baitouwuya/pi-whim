@@ -6,7 +6,7 @@
 //! touching any of it.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     path::{Path, PathBuf},
 };
@@ -131,7 +131,10 @@ pub struct PiWhimApplication<R: AgentRuntime = PiRpcRuntime> {
     /// initializing. Keeping the raw prompt here avoids losing auto naming to
     /// a startup race without persisting conversation text.
     deferred_session_titles: HashMap<SessionToken, DeferredSessionTitle>,
-    expected_session_title_names: HashMap<SessionToken, String>,
+    /// Names sent by this process that may still produce a session-info echo.
+    /// Keep all outstanding names: a fallback title can be acknowledged after
+    /// the AI replacement has already been sent.
+    expected_session_title_names: HashMap<SessionToken, VecDeque<String>>,
     title_eligible: HashSet<SessionToken>,
     title_attempted: HashSet<SessionToken>,
 }
@@ -164,6 +167,7 @@ enum SessionTitleTarget {
 }
 
 type OneShotInstall = (u64, Option<ResolvedOneShotAiConfig>);
+const MAX_EXPECTED_SESSION_TITLE_NAMES: usize = 8;
 
 impl Default for PiWhimApplication<PiRpcRuntime> {
     fn default() -> Self {
@@ -749,7 +753,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             .collect::<Vec<_>>();
         for (target, fallback, baseline, source) in retired {
             if source == SessionTitleSource::Automatic {
-                self.apply_pending_session_title(target, fallback, &baseline, source);
+                self.apply_pending_session_title(target, fallback, &baseline, source, false);
             } else {
                 self.report("notice-smart-rename-unavailable");
             }
@@ -1566,6 +1570,27 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         }
     }
 
+    fn persist_session_title_source(
+        &mut self,
+        session_id: pi_whim_core::SessionId,
+        title: &str,
+        source: SessionTitleSource,
+    ) -> bool {
+        let Some(store) = self.store.as_ref() else {
+            return true;
+        };
+        let result = if source == SessionTitleSource::Automatic {
+            store.set_session_ai_title(session_id, title)
+        } else {
+            store.rename_session(session_id, title)
+        };
+        if let Err(error) = result {
+            self.notices.error(error.to_string());
+            return false;
+        }
+        true
+    }
+
     fn discover_sessions(&mut self, project_id: ProjectId, sessions_path: &Path) {
         let Some(store) = self.store.as_ref() else {
             return;
@@ -1667,8 +1692,8 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         self.cancel_pending_titles_for_path(&path);
         // A live session renames through its own process so the name lands in
         // the session file; renaming a background session never disturbs it.
-        // Without a live process the rename is store-only and may be
-        // overwritten by a later disk rescan.
+        // Without a live process the title is appended to Pi's JSONL directly.
+        let live_token = self.sessions.token_for(&path);
         if let Some(session) = self.sessions.get(&path) {
             if let Err(error) = session
                 .runtime
@@ -1677,12 +1702,20 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 self.notices.error(error.to_string());
                 return;
             }
+            if let Some(token) = live_token {
+                self.expect_session_title_name(token, &title);
+            }
         } else if let Err(error) = persist_session_title_to_jsonl(Path::new(&path), &title) {
             self.notices.error(error.to_string());
             return;
         }
         if let Some(project_id) = self.state().selected_project {
             self.index_session(project_id, &path, Some(&title));
+            self.persist_session_title_source(
+                stable_session_id(&path),
+                &title,
+                SessionTitleSource::ExplicitSmartRename,
+            );
         }
         if self.sessions.active_key() == Some(path.as_str()) {
             self.refresh_runtime_controls();
@@ -2089,8 +2122,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
 
         // A matching session-info event is the acknowledgement of this name,
         // not a manual rename that should cancel the background replacement.
-        self.expected_session_title_names
-            .insert(token, baseline.clone());
+        self.expect_session_title_name(token, &baseline);
         if let Some(path) = session_file {
             self.index_session(project_id, &path, Some(&baseline));
         }
@@ -2117,10 +2149,14 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     fn submit_deferred_session_titles(&mut self) {
         let deferred = std::mem::take(&mut self.deferred_session_titles);
         for (token, title) in deferred {
-            let still_current = self
-                .expected_session_title_names
-                .get(&token)
-                .is_some_and(|expected| expected.trim() == title.baseline.trim());
+            let still_current =
+                self.expected_session_title_names
+                    .get(&token)
+                    .is_some_and(|expected| {
+                        expected
+                            .iter()
+                            .any(|name| name.trim() == title.baseline.trim())
+                    });
             if !still_current || self.sessions.key_for(token).is_none() {
                 continue;
             }
@@ -2162,7 +2198,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             }
             Err(_) => {
                 if source == SessionTitleSource::Automatic {
-                    self.apply_pending_session_title(target, fallback, &baseline, source);
+                    self.apply_pending_session_title(target, fallback, &baseline, source, false);
                 }
                 false
             }
@@ -2234,6 +2270,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                     title,
                     &pending.baseline,
                     pending.source,
+                    true,
                 ),
                 Err(error) if pending.source == SessionTitleSource::ExplicitSmartRename => {
                     self.report_smart_rename_error(error);
@@ -2243,6 +2280,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                     pending.fallback,
                     &pending.baseline,
                     pending.source,
+                    false,
                 ),
             }
         }
@@ -2276,10 +2314,14 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         title: String,
         baseline: &str,
         source: SessionTitleSource,
+        persist_source: bool,
     ) {
+        if title.trim() == baseline.trim() {
+            return;
+        }
         match target {
             SessionTitleTarget::Live(token) => {
-                self.apply_live_session_title(token, title, baseline, source)
+                self.apply_live_session_title(token, title, baseline, source, persist_source)
             }
             SessionTitleTarget::Stored { project_id, path } => {
                 let still_current = self
@@ -2292,28 +2334,19 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                     return;
                 }
                 if let Some(token) = self.sessions.token_for(&path) {
-                    self.apply_live_session_title(token, title, baseline, source);
-                    return;
-                }
-                if title.trim() == baseline.trim() {
+                    self.apply_live_session_title(token, title, baseline, source, persist_source);
                     return;
                 }
                 if let Err(error) = persist_session_title_to_jsonl(Path::new(&path), &title) {
                     self.notices.error(error.to_string());
                     return;
                 }
-                if let Some(store) = self.store.as_ref() {
-                    if let Err(error) = store.rename_session(stable_session_id(&path), &title) {
-                        self.notices.error(error.to_string());
-                        return;
-                    }
-                    if let Ok(sessions) = store.list_sessions(project_id) {
-                        self.apply(Action::SessionsLoaded {
-                            project_id,
-                            sessions,
-                        });
-                    }
+                if persist_source
+                    && !self.persist_session_title_source(stable_session_id(&path), &title, source)
+                {
+                    return;
                 }
+                self.index_session(project_id, &path, Some(&title));
             }
         }
     }
@@ -2324,8 +2357,8 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         title: String,
         baseline: &str,
         source: SessionTitleSource,
+        persist_source: bool,
     ) {
-        self.expected_session_title_names.remove(&token);
         let Some(key) = self.sessions.key_for(token).map(str::to_owned) else {
             return;
         };
@@ -2371,7 +2404,13 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             }
             return;
         }
+        self.expect_session_title_name(token, &title);
         if let Some(path) = state.get("sessionFile").and_then(Value::as_str) {
+            if persist_source
+                && !self.persist_session_title_source(stable_session_id(path), &title, source)
+            {
+                return;
+            }
             self.index_session(project_id, path, Some(&title));
         }
     }
@@ -2393,6 +2432,33 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 service.cancel(request_id);
             }
         }
+    }
+
+    fn expect_session_title_name(&mut self, token: SessionToken, name: &str) {
+        let names = self.expected_session_title_names.entry(token).or_default();
+        if names.len() >= MAX_EXPECTED_SESSION_TITLE_NAMES {
+            names.pop_front();
+        }
+        names.push_back(name.trim().to_owned());
+    }
+
+    fn consume_expected_session_title_name(&mut self, token: SessionToken, name: &str) -> bool {
+        let (expected, empty) = self
+            .expected_session_title_names
+            .get_mut(&token)
+            .map(|names| {
+                let expected = names
+                    .iter()
+                    .position(|expected| expected == name.trim())
+                    .and_then(|index| names.remove(index))
+                    .is_some();
+                (expected, names.is_empty())
+            })
+            .unwrap_or((false, false));
+        if empty {
+            self.expected_session_title_names.remove(&token);
+        }
+        expected
     }
 
     fn cancel_pending_titles_for_path(&mut self, path: &str) {
@@ -2538,23 +2604,43 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 }
             }
             events::Effect::RenameSessionFile(name) => {
-                if let Some(token) = self.sessions.token_for(key)
-                    && let Some(name) = name
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|name| !name.is_empty())
-                {
-                    let expected = self
-                        .expected_session_title_names
-                        .get(&token)
-                        .is_some_and(|expected| expected.trim() == name);
-                    if !expected {
-                        // Any other non-empty name is manual or external and wins
-                        // over a late background result.
+                let normalized_name = name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty());
+                let expected = self
+                    .sessions
+                    .token_for(key)
+                    .zip(normalized_name)
+                    .is_some_and(|(token, name)| {
+                        self.consume_expected_session_title_name(token, name)
+                    });
+                if let Some((project_id, path, _)) = self.reported_session_file(key) {
+                    let unchanged = normalized_name.is_some_and(|name| {
+                        self.state()
+                            .sessions
+                            .get(&project_id)
+                            .and_then(|sessions| {
+                                sessions.iter().find(|session| session.pi_path == path)
+                            })
+                            .is_some_and(|session| session.title.trim() == name)
+                    });
+                    let manual_change = !expected && !unchanged && normalized_name.is_some();
+                    if manual_change && let Some(token) = self.sessions.token_for(key) {
+                        // A changed external name wins over a late background
+                        // result and every generated title.
                         self.cancel_pending_title(token);
                     }
-                }
-                if let Some((project_id, path, _)) = self.reported_session_file(key) {
+                    if manual_change
+                        && let Some(name) = normalized_name
+                        && !self.persist_session_title_source(
+                            stable_session_id(&path),
+                            name,
+                            SessionTitleSource::ExplicitSmartRename,
+                        )
+                    {
+                        return;
+                    }
                     self.index_session(project_id, &path, name.as_deref());
                 }
             }
@@ -3360,7 +3446,7 @@ mod tests {
         let request_id = Uuid::new_v4();
         app.one_shot_generation = 4;
         app.expected_session_title_names
-            .insert(token, "First prompt".into());
+            .insert(token, VecDeque::from(["First prompt".into()]));
         app.pending_session_titles.insert(
             request_id,
             PendingSessionTitle {
@@ -3388,6 +3474,123 @@ mod tests {
             command.get("type").and_then(Value::as_str) == Some("set_session_name")
                 && command.get("name").and_then(Value::as_str) == Some("AI title")
         }));
+    }
+
+    #[test]
+    fn a_late_fallback_ack_cannot_replace_the_persisted_ai_title() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        fs::write(
+            &path,
+            r#"{"type":"message","message":{"role":"user","content":"First prompt"}}"#,
+        )
+        .unwrap();
+        let runtime = FakeRuntime::default();
+        runtime.set_response(
+            "get_state",
+            json!({
+                "sessionName": "AI title",
+                "sessionFile": path.to_string_lossy(),
+            }),
+        );
+        let mut app = test_application(&directory, runtime);
+        start_test_session(&mut app, &directory);
+        let key = app.sessions.active_key().unwrap().to_owned();
+        let token = app.sessions.token_for(&key).unwrap();
+        let project_id = app.sessions.get(&key).unwrap().project_id;
+        let summary = session_summary_from_jsonl(project_id, &path).unwrap();
+        let session_id = summary.id;
+        app.store.as_ref().unwrap().save_session(&summary).unwrap();
+        app.store
+            .as_ref()
+            .unwrap()
+            .set_session_ai_title(session_id, "AI title")
+            .unwrap();
+        app.apply(Action::SessionsLoaded {
+            project_id,
+            sessions: app
+                .store
+                .as_ref()
+                .unwrap()
+                .list_sessions(project_id)
+                .unwrap(),
+        });
+        app.expected_session_title_names.insert(
+            token,
+            VecDeque::from(["First prompt".into(), "AI title".into()]),
+        );
+
+        app.perform_effect(
+            &key,
+            events::Effect::RenameSessionFile(Some("First prompt".into())),
+        );
+
+        assert_eq!(
+            app.store
+                .as_ref()
+                .unwrap()
+                .list_sessions(project_id)
+                .unwrap()[0]
+                .title,
+            "AI title"
+        );
+        assert_eq!(
+            app.expected_session_title_names.get(&token),
+            Some(&VecDeque::from(["AI title".into()]))
+        );
+
+        app.perform_effect(
+            &key,
+            events::Effect::RenameSessionFile(Some("AI title".into())),
+        );
+        app.perform_effect(
+            &key,
+            events::Effect::RenameSessionFile(Some("AI title".into())),
+        );
+        app.store
+            .as_ref()
+            .unwrap()
+            .set_session_ai_title(session_id, "Replacement AI title")
+            .unwrap();
+        assert_eq!(
+            app.store
+                .as_ref()
+                .unwrap()
+                .list_sessions(project_id)
+                .unwrap()[0]
+                .title,
+            "Replacement AI title",
+            "replaying the current title must not promote it to a manual title"
+        );
+    }
+
+    #[test]
+    fn expected_title_acknowledgements_are_bounded_and_count_duplicates() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = FakeRuntime::default();
+        let mut app = test_application(&directory, runtime);
+        start_test_session(&mut app, &directory);
+        let token = app
+            .sessions
+            .active_key()
+            .and_then(|key| app.sessions.token_for(key))
+            .unwrap();
+
+        for index in 0..10 {
+            app.expect_session_title_name(token, &format!("title-{index}"));
+        }
+        app.expect_session_title_name(token, "same");
+        app.expect_session_title_name(token, "same");
+
+        let names = app.expected_session_title_names.get(&token).unwrap();
+        assert_eq!(names.len(), MAX_EXPECTED_SESSION_TITLE_NAMES);
+        assert_eq!(
+            names.iter().filter(|name| name.as_str() == "same").count(),
+            2
+        );
+        assert!(app.consume_expected_session_title_name(token, "same"));
+        assert!(app.consume_expected_session_title_name(token, "same"));
+        assert!(!app.consume_expected_session_title_name(token, "same"));
     }
 
     #[test]
