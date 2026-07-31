@@ -461,74 +461,30 @@ fn dispatch_request_cancellable(
         };
         actor_id
     };
-    if !matches!(
-        request.tool_name.as_str(),
-        RESET_TEAM_TOOL | "_prompt_context" | "_take_peer_messages"
-    ) && let Err(error) = ensure_actor_active(host, actor_id)
-    {
-        return ToolResponse::error_with_details(
-            request.request_id,
-            error.code,
-            error.message,
-            error.details,
-        );
-    }
-    if is_policy_tool(request.tool_name.as_str())
-        && let Err(error) = ensure_tool_enabled(host, actor_id, &request.tool_name)
-    {
-        return ToolResponse::error_with_details(
-            request.request_id,
-            error.code,
-            error.message,
-            error.details,
-        );
-    }
-    let result = match request.tool_name.as_str() {
-        SPAWN_AGENT_TOOL => spawn_agent(host, actor_id, &request.arguments),
-        SEND_MESSAGE_TOOL => send_message(host, actor_id, &request.arguments),
-        LIST_AGENTS_TOOL => list_agents(host, actor_id, &request.arguments),
-        READ_MESSAGES_TOOL => read_messages(host, actor_id),
-        READ_SESSION_TOOL => read_session(host, actor_id, &request.arguments),
-        RESOLVE_SESSION_TOOL => resolve_session(host, actor_id, &request.arguments),
-        LIST_SESSIONS_TOOL => list_sessions(host, actor_id, &request.arguments),
-        SEARCH_SESSIONS_TOOL => search_sessions(host, actor_id, &request.arguments),
-        WAIT_AGENT_TOOL => wait_agent(host, actor_id, &request.arguments),
-        INTERRUPT_AGENT_TOOL => interrupt_agent(host, actor_id, &request.arguments),
-        RESET_TEAM_TOOL => reset_team(host, actor_id, &request.arguments),
-        READ_FILE_TOOL => read_file(host, actor_id, &request.request_id, &request.arguments),
-        WRITE_FILE_TOOL => write_file(host, actor_id, &request.request_id, &request.arguments),
-        EDIT_FILE_TOOL => edit_file(host, actor_id, &request.request_id, &request.arguments),
-        BASH_TOOL => parse_arguments::<BashArguments>(&request.arguments)
-            .and_then(|arguments| bash_dispatch::execute(host, actor_id, arguments, cancelled)),
-        FETCH_TOOL => ensure_tool_enabled(host, actor_id, FETCH_TOOL)
-            .and_then(|_| parse_arguments::<fetch::FetchArguments>(&request.arguments))
-            .and_then(|arguments| fetch::execute(arguments, cancelled)),
-        WEB_SEARCH_TOOL => ensure_tool_enabled(host, actor_id, WEB_SEARCH_TOOL)
-            .and_then(|_| parse_arguments::<web_search::WebSearchArguments>(&request.arguments))
-            .and_then(|arguments| {
-                web_search::execute(
-                    &host.launch.search_engines,
-                    &host.launch.search_engine_api_keys,
-                    arguments,
-                    cancelled,
-                )
-            }),
-        LIST_PROCESSES_TOOL => bash_dispatch::list(host, actor_id),
-        READ_PROCESS_TOOL => parse_arguments::<ProcessIdArguments>(&request.arguments)
-            .and_then(|arguments| bash_dispatch::read(host, actor_id, arguments)),
-        STOP_PROCESS_TOOL => parse_arguments::<ProcessIdArguments>(&request.arguments)
-            .and_then(|arguments| bash_dispatch::stop(host, actor_id, arguments)),
-        LIST_AVAILABLE_MODELS_TOOL => list_available_models(host, actor_id),
-        LIST_PENDING_REQUESTS_TOOL => list_pending_interactions(host, actor_id),
-        RESOLVE_INTERACTION_TOOL => parse_arguments::<ApprovalRequestArguments>(&request.arguments)
-            .and_then(|arguments| resolve_interaction(host, actor_id, arguments)),
-        ASK_USER_TOOL => parse_arguments::<AskUserArguments>(&request.arguments)
-            .and_then(|arguments| ask_user(host, actor_id, arguments)),
-        "_prompt_context" => prompt_context(host, actor_id, &request.arguments),
-        "_take_peer_messages" => take_peer_messages(host, actor_id),
-        _ => Err(HostError::new("unknown_tool", "unknown agent tool")),
+    let Some(spec) = find_tool(request.tool_name.as_str()) else {
+        return ToolResponse::error(request.request_id, "unknown_tool", "unknown agent tool");
     };
-    match result {
+    if !spec.internal
+        && let Err(error) = ensure_actor_active(host, actor_id)
+    {
+        return ToolResponse::error_with_details(
+            request.request_id,
+            error.code,
+            error.message,
+            error.details,
+        );
+    }
+    if matches!(spec.permission, ToolPermission::NeedsApproval)
+        && let Err(error) = ensure_tool_enabled(host, actor_id, spec.name)
+    {
+        return ToolResponse::error_with_details(
+            request.request_id,
+            error.code,
+            error.message,
+            error.details,
+        );
+    }
+    match (spec.handler)(host, actor_id, &request, cancelled) {
         Ok(content) => ToolResponse::success(request.request_id, content),
         Err(error) => ToolResponse::error_with_details(
             request.request_id,
@@ -539,32 +495,434 @@ fn dispatch_request_cancellable(
     }
 }
 
-fn is_policy_tool(tool: &str) -> bool {
-    matches!(
-        tool,
-        SPAWN_AGENT_TOOL
-            | SEND_MESSAGE_TOOL
-            | LIST_AGENTS_TOOL
-            | READ_MESSAGES_TOOL
-            | WAIT_AGENT_TOOL
-            | INTERRUPT_AGENT_TOOL
-            | READ_SESSION_TOOL
-            | RESOLVE_SESSION_TOOL
-            | LIST_SESSIONS_TOOL
-            | SEARCH_SESSIONS_TOOL
-            | READ_FILE_TOOL
-            | WRITE_FILE_TOOL
-            | EDIT_FILE_TOOL
-            | BASH_TOOL
-            | FETCH_TOOL
-            | LIST_PROCESSES_TOOL
-            | READ_PROCESS_TOOL
-            | STOP_PROCESS_TOOL
-            | LIST_AVAILABLE_MODELS_TOOL
-            | LIST_PENDING_REQUESTS_TOOL
-            | RESOLVE_INTERACTION_TOOL
-            | ASK_USER_TOOL
-    )
+/// Replaces the prior `is_policy_tool` allowlist + per-arm `ensure_tool_enabled`
+/// double-gate. `permission: NeedsApproval` is the single source of truth for
+/// whether a tool is gated against the agent's enabled-tools policy.
+#[derive(Clone, Copy)]
+enum ToolPermission {
+    None,
+    NeedsApproval,
+}
+
+/// Single registry for every dispatchable tool. Adding a tool = one entry here;
+/// the per-name match arm, `is_policy_tool` listing, and internal gates are gone.
+struct ToolSpec {
+    name: &'static str,
+    handler: fn(&HostContext, AgentId, &ToolRequest, Option<&AtomicBool>) -> HostResult,
+    permission: ToolPermission,
+    /// Internal control tools (`reset_team`, `_prompt_context`,
+    /// `_take_peer_messages`) skip the `ensure_actor_active` pre-flight.
+    internal: bool,
+}
+
+const TOOLS: &[ToolSpec] = &[
+    ToolSpec {
+        name: SPAWN_AGENT_TOOL,
+        handler: spawn_agent_handler,
+        permission: ToolPermission::NeedsApproval,
+        internal: false,
+    },
+    ToolSpec {
+        name: SEND_MESSAGE_TOOL,
+        handler: send_message_handler,
+        permission: ToolPermission::NeedsApproval,
+        internal: false,
+    },
+    ToolSpec {
+        name: LIST_AGENTS_TOOL,
+        handler: list_agents_handler,
+        permission: ToolPermission::NeedsApproval,
+        internal: false,
+    },
+    ToolSpec {
+        name: READ_MESSAGES_TOOL,
+        handler: read_messages_handler,
+        permission: ToolPermission::NeedsApproval,
+        internal: false,
+    },
+    ToolSpec {
+        name: READ_SESSION_TOOL,
+        handler: read_session_handler,
+        permission: ToolPermission::NeedsApproval,
+        internal: false,
+    },
+    ToolSpec {
+        name: RESOLVE_SESSION_TOOL,
+        handler: resolve_session_handler,
+        permission: ToolPermission::NeedsApproval,
+        internal: false,
+    },
+    ToolSpec {
+        name: LIST_SESSIONS_TOOL,
+        handler: list_sessions_handler,
+        permission: ToolPermission::NeedsApproval,
+        internal: false,
+    },
+    ToolSpec {
+        name: SEARCH_SESSIONS_TOOL,
+        handler: search_sessions_handler,
+        permission: ToolPermission::NeedsApproval,
+        internal: false,
+    },
+    ToolSpec {
+        name: WAIT_AGENT_TOOL,
+        handler: wait_agent_handler,
+        permission: ToolPermission::NeedsApproval,
+        internal: false,
+    },
+    ToolSpec {
+        name: INTERRUPT_AGENT_TOOL,
+        handler: interrupt_agent_handler,
+        permission: ToolPermission::NeedsApproval,
+        internal: false,
+    },
+    ToolSpec {
+        name: RESET_TEAM_TOOL,
+        handler: reset_team_handler,
+        permission: ToolPermission::None,
+        internal: true,
+    },
+    ToolSpec {
+        name: READ_FILE_TOOL,
+        handler: read_file_handler,
+        permission: ToolPermission::NeedsApproval,
+        internal: false,
+    },
+    ToolSpec {
+        name: WRITE_FILE_TOOL,
+        handler: write_file_handler,
+        permission: ToolPermission::NeedsApproval,
+        internal: false,
+    },
+    ToolSpec {
+        name: EDIT_FILE_TOOL,
+        handler: edit_file_handler,
+        permission: ToolPermission::NeedsApproval,
+        internal: false,
+    },
+    ToolSpec {
+        name: BASH_TOOL,
+        handler: bash_handler,
+        permission: ToolPermission::NeedsApproval,
+        internal: false,
+    },
+    ToolSpec {
+        name: FETCH_TOOL,
+        handler: fetch_handler,
+        permission: ToolPermission::NeedsApproval,
+        internal: false,
+    },
+    ToolSpec {
+        name: WEB_SEARCH_TOOL,
+        handler: web_search_handler,
+        permission: ToolPermission::NeedsApproval,
+        internal: false,
+    },
+    ToolSpec {
+        name: LIST_PROCESSES_TOOL,
+        handler: list_processes_handler,
+        permission: ToolPermission::NeedsApproval,
+        internal: false,
+    },
+    ToolSpec {
+        name: READ_PROCESS_TOOL,
+        handler: read_process_handler,
+        permission: ToolPermission::NeedsApproval,
+        internal: false,
+    },
+    ToolSpec {
+        name: STOP_PROCESS_TOOL,
+        handler: stop_process_handler,
+        permission: ToolPermission::NeedsApproval,
+        internal: false,
+    },
+    ToolSpec {
+        name: LIST_AVAILABLE_MODELS_TOOL,
+        handler: list_available_models_handler,
+        permission: ToolPermission::NeedsApproval,
+        internal: false,
+    },
+    ToolSpec {
+        name: LIST_PENDING_REQUESTS_TOOL,
+        handler: list_pending_interactions_handler,
+        permission: ToolPermission::NeedsApproval,
+        internal: false,
+    },
+    ToolSpec {
+        name: RESOLVE_INTERACTION_TOOL,
+        handler: resolve_interaction_handler,
+        permission: ToolPermission::NeedsApproval,
+        internal: false,
+    },
+    ToolSpec {
+        name: ASK_USER_TOOL,
+        handler: ask_user_handler,
+        permission: ToolPermission::NeedsApproval,
+        internal: false,
+    },
+    ToolSpec {
+        name: "_prompt_context",
+        handler: prompt_context_handler,
+        permission: ToolPermission::None,
+        internal: true,
+    },
+    ToolSpec {
+        name: "_take_peer_messages",
+        handler: take_peer_messages_handler,
+        permission: ToolPermission::None,
+        internal: true,
+    },
+];
+
+fn find_tool(name: &str) -> Option<&'static ToolSpec> {
+    TOOLS.iter().find(|spec| spec.name == name)
+}
+
+fn spawn_agent_handler(
+    host: &HostContext,
+    actor_id: AgentId,
+    request: &ToolRequest,
+    _cancelled: Option<&AtomicBool>,
+) -> HostResult {
+    spawn_agent(host, actor_id, &request.arguments)
+}
+
+fn send_message_handler(
+    host: &HostContext,
+    actor_id: AgentId,
+    request: &ToolRequest,
+    _cancelled: Option<&AtomicBool>,
+) -> HostResult {
+    send_message(host, actor_id, &request.arguments)
+}
+
+fn list_agents_handler(
+    host: &HostContext,
+    actor_id: AgentId,
+    request: &ToolRequest,
+    _cancelled: Option<&AtomicBool>,
+) -> HostResult {
+    list_agents(host, actor_id, &request.arguments)
+}
+
+fn read_messages_handler(
+    host: &HostContext,
+    actor_id: AgentId,
+    _request: &ToolRequest,
+    _cancelled: Option<&AtomicBool>,
+) -> HostResult {
+    read_messages(host, actor_id)
+}
+
+fn read_session_handler(
+    host: &HostContext,
+    actor_id: AgentId,
+    request: &ToolRequest,
+    _cancelled: Option<&AtomicBool>,
+) -> HostResult {
+    read_session(host, actor_id, &request.arguments)
+}
+
+fn resolve_session_handler(
+    host: &HostContext,
+    actor_id: AgentId,
+    request: &ToolRequest,
+    _cancelled: Option<&AtomicBool>,
+) -> HostResult {
+    resolve_session(host, actor_id, &request.arguments)
+}
+
+fn list_sessions_handler(
+    host: &HostContext,
+    actor_id: AgentId,
+    request: &ToolRequest,
+    _cancelled: Option<&AtomicBool>,
+) -> HostResult {
+    list_sessions(host, actor_id, &request.arguments)
+}
+
+fn search_sessions_handler(
+    host: &HostContext,
+    actor_id: AgentId,
+    request: &ToolRequest,
+    _cancelled: Option<&AtomicBool>,
+) -> HostResult {
+    search_sessions(host, actor_id, &request.arguments)
+}
+
+fn wait_agent_handler(
+    host: &HostContext,
+    actor_id: AgentId,
+    request: &ToolRequest,
+    _cancelled: Option<&AtomicBool>,
+) -> HostResult {
+    wait_agent(host, actor_id, &request.arguments)
+}
+
+fn interrupt_agent_handler(
+    host: &HostContext,
+    actor_id: AgentId,
+    request: &ToolRequest,
+    _cancelled: Option<&AtomicBool>,
+) -> HostResult {
+    interrupt_agent(host, actor_id, &request.arguments)
+}
+
+fn reset_team_handler(
+    host: &HostContext,
+    actor_id: AgentId,
+    request: &ToolRequest,
+    _cancelled: Option<&AtomicBool>,
+) -> HostResult {
+    reset_team(host, actor_id, &request.arguments)
+}
+
+fn read_file_handler(
+    host: &HostContext,
+    actor_id: AgentId,
+    request: &ToolRequest,
+    _cancelled: Option<&AtomicBool>,
+) -> HostResult {
+    read_file(host, actor_id, &request.request_id, &request.arguments)
+}
+
+fn write_file_handler(
+    host: &HostContext,
+    actor_id: AgentId,
+    request: &ToolRequest,
+    _cancelled: Option<&AtomicBool>,
+) -> HostResult {
+    write_file(host, actor_id, &request.request_id, &request.arguments)
+}
+
+fn edit_file_handler(
+    host: &HostContext,
+    actor_id: AgentId,
+    request: &ToolRequest,
+    _cancelled: Option<&AtomicBool>,
+) -> HostResult {
+    edit_file(host, actor_id, &request.request_id, &request.arguments)
+}
+
+fn bash_handler(
+    host: &HostContext,
+    actor_id: AgentId,
+    request: &ToolRequest,
+    cancelled: Option<&AtomicBool>,
+) -> HostResult {
+    parse_arguments::<BashArguments>(&request.arguments)
+        .and_then(|arguments| bash_dispatch::execute(host, actor_id, arguments, cancelled))
+}
+
+fn fetch_handler(
+    _host: &HostContext,
+    _actor_id: AgentId,
+    request: &ToolRequest,
+    cancelled: Option<&AtomicBool>,
+) -> HostResult {
+    parse_arguments::<fetch::FetchArguments>(&request.arguments)
+        .and_then(|arguments| fetch::execute(arguments, cancelled))
+}
+
+fn web_search_handler(
+    host: &HostContext,
+    _actor_id: AgentId,
+    request: &ToolRequest,
+    cancelled: Option<&AtomicBool>,
+) -> HostResult {
+    parse_arguments::<web_search::WebSearchArguments>(&request.arguments).and_then(|arguments| {
+        web_search::execute(
+            &host.launch.search_engines,
+            &host.launch.search_engine_api_keys,
+            arguments,
+            cancelled,
+        )
+    })
+}
+
+fn list_processes_handler(
+    host: &HostContext,
+    actor_id: AgentId,
+    _request: &ToolRequest,
+    _cancelled: Option<&AtomicBool>,
+) -> HostResult {
+    bash_dispatch::list(host, actor_id)
+}
+
+fn read_process_handler(
+    host: &HostContext,
+    actor_id: AgentId,
+    request: &ToolRequest,
+    _cancelled: Option<&AtomicBool>,
+) -> HostResult {
+    parse_arguments::<ProcessIdArguments>(&request.arguments)
+        .and_then(|arguments| bash_dispatch::read(host, actor_id, arguments))
+}
+
+fn stop_process_handler(
+    host: &HostContext,
+    actor_id: AgentId,
+    request: &ToolRequest,
+    _cancelled: Option<&AtomicBool>,
+) -> HostResult {
+    parse_arguments::<ProcessIdArguments>(&request.arguments)
+        .and_then(|arguments| bash_dispatch::stop(host, actor_id, arguments))
+}
+
+fn list_available_models_handler(
+    host: &HostContext,
+    actor_id: AgentId,
+    _request: &ToolRequest,
+    _cancelled: Option<&AtomicBool>,
+) -> HostResult {
+    list_available_models(host, actor_id)
+}
+
+fn list_pending_interactions_handler(
+    host: &HostContext,
+    actor_id: AgentId,
+    _request: &ToolRequest,
+    _cancelled: Option<&AtomicBool>,
+) -> HostResult {
+    list_pending_interactions(host, actor_id)
+}
+
+fn resolve_interaction_handler(
+    host: &HostContext,
+    actor_id: AgentId,
+    request: &ToolRequest,
+    _cancelled: Option<&AtomicBool>,
+) -> HostResult {
+    parse_arguments::<ApprovalRequestArguments>(&request.arguments)
+        .and_then(|arguments| resolve_interaction(host, actor_id, arguments))
+}
+
+fn ask_user_handler(
+    host: &HostContext,
+    actor_id: AgentId,
+    request: &ToolRequest,
+    _cancelled: Option<&AtomicBool>,
+) -> HostResult {
+    parse_arguments::<AskUserArguments>(&request.arguments)
+        .and_then(|arguments| ask_user(host, actor_id, arguments))
+}
+
+fn prompt_context_handler(
+    host: &HostContext,
+    actor_id: AgentId,
+    request: &ToolRequest,
+    _cancelled: Option<&AtomicBool>,
+) -> HostResult {
+    prompt_context(host, actor_id, &request.arguments)
+}
+
+fn take_peer_messages_handler(
+    host: &HostContext,
+    actor_id: AgentId,
+    _request: &ToolRequest,
+    _cancelled: Option<&AtomicBool>,
+) -> HostResult {
+    take_peer_messages(host, actor_id)
 }
 
 struct DisconnectWatch {
@@ -685,7 +1043,6 @@ fn ensure_actor_active(host: &HostContext, actor_id: AgentId) -> Result<(), Host
 }
 
 fn read_file(host: &HostContext, actor_id: AgentId, request_id: &str, value: &Value) -> HostResult {
-    ensure_tool_enabled(host, actor_id, READ_FILE_TOOL)?;
     let arguments: file_dispatch::ReadArguments = parse_arguments(value)?;
     let actor = file_actor(host, actor_id)?;
     let scope = approved_file_scope(
@@ -707,7 +1064,6 @@ fn write_file(
     request_id: &str,
     value: &Value,
 ) -> HostResult {
-    ensure_tool_enabled(host, actor_id, WRITE_FILE_TOOL)?;
     let actor = file_actor(host, actor_id)?;
     if actor.permission_level == AgentPermissionLevel::ReadOnly {
         return Err(HostError::new(
@@ -730,7 +1086,6 @@ fn write_file(
 }
 
 fn edit_file(host: &HostContext, actor_id: AgentId, request_id: &str, value: &Value) -> HostResult {
-    ensure_tool_enabled(host, actor_id, EDIT_FILE_TOOL)?;
     let actor = file_actor(host, actor_id)?;
     if actor.permission_level == AgentPermissionLevel::ReadOnly {
         return Err(HostError::new(
