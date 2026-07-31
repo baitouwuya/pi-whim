@@ -248,11 +248,22 @@ fn child_sandbox_profile(
     fn quoted(path: &std::path::Path) -> String {
         path.to_string_lossy().replace('"', "\\\"")
     }
+    /// Resolve symlinks so the sandbox `subpath` matches the kernel's real path.
+    /// macOS temp directories live under `/var/folders` (symlinked to
+    /// `/private/var/folders`); sandbox-exec does not resolve symlinks in
+    /// `subpath` directives, causing silent access denials.
+    fn canonical(path: &std::path::Path) -> std::path::PathBuf {
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    }
+
+    let project_root = canonical(project_root);
+    let child_directory = canonical(child_directory);
+    let executable = canonical(executable);
 
     let mut read_paths = vec![
-        format!("(subpath \"{}\")", quoted(project_root)),
-        format!("(subpath \"{}\")", quoted(child_directory)),
-        format!("(subpath \"{}\")", quoted(executable)),
+        format!("(subpath \"{}\")", quoted(&project_root)),
+        format!("(subpath \"{}\")", quoted(&child_directory)),
+        format!("(subpath \"{}\")", quoted(&executable)),
         "(subpath \"/usr\")".into(),
         "(subpath \"/bin\")".into(),
         "(subpath \"/sbin\")".into(),
@@ -260,12 +271,16 @@ fn child_sandbox_profile(
         "(subpath \"/dev\")".into(),
     ];
     for extension in extensions {
-        read_paths.push(format!("(subpath \"{}\")", quoted(extension)));
+        // Use the parent directory so the sandbox permits reading sibling files
+        // (e.g., client.ts alongside index.ts) that the entrypoint imports.
+        let dir = extension.parent().unwrap_or(extension);
+        let dir = canonical(dir);
+        read_paths.push(format!("(subpath \"{}\")", quoted(&dir)));
     }
     format!(
         "(version 1) (deny default) (import \"system.sb\") (allow process*) (allow file-read* {}) (allow file-write* (subpath \"{}\")) {network_policy}",
         read_paths.join(" "),
-        quoted(project_root),
+        quoted(&project_root),
     )
 }
 
@@ -316,6 +331,10 @@ fn filtered_environment(
         serde_json::to_vec(&models).map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())?;
+    // Resolve symlinks (e.g., /var/folders -> /private/var/folders on macOS) so
+    // PI_CODING_AGENT_DIR matches the sandbox-exec subpath, which is also
+    // canonicalized. Without this, the child cannot read models.json.
+    let directory = std::fs::canonicalize(&directory).unwrap_or(directory);
     // Pi resolves its managed rg and fd binaries through PATH. Keep the parent's
     // managed bin directory available while isolating the child's configuration.
     let managed_bin = std::path::PathBuf::from(agent_directory).join("bin");
@@ -607,9 +626,12 @@ mod tests {
             "(allow network-outbound (remote tcp))",
         );
         assert!(profile.contains("(import \"system.sb\")"));
+        // Non-existent paths fall back to the literal path when canonicalize fails.
         assert!(profile.contains("(subpath \"/project\")"));
         assert!(profile.contains("(subpath \"/temporary-child\")"));
-        assert!(profile.contains("(subpath \"/extensions/team.ts\")"));
+        // Extensions use the parent directory so sibling files are readable.
+        assert!(profile.contains("(subpath \"/extensions\")"));
+        assert!(!profile.contains("(subpath \"/extensions/team.ts\")"));
         assert!(profile.contains("(allow network-outbound (remote tcp))"));
     }
 

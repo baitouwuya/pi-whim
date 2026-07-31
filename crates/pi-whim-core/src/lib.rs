@@ -582,8 +582,8 @@ pub struct SlashCommandInfo {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QueueMode {
-    All,
     #[default]
+    All,
     OneAtATime,
 }
 

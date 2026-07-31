@@ -4,11 +4,11 @@
 //! state. This module is only the presentation and the keyboard: a list anchored
 //! above the composer, arrows to move, Enter or Tab to run, Escape to dismiss.
 //!
-//! The keys are bound with `capture_key_down`, which runs before the focused
-//! input sees them. That ordering is the whole trick — the composer keeps focus
-//! while the palette is open, so typing continues to filter, but an arrow moves
-//! the selection instead of the caret and Enter runs the option instead of
-//! submitting the prompt.
+//! The composer keeps focus while the palette is open, so typing continues to
+//! filter. The catch is that the input binds arrows, Enter, and Tab to its own
+//! actions, and a bound action never reaches a key listener: those three arrive
+//! here as captured *actions* ([`Palette::handle_palette_key`]), while Escape —
+//! which the input lets propagate — still comes through `capture_key_down`.
 
 use gpui::{
     Context, EventEmitter, InteractiveElement, IntoElement, KeyDownEvent, Keystroke, ParentElement,
@@ -34,6 +34,18 @@ pub enum PaletteEvent {
     Run(SlashCommand),
     /// Replace the composer's text, for the commands that take an argument.
     SetComposerText(String),
+}
+
+/// A navigation key, named rather than read from a keystroke.
+///
+/// Arrows, Enter, and Tab reach the palette as captured input actions, not as
+/// key events — see the module note. Escape is absent because it is the one
+/// navigation key the input lets propagate, so it still arrives as a keystroke.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaletteKey {
+    Up,
+    Down,
+    Run,
 }
 
 /// What a keystroke means to an open palette.
@@ -167,7 +179,26 @@ impl Palette {
         if !self.is_open() {
             return false;
         }
-        match key_action(&event.keystroke) {
+        self.act(key_action(&event.keystroke), cx)
+    }
+
+    /// Handle a navigation key captured as an input action.
+    ///
+    /// Same contract as [`Palette::handle_key`]: whether the palette took it.
+    pub fn handle_palette_key(&mut self, key: PaletteKey, cx: &mut Context<Self>) -> bool {
+        if !self.is_open() {
+            return false;
+        }
+        let action = match key {
+            PaletteKey::Up => KeyAction::Move(-1),
+            PaletteKey::Down => KeyAction::Move(1),
+            PaletteKey::Run => KeyAction::Run,
+        };
+        self.act(action, cx)
+    }
+
+    fn act(&mut self, action: KeyAction, cx: &mut Context<Self>) -> bool {
+        match action {
             KeyAction::Ignore => return false,
             KeyAction::Move(delta) => {
                 self.selection = step(self.selection, self.options.len(), delta);
@@ -300,6 +331,17 @@ impl Render for Palette {
                                     .child(SharedString::from(option.title.clone())),
                             )
                             .child(
+                                // What to type, beside what it does: the palette
+                                // teaches the commands it offers, and the trigger
+                                // is the part worth remembering.
+                                div()
+                                    .flex_none()
+                                    .font_family(pi_whim_theme::font::MONO)
+                                    .text_size(px(text::LABEL_SIZE))
+                                    .text_color(tokens.accent.hsla())
+                                    .child(SharedString::from(option.trigger.clone())),
+                            )
+                            .child(
                                 // Right-aligned, and the only part that gives up
                                 // space: a long description truncates rather than
                                 // pushing the name it belongs to out of line.
@@ -321,6 +363,7 @@ impl Render for Palette {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::AppContext;
 
     #[test]
     fn stepping_wraps_at_both_ends() {
@@ -413,4 +456,63 @@ mod tests {
         assert!(PALETTE_WIDTH > 0.0);
         assert!(PALETTE_MAX_HEIGHT > 0.0);
     };
+
+    struct Probe;
+
+    #[gpui::test]
+    async fn captured_actions_move_the_selection_and_run_it(cx: &mut gpui::TestAppContext) {
+        use std::{cell::RefCell, rc::Rc};
+
+        // Arrows, Enter, and Tab reach the palette as captured input actions —
+        // the input bound them first — so this exercises the path those keys
+        // actually take, which is the one that once let Enter submit the raw
+        // query as a prompt.
+        let palette = cx.update(|cx| cx.new(|_| Palette::new(Tokens::light())));
+        let events: Rc<RefCell<Vec<PaletteEvent>>> = Rc::new(RefCell::new(Vec::new()));
+        let observed = events.clone();
+        let _probe = cx.update(|cx| {
+            cx.new(|cx| {
+                cx.subscribe(&palette, move |_, _, event: &PaletteEvent, _| {
+                    observed.borrow_mut().push(event.clone());
+                })
+                .detach();
+                Probe
+            })
+        });
+
+        cx.update(|cx| {
+            palette.update(cx, |palette, cx| {
+                palette.sync(&AppState::default(), "/", cx);
+                assert!(palette.is_open());
+
+                // An arrow moves; running off the top wraps to the bottom.
+                assert!(palette.handle_palette_key(PaletteKey::Down, cx));
+                assert_eq!(palette.selection, 1);
+                assert!(palette.handle_palette_key(PaletteKey::Up, cx));
+                assert_eq!(palette.selection, 0);
+                assert!(palette.handle_palette_key(PaletteKey::Up, cx));
+                assert_eq!(palette.selection, palette.options.len() - 1);
+
+                // A command that needs an argument only prefills the field.
+                let model = palette
+                    .options
+                    .iter()
+                    .position(|option| option.command == SlashCommand::ChooseModel)
+                    .expect("the model command is listed");
+                palette.selection = model;
+                assert!(palette.handle_palette_key(PaletteKey::Run, cx));
+                assert!(!palette.is_open(), "running closes the panel");
+
+                // Closed, the keys belong to the input again.
+                assert!(!palette.handle_palette_key(PaletteKey::Down, cx));
+            });
+        });
+
+        let events = events.borrow();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            PaletteEvent::SetComposerText(text) if text == "/model "
+        ));
+    }
 }

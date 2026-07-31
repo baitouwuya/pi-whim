@@ -105,6 +105,83 @@ pub struct Context<'a> {
 pub fn translate(event: &Value, context: Context<'_>, turn: &mut Turn) -> Outcome {
     let mut outcome = Outcome::default();
     match event.get("type").and_then(Value::as_str) {
+        Some("message_start")
+            if event
+                .get("message")
+                .and_then(|message| message.get("role"))
+                .and_then(Value::as_str)
+                == Some("custom")
+                && event
+                    .get("message")
+                    .and_then(|message| message.get("customType"))
+                    .and_then(Value::as_str)
+                    == Some("pi-whim-peer-message") =>
+        {
+            turn.running = true;
+            outcome.session_running(&context, true);
+            if context.is_active {
+                outcome.act(Action::UpsertConversation(peer_message_item(
+                    event.get("message").unwrap_or(&Value::Null),
+                )));
+            }
+        }
+
+        Some("message_start")
+            if event
+                .get("message")
+                .and_then(|message| message.get("role"))
+                .and_then(Value::as_str)
+                == Some("user") =>
+        {
+            let message = event.get("message").cloned().unwrap_or(Value::Null);
+            // A user message opens a turn just as an assistant one does: a queue
+            // drained while the session idles starts its turn right here.
+            turn.running = true;
+            outcome.session_running(&context, true);
+            let text = content_text(message.get("content")).unwrap_or_default();
+            // A prompt the workbench already placed optimistically is matched
+            // off rather than added again. Exact text is only a hint — Pi can
+            // store a slash command expanded — so a mismatch still consumes the
+            // oldest outstanding prompt: Pi reports them strictly in order.
+            if !turn.optimistic_prompts.is_empty() {
+                match turn
+                    .optimistic_prompts
+                    .iter()
+                    .position(|prompt| *prompt == text)
+                {
+                    Some(index) => {
+                        turn.optimistic_prompts.remove(index);
+                    }
+                    None => {
+                        turn.optimistic_prompts.pop_front();
+                    }
+                }
+                return outcome;
+            }
+            if !context.is_active {
+                return outcome;
+            }
+            // A queued steering or follow-up message reaching its turn. Nothing
+            // showed it while it waited, so place it where it was consumed: at
+            // the end of the conversation.
+            outcome.act(Action::UpsertConversation(ConversationItem {
+                id: message
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| Uuid::new_v4().to_string()),
+                role: ConversationRole::User,
+                full_text: text,
+                streaming: false,
+                tool_name: None,
+                tool_report: None,
+                tool_details: None,
+                is_error: false,
+                model: None,
+                attachments: Vec::new(),
+            }));
+        }
+
         Some("message_start" | "message_update") => {
             let message = event.get("message").cloned().unwrap_or(Value::Null);
             if message.get("role").and_then(Value::as_str) != Some("assistant") {
@@ -194,6 +271,9 @@ pub fn translate(event: &Value, context: Context<'_>, turn: &mut Turn) -> Outcom
 
         Some("agent_settled") => {
             turn.running = false;
+            // Whatever was placed optimistically is on the transcript now; a
+            // leftover would eat the next turn's first queued message.
+            turn.optimistic_prompts.clear();
             outcome.session_running(&context, false);
             outcome.effect(Effect::SyncSessionFile);
             let reply_error = turn.reply_error.take();
@@ -367,6 +447,12 @@ pub fn tool_event_action(event: &Value, conversation: &[ConversationItem]) -> Ac
 /// wholesale, so the two paths cannot drift. Roles the workbench does not
 /// render return `None`.
 pub fn session_entry_action(entry: &Value) -> Option<Action> {
+    if entry.get("type").and_then(Value::as_str) == Some("custom_message")
+        && entry.get("customType").and_then(Value::as_str) == Some("pi-whim-peer-message")
+    {
+        return Some(Action::UpsertConversation(peer_message_item(entry)));
+    }
+
     if entry.get("type").and_then(Value::as_str) == Some("compaction") {
         let id = entry
             .get("id")
@@ -437,6 +523,44 @@ pub fn session_entry_action(entry: &Value) -> Option<Action> {
             .map(str::to_owned),
         attachments: Vec::new(),
     }))
+}
+
+fn peer_message_item(value: &Value) -> ConversationItem {
+    let details = value.get("details").unwrap_or(&Value::Null);
+    let fallback_content = content_text(value.get("content")).unwrap_or_default();
+    let content = details
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or(&fallback_content)
+        .to_owned();
+    let sender = details
+        .get("sender_name")
+        .and_then(Value::as_str)
+        .unwrap_or("Pi");
+    let sender_session = details
+        .get("sender_session_id")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    ConversationItem {
+        // The delivery id lives in details both before persistence and after
+        // replay. Keeping it stable makes the durable entry update the live
+        // card instead of inserting a duplicate with the transcript entry id.
+        id: details
+            .get("id")
+            .and_then(Value::as_str)
+            .or_else(|| value.get("id").and_then(Value::as_str))
+            .map(str::to_owned)
+            .unwrap_or_else(|| Uuid::new_v4().to_string()),
+        role: ConversationRole::System,
+        full_text: content,
+        streaming: false,
+        tool_name: Some("peer_message".into()),
+        tool_report: Some(sender.to_owned()),
+        tool_details: Some(sender_session.to_owned()),
+        is_error: false,
+        model: None,
+        attachments: Vec::new(),
+    }
 }
 
 /// A successful stop with neither visible text nor a tool call is not a reply.
@@ -613,6 +737,23 @@ mod tests {
         })
     }
 
+    fn peer_message_start() -> Value {
+        json!({
+            "type": "message_start",
+            "message": {
+                "role": "custom",
+                "customType": "pi-whim-peer-message",
+                "content": "context annotation",
+                "details": {
+                    "id": "delivery-1",
+                    "sender_name": "root",
+                    "sender_session_id": "2ee851d1-b4eb-5ebd-b8ab-a967057fd8ed",
+                    "content": "Please continue the upload."
+                }
+            }
+        })
+    }
+
     fn upserted(outcome: &Outcome) -> Vec<&ConversationItem> {
         outcome
             .actions
@@ -670,6 +811,30 @@ mod tests {
         assert_eq!(items[0].full_text, "Hello");
         assert!(items[0].streaming);
         assert_eq!(items[0].role, ConversationRole::Assistant);
+    }
+
+    #[test]
+    fn a_peer_message_appears_live_and_opens_a_turn() {
+        let mut turn = Turn::default();
+        let outcome = translate(&peer_message_start(), active(), &mut turn);
+
+        assert_eq!(running(&outcome), Some(true));
+        assert!(turn.running);
+        let items = upserted(&outcome);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "delivery-1");
+        assert_eq!(items[0].full_text, "Please continue the upload.");
+        assert_eq!(items[0].tool_report.as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn a_background_peer_message_only_updates_the_busy_state() {
+        let mut turn = Turn::default();
+        let outcome = translate(&peer_message_start(), background(), &mut turn);
+
+        assert_eq!(running(&outcome), Some(true));
+        assert!(turn.running);
+        assert!(upserted(&outcome).is_empty());
     }
 
     #[test]
@@ -1282,6 +1447,35 @@ mod tests {
     }
 
     #[test]
+    fn a_persisted_peer_message_keeps_its_source_and_visible_content() {
+        let Action::UpsertConversation(item) = session_entry_action(&json!({
+            "type": "custom_message",
+            "id": "peer-entry",
+            "customType": "pi-whim-peer-message",
+            "content": "context annotation",
+            "details": {
+                "id": "delivery-1",
+                "sender_name": "root",
+                "sender_session_id": "2ee851d1-b4eb-5ebd-b8ab-a967057fd8ed",
+                "content": "Please continue the upload."
+            }
+        }))
+        .expect("peer messages are visible") else {
+            panic!("expected a conversation item");
+        };
+
+        assert_eq!(item.id, "delivery-1");
+        assert_eq!(item.role, ConversationRole::System);
+        assert_eq!(item.full_text, "Please continue the upload.");
+        assert_eq!(item.tool_name.as_deref(), Some("peer_message"));
+        assert_eq!(item.tool_report.as_deref(), Some("root"));
+        assert_eq!(
+            item.tool_details.as_deref(),
+            Some("2ee851d1-b4eb-5ebd-b8ab-a967057fd8ed")
+        );
+    }
+
+    #[test]
     fn replaying_an_empty_successful_reply_keeps_the_error_visible() {
         let Action::UpsertConversation(item) = session_entry_action(&json!({
             "id": "empty-reply",
@@ -1435,5 +1629,101 @@ mod tests {
         );
 
         assert_ne!(first, other.compaction_item_id);
+    }
+
+    /// A user message the way Pi announces it: content is a list of parts.
+    fn user_message_start(text: &str) -> Value {
+        json!({
+            "type": "message_start",
+            "message": {
+                "role": "user",
+                "id": "u1",
+                "content": [{"type": "text", "text": text}],
+            },
+        })
+    }
+
+    #[test]
+    fn a_queued_user_message_is_placed_where_it_is_consumed() {
+        // Nothing showed it while it waited in the queue, so when its turn
+        // comes the card appears here, at the end of the conversation.
+        let mut turn = Turn::default();
+        let outcome = translate(&user_message_start("queued thought"), active(), &mut turn);
+
+        assert!(turn.running);
+        assert_eq!(running(&outcome), Some(true));
+        let items = upserted(&outcome);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].role, ConversationRole::User);
+        assert_eq!(items[0].full_text, "queued thought");
+        assert!(!items[0].streaming);
+    }
+
+    #[test]
+    fn an_optimistic_prompt_is_matched_off_instead_of_doubled() {
+        // The workbench already placed this card when the prompt was sent.
+        let mut turn = Turn::default();
+        turn.optimistic_prompts.push_back("hello".into());
+        let outcome = translate(&user_message_start("hello"), active(), &mut turn);
+
+        assert!(turn.optimistic_prompts.is_empty());
+        assert!(upserted(&outcome).is_empty());
+        // It still opens the turn: the reply follows this same event.
+        assert!(turn.running);
+    }
+
+    #[test]
+    fn an_expanded_slash_command_still_consumes_the_oldest_prompt() {
+        // Pi stores `/fork` expanded, so the text differs from what was sent.
+        // Prompts arrive strictly in order, so the oldest outstanding one is
+        // this message's twin regardless.
+        let mut turn = Turn::default();
+        turn.optimistic_prompts.push_back("/fork".into());
+        let outcome = translate(
+            &user_message_start("Fork the conversation into a new session…"),
+            active(),
+            &mut turn,
+        );
+
+        assert!(turn.optimistic_prompts.is_empty());
+        assert!(upserted(&outcome).is_empty());
+    }
+
+    #[test]
+    fn a_matching_prompt_is_consumed_wherever_it_queued() {
+        // Two prompts in flight; the second arrives first on the wire is not
+        // possible, but the exact match keeps the FIFO honest either way.
+        let mut turn = Turn::default();
+        turn.optimistic_prompts.push_back("first".into());
+        turn.optimistic_prompts.push_back("second".into());
+        let outcome = translate(&user_message_start("first"), active(), &mut turn);
+
+        assert_eq!(turn.optimistic_prompts.len(), 1);
+        assert_eq!(turn.optimistic_prompts[0], "second");
+        assert!(upserted(&outcome).is_empty());
+    }
+
+    #[test]
+    fn a_settled_turn_forgets_prompts_it_never_saw_echoed() {
+        // A prompt sent into an aborted turn never announces itself; keeping it
+        // would eat the next turn's first queued message.
+        let mut turn = Turn {
+            running: true,
+            ..Turn::default()
+        };
+        turn.optimistic_prompts.push_back("never echoed".into());
+        translate(&json!({"type": "agent_settled"}), active(), &mut turn);
+
+        assert!(turn.optimistic_prompts.is_empty());
+    }
+
+    #[test]
+    fn a_background_user_message_moves_only_its_busy_dot() {
+        let mut turn = Turn::default();
+        let outcome = translate(&user_message_start("hi"), background(), &mut turn);
+
+        assert_eq!(running(&outcome), Some(true));
+        assert!(turn.running);
+        assert!(upserted(&outcome).is_empty());
     }
 }

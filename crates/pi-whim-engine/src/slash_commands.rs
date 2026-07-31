@@ -87,9 +87,9 @@ impl SlashCommandOption {
     }
 }
 
-/// Returns the commands relevant to a composer that begins with `/`.
+/// Returns the commands relevant to a slash query in the composer.
 pub fn options(state: &AppState, composer: &str) -> Option<Vec<SlashCommandOption>> {
-    let query = composer.strip_prefix('/')?;
+    let query = slash_query(composer)?;
     if query.contains(['\n', '\r']) {
         return None;
     }
@@ -137,6 +137,43 @@ pub fn options(state: &AppState, composer: &str) -> Option<Vec<SlashCommandOptio
             .filter(|option| option.matches(query))
             .collect(),
     )
+}
+
+/// The slash query being typed, wherever in the composer the `/` sits.
+///
+/// At the very start the whole text is the query, arguments and all — the
+/// command can take them because it will be the whole prompt on its own.
+/// Anywhere else only the trailing token counts: "space + /" opens the
+/// palette mid-sentence, but with no room for an argument the token only
+/// completes a command name, so a space after it closes the query again.
+fn slash_query(composer: &str) -> Option<&str> {
+    if let Some(query) = composer.strip_prefix('/') {
+        return Some(query);
+    }
+    let slash = composer.rfind('/')?;
+    let before = composer[..slash].chars().next_back()?;
+    if !before.is_whitespace() {
+        return None;
+    }
+    let query = &composer[slash + 1..];
+    if query.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(query)
+}
+
+/// The composer text with a trailing mid-text slash query removed.
+///
+/// Running an option picked mid-sentence should cost the query token, not the
+/// sentence around it. Returns `None` when the composer is itself the query —
+/// a leading `/` — where the caller clears the whole field instead.
+pub fn without_trailing_query(composer: &str) -> Option<String> {
+    if composer.starts_with('/') {
+        return None;
+    }
+    slash_query(composer)?;
+    let slash = composer.rfind('/')?;
+    Some(composer[..slash].trim_end().to_owned())
 }
 
 fn command_argument<'a>(query: &'a str, command: &str) -> Option<&'a str> {
@@ -545,6 +582,78 @@ mod tests {
             options(&state, "/model gpt").unwrap()[0].command,
             SlashCommand::SetModel(_)
         ));
+    }
+
+    #[test]
+    fn a_slash_after_a_space_opens_the_palette_mid_sentence() {
+        let state = AppState::default();
+        let options = options(&state, "please /mo").expect("mid-sentence query");
+        assert!(
+            options.iter().any(|option| option.trigger == "/model"),
+            "the query should still complete command names"
+        );
+    }
+
+    #[test]
+    fn a_lone_slash_mid_sentence_lists_everything() {
+        let state = AppState::default();
+        let mid = options(&state, "please /").expect("lone mid-sentence slash");
+        let leading = options(&state, "/").expect("lone leading slash");
+        assert_eq!(mid.len(), leading.len());
+    }
+
+    #[test]
+    fn a_mid_sentence_query_is_one_token_only() {
+        // Mid-sentence there is no room for arguments: a space after the token
+        // means the user moved on, so the palette closes again.
+        let state = AppState::default();
+        assert!(options(&state, "please /model gpt").is_none());
+        assert!(options(&state, "please /model ").is_none());
+    }
+
+    #[test]
+    fn a_slash_inside_a_word_is_not_a_query() {
+        let state = AppState::default();
+        assert!(options(&state, "edit src/main.rs").is_none());
+        assert!(options(&state, "src/").is_none());
+    }
+
+    #[test]
+    fn a_leading_slash_still_takes_arguments() {
+        // At the start the command will be the whole prompt, so it can take
+        // the rest of the line as its argument.
+        let state = AppState {
+            available_models: vec![ModelOption {
+                provider: "test".into(),
+                provider_name: "Test".into(),
+                id: "gpt-example".into(),
+                name: "GPT Example".into(),
+            }],
+            ..AppState::default()
+        };
+        assert!(matches!(
+            options(&state, "/model gpt").unwrap()[0].command,
+            SlashCommand::SetModel(_)
+        ));
+    }
+
+    #[test]
+    fn stripping_the_query_keeps_the_sentence_around_it() {
+        assert_eq!(
+            without_trailing_query("please /mo"),
+            Some("please".to_owned())
+        );
+        assert_eq!(
+            without_trailing_query("please /"),
+            Some("please".to_owned())
+        );
+    }
+
+    #[test]
+    fn there_is_no_sentence_to_keep_for_a_leading_or_absent_query() {
+        assert_eq!(without_trailing_query("/model"), None);
+        assert_eq!(without_trailing_query("no query here"), None);
+        assert_eq!(without_trailing_query("edit src/main.rs"), None);
     }
 
     #[test]

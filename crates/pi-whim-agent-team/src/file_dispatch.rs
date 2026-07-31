@@ -22,7 +22,7 @@ use crate::{file_compression, image_compression, model::AgentDescriptor};
 use pi_whim_core::AgentPermissionLevel;
 
 const DEFAULT_MAX_TOKENS: usize = 6_000;
-const DEFAULT_MAX_BYTES: usize = 48 * 1024;
+const DEFAULT_MAX_BYTES: usize = 128 * 1024;
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_IMAGE_RESPONSE_BYTES: usize = 700 * 1024;
 const DEFAULT_DIRECTORY_PAGE_SIZE: usize = 200;

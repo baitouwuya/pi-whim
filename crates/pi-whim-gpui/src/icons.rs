@@ -134,7 +134,7 @@ pub fn tool(name: &str) -> IconName {
         "send_message" | "read_messages" | "list_pending_requests" | "resolve_interaction" => {
             IconName::Inbox
         }
-        "read_session" | "list_sessions" => IconName::BookOpen,
+        "read_session" | "resolve_session" | "list_sessions" => IconName::BookOpen,
         _ => IconName::SquareTerminal,
     }
 }

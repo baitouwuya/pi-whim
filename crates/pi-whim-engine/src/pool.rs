@@ -51,6 +51,15 @@ pub struct Turn {
     /// overwrite the visible failure with `Ready` immediately.
     pub reply_error: Option<String>,
     pub pending_prompt: Option<PendingPrompt>,
+    /// The prompts the workbench already shows, in the order they were sent.
+    ///
+    /// Pi reports every user message over `message_start` — the one a prompt
+    /// begins with and the ones drained from its queues. Only the queued ones
+    /// are news: a submission the workbench placed optimistically must be
+    /// matched off this list rather than added again. Order is the matcher,
+    /// because a slash command can reach the transcript expanded beyond what
+    /// was typed.
+    pub optimistic_prompts: std::collections::VecDeque<String>,
 }
 
 /// One Pi process and the state its current turn accumulates.

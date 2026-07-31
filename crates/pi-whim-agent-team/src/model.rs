@@ -200,6 +200,11 @@ pub struct SendMessageArguments {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct ResolveSessionArguments {
+    pub target: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct BashArguments {
     pub command: String,
     #[serde(default)]

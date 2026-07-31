@@ -20,8 +20,9 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, Context, EventEmitter, FollowMode, IntoElement, ListAlignment, ListState,
-    ParentElement, Render, Styled, Window, div, list, prelude::FluentBuilder, px,
+    AnyElement, Context, EventEmitter, FollowMode, InteractiveElement, IntoElement, ListAlignment,
+    ListState, MouseButton, ParentElement, Render, Styled, Window, div, list,
+    prelude::FluentBuilder, px,
 };
 use pi_whim_core::{
     AppState, ConversationItem, ConversationRole, Language, strings::text as translate,
@@ -54,6 +55,8 @@ pub enum ConversationEvent {
     ForkAt(String),
     /// Copy a completed assistant reply.
     CopyAssistant(String),
+    /// Drop everything still waiting in the agent's queues.
+    ClearQueue,
 }
 
 /// The scrolling list of conversation entries.
@@ -72,6 +75,13 @@ pub struct Conversation {
     language: Language,
     /// Whether the local transcript should show that Pi is generating.
     generating: bool,
+    /// Steering messages waiting in the agent, shown pinned to the end.
+    ///
+    /// Held rather than read from state at render: the shell syncs snapshots in,
+    /// and this view renders nothing it was not handed.
+    queued_steering: Vec<String>,
+    /// Follow-up messages waiting behind the turn, after the steering ones.
+    queued_follow_up: Vec<String>,
     /// Prevents more than one reveal loop from running for this conversation.
     typewriter_running: bool,
     tokens: Tokens,
@@ -94,6 +104,8 @@ impl Conversation {
             has_project: false,
             language: Language::default(),
             generating: false,
+            queued_steering: Vec::new(),
+            queued_follow_up: Vec::new(),
             typewriter_running: false,
             tokens,
             list,
@@ -158,9 +170,30 @@ impl Conversation {
         self.messages.clear();
         self.expansions.clear();
         self.typewriter.clear();
+        self.queued_steering.clear();
+        self.queued_follow_up.clear();
         self.list.reset(0);
         self.list.set_follow_mode(FollowMode::Tail);
         cx.notify();
+    }
+
+    /// Replace what the queue block shows.
+    pub fn set_queue(
+        &mut self,
+        steering: Vec<String>,
+        follow_up: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.queued_steering == steering && self.queued_follow_up == follow_up {
+            return;
+        }
+        self.queued_steering = steering;
+        self.queued_follow_up = follow_up;
+        cx.notify();
+    }
+
+    fn queue_is_empty(&self) -> bool {
+        self.queued_steering.is_empty() && self.queued_follow_up.is_empty()
     }
 
     pub fn set_tokens(&mut self, tokens: Tokens, cx: &mut Context<Self>) {
@@ -409,6 +442,91 @@ impl Conversation {
         .py(px(5.0))
         .into_any_element()
     }
+
+    /// The queue, pinned where its messages will land: the very end.
+    ///
+    /// Faded because none of it has happened yet — this is a preview of what
+    /// the agent is holding, not a part of the transcript. A message takes its
+    /// real place here when the turn consumes it, and the block's row goes.
+    fn render_queue_block(&self, cx: &mut Context<Self>) -> AnyElement {
+        let tokens = self.tokens;
+        let language = self.language;
+        let count = self.queued_steering.len() + self.queued_follow_up.len();
+        let rows = self
+            .queued_steering
+            .iter()
+            .map(|text| (translate("queued", language), text))
+            .chain(
+                self.queued_follow_up
+                    .iter()
+                    .map(|text| (translate("follow-ups", language), text)),
+            );
+        reading_lane(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(5.0))
+                .py(px(6.0))
+                .opacity(0.55)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .text_size(px(text::LABEL_SIZE))
+                        .text_color(tokens.muted.hsla())
+                        .child(format!(
+                            "{} · {}",
+                            translate("queued-messages", language),
+                            count
+                        ))
+                        .child(div().flex_1())
+                        .child(
+                            div()
+                                .id("conversation-queue-clear")
+                                .px(px(6.0))
+                                .py(px(1.0))
+                                .border_1()
+                                .border_color(tokens.line.hsla())
+                                .cursor_pointer()
+                                .hover(|button| {
+                                    button
+                                        .border_color(tokens.line_strong.hsla())
+                                        .text_color(tokens.text.hsla())
+                                })
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|_, _, _, cx| {
+                                        cx.emit(ConversationEvent::ClearQueue)
+                                    }),
+                                )
+                                .child(translate("clear-queue", language)),
+                        ),
+                )
+                .children(rows.map(|(kind, queued_text)| {
+                    div()
+                        .flex()
+                        .items_baseline()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(px(text::LABEL_SIZE))
+                                .text_color(tokens.muted.hsla())
+                                .child(kind),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .text_size(px(text::DETAIL_SIZE))
+                                .text_color(tokens.text.hsla())
+                                .child(queued_text.clone()),
+                        )
+                })),
+        )
+        .into_any_element()
+    }
 }
 
 fn rekey_expansion(expansions: &mut HashMap<String, MessageExpansion>, from: &str, to: &str) {
@@ -465,7 +583,7 @@ impl Render for Conversation {
             .min_h(px(0.0))
             // A blank canvas reads as a broken view rather than as an empty one,
             // so the transcript says what to do while there is nothing in it.
-            .when(self.messages.is_empty(), |this| {
+            .when(self.messages.is_empty() && self.queue_is_empty(), |this| {
                 this.child(self.render_empty_state())
             })
             .when(!self.messages.is_empty(), |this| {
@@ -476,6 +594,11 @@ impl Render for Conversation {
                     .flex_1(),
                 )
                 .when(self.generating, |this| this.child(self.render_generating()))
+            })
+            // Below even the generating dots: the queue is the last thing the
+            // reader sees, which is where its messages will appear.
+            .when(!self.queue_is_empty(), |this| {
+                this.child(self.render_queue_block(cx))
             })
     }
 }

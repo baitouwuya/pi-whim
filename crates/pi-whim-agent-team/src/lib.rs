@@ -32,9 +32,9 @@ use std::{
 use model::{
     AgentDescriptor, AgentId, AgentMessage, AgentNode, AgentOutcome, AgentSessionEntry,
     AgentStatus, ApprovalRequestArguments, AskUserArguments, BashArguments, ListAgentsArguments,
-    ListSessionsArguments, ProcessCommand, ProcessIdArguments, ReadSessionArguments,
-    ResetTeamArguments, SearchSessionsArguments, SendMessageArguments, SessionSnapshot,
-    SpawnAgentArguments, TargetArguments, TeamState, WaitAgentArguments,
+    ListSessionsArguments, MessageKind, ProcessCommand, ProcessIdArguments, ReadSessionArguments,
+    ResetTeamArguments, ResolveSessionArguments, SearchSessionsArguments, SendMessageArguments,
+    SessionSnapshot, SpawnAgentArguments, TargetArguments, TeamState, WaitAgentArguments,
 };
 use pi_whim_core::{
     AgentModelSelection, AgentPermissionLevel, AgentPermissionPolicy, AgentTeamConfig,
@@ -44,9 +44,9 @@ use pi_whim_tool_protocol::{
     ASK_USER_TOOL, BASH_TOOL, EDIT_FILE_TOOL, FETCH_TOOL, INTERRUPT_AGENT_TOOL, LIST_AGENTS_TOOL,
     LIST_AVAILABLE_MODELS_TOOL, LIST_PENDING_REQUESTS_TOOL, LIST_PROCESSES_TOOL,
     LIST_SESSIONS_TOOL, PROTOCOL_VERSION, READ_FILE_TOOL, READ_MESSAGES_TOOL, READ_PROCESS_TOOL,
-    READ_SESSION_TOOL, RESET_TEAM_TOOL, RESOLVE_INTERACTION_TOOL, SEARCH_SESSIONS_TOOL,
-    SEND_MESSAGE_TOOL, SPAWN_AGENT_TOOL, STOP_PROCESS_TOOL, ToolRequest, ToolResponse,
-    WAIT_AGENT_TOOL, WEB_SEARCH_TOOL, WRITE_FILE_TOOL,
+    READ_SESSION_TOOL, RESET_TEAM_TOOL, RESOLVE_INTERACTION_TOOL, RESOLVE_SESSION_TOOL,
+    SEARCH_SESSIONS_TOOL, SEND_MESSAGE_TOOL, SPAWN_AGENT_TOOL, STOP_PROCESS_TOOL, ToolRequest,
+    ToolResponse, WAIT_AGENT_TOOL, WEB_SEARCH_TOOL, WRITE_FILE_TOOL,
 };
 use routing::{
     RoutingError, is_direct_child, message_kind, message_kind_for_descriptors,
@@ -463,7 +463,7 @@ fn dispatch_request_cancellable(
     };
     if !matches!(
         request.tool_name.as_str(),
-        RESET_TEAM_TOOL | "_prompt_context"
+        RESET_TEAM_TOOL | "_prompt_context" | "_take_peer_messages"
     ) && let Err(error) = ensure_actor_active(host, actor_id)
     {
         return ToolResponse::error_with_details(
@@ -489,6 +489,7 @@ fn dispatch_request_cancellable(
         LIST_AGENTS_TOOL => list_agents(host, actor_id, &request.arguments),
         READ_MESSAGES_TOOL => read_messages(host, actor_id),
         READ_SESSION_TOOL => read_session(host, actor_id, &request.arguments),
+        RESOLVE_SESSION_TOOL => resolve_session(host, actor_id, &request.arguments),
         LIST_SESSIONS_TOOL => list_sessions(host, actor_id, &request.arguments),
         SEARCH_SESSIONS_TOOL => search_sessions(host, actor_id, &request.arguments),
         WAIT_AGENT_TOOL => wait_agent(host, actor_id, &request.arguments),
@@ -524,6 +525,7 @@ fn dispatch_request_cancellable(
         ASK_USER_TOOL => parse_arguments::<AskUserArguments>(&request.arguments)
             .and_then(|arguments| ask_user(host, actor_id, arguments)),
         "_prompt_context" => prompt_context(host, actor_id, &request.arguments),
+        "_take_peer_messages" => take_peer_messages(host, actor_id),
         _ => Err(HostError::new("unknown_tool", "unknown agent tool")),
     };
     match result {
@@ -547,6 +549,7 @@ fn is_policy_tool(tool: &str) -> bool {
             | WAIT_AGENT_TOOL
             | INTERRUPT_AGENT_TOOL
             | READ_SESSION_TOOL
+            | RESOLVE_SESSION_TOOL
             | LIST_SESSIONS_TOOL
             | SEARCH_SESSIONS_TOOL
             | READ_FILE_TOOL
@@ -1015,6 +1018,7 @@ fn level_tools(level: AgentPermissionLevel) -> &'static [&'static str] {
         "read_messages",
         "wait_agent",
         "read_session",
+        "resolve_session",
         "list_sessions",
         "search_sessions",
         "send_message",
@@ -1040,6 +1044,7 @@ fn level_tools(level: AgentPermissionLevel) -> &'static [&'static str] {
         "read_messages",
         "wait_agent",
         "read_session",
+        "resolve_session",
         "list_sessions",
         "search_sessions",
         "send_message",
@@ -2021,6 +2026,91 @@ fn read_messages(host: &HostContext, actor_id: AgentId) -> HostResult {
         .drain(..)
         .collect();
     Ok(json!({ "messages": messages }))
+}
+
+fn take_peer_messages(host: &HostContext, actor_id: AgentId) -> HostResult {
+    let (lock, _) = &*host.shared;
+    let mut state = lock
+        .lock()
+        .map_err(|_| HostError::new("internal", "agent state is unavailable"))?;
+    let inbox = state.inboxes.entry(actor_id).or_default();
+    let mut messages = Vec::new();
+    let mut retained = VecDeque::with_capacity(inbox.len());
+    while let Some(message) = inbox.pop_front() {
+        if message.kind == MessageKind::PeerMessage {
+            messages.push(message);
+        } else {
+            retained.push_back(message);
+        }
+    }
+    *inbox = retained;
+    Ok(json!({ "messages": messages }))
+}
+
+/// Resolve one known agent/session address without enumerating either catalog.
+fn resolve_session(host: &HostContext, actor_id: AgentId, value: &Value) -> HostResult {
+    let arguments: ResolveSessionArguments = parse_arguments(value)?;
+    let target = arguments.target.trim();
+    if target.is_empty() {
+        return Err(HostError::new(
+            "invalid_arguments",
+            "target cannot be empty",
+        ));
+    }
+
+    let (actor, visible) = {
+        let (lock, _) = &*host.shared;
+        let state = lock
+            .lock()
+            .map_err(|_| HostError::new("internal", "agent state is unavailable"))?;
+        let actor = state
+            .actors
+            .get(&actor_id)
+            .map(|node| node.descriptor.clone())
+            .ok_or_else(|| HostError::new("unauthorized", "agent is unavailable"))?;
+        let visible = resolve_visible_target(&state, actor_id, target)
+            .ok()
+            .and_then(|id| state.actors.get(&id))
+            .map(|node| node.descriptor.clone());
+        (actor, visible)
+    };
+
+    let descriptor = if let Some(descriptor) = visible {
+        descriptor
+    } else {
+        let session_id: pi_whim_core::SessionId = target.parse().map_err(|_| {
+            HostError::new(
+                "session_not_found",
+                "target is not a visible agent name, runtime ID, or valid session ID",
+            )
+        })?;
+        session_inventory(host, actor_id)
+            .into_iter()
+            .find(|snapshot| snapshot.descriptor.session_id == session_id)
+            .or_else(|| {
+                let snapshot = catalog::snapshot(session_id)?;
+                (actor.level == 0 && snapshot.descriptor.level == 0).then_some(snapshot)
+            })
+            .map(|snapshot| snapshot.descriptor)
+            .ok_or_else(|| HostError::new("session_not_found", "no session matches target"))?
+    };
+
+    let active = catalog::active(descriptor.session_id).is_some();
+    let can_message = actor.session_id != descriptor.session_id
+        && message_kind_for_descriptors(&actor, &descriptor).is_ok();
+    Ok(json!({
+        "session_id": descriptor.session_id,
+        "agent_id": descriptor.id,
+        "name": descriptor.name,
+        "role": descriptor.role,
+        "level": descriptor.level,
+        "status": descriptor.status,
+        "active": active,
+        "can_message": can_message,
+        "persistent": catalog::snapshot(descriptor.session_id)
+            .and_then(|snapshot| snapshot.session_path)
+            .is_some()
+    }))
 }
 
 fn read_session(host: &HostContext, actor_id: AgentId, value: &Value) -> HostResult {
@@ -3878,6 +3968,26 @@ mod tests {
             &json!({ "target": root_session, "message": "direct notification" }),
         );
         assert!(result.is_ok());
+        supervisor.stop().unwrap();
+    }
+
+    #[test]
+    fn a_known_session_id_resolves_without_listing_catalogs() {
+        let (mut supervisor, _) = test_host(AgentTeamConfig::default());
+        let session_id = supervisor.host.shared.0.lock().unwrap().actors[&supervisor.root_id]
+            .descriptor
+            .session_id;
+
+        let resolved = resolve_session(
+            &supervisor.host,
+            supervisor.root_id,
+            &json!({ "target": session_id }),
+        )
+        .unwrap();
+
+        assert_eq!(resolved["session_id"], json!(session_id));
+        assert_eq!(resolved["active"], true);
+        assert_eq!(resolved["can_message"], false);
         supervisor.stop().unwrap();
     }
 

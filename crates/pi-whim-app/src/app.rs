@@ -403,6 +403,13 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                     self.notices.error(error);
                 }
             }
+            Request::ClearQueue => {
+                // Pi answers with the queue it dropped and a `queue_update`
+                // event, which is what refreshes the snapshot.
+                if let Err(error) = self.active_command(json!({"type":"clear_queue"})) {
+                    self.notices.error(error);
+                }
+            }
             Request::SetLanguage(language) => {
                 self.apply(Action::SetLanguage(language));
                 self.save_preferences();
@@ -1894,19 +1901,26 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         if first_plain_prompt && let Some(token) = self.sessions.token_for(&key) {
             self.title_eligible.insert(token);
         }
-        let item = ConversationItem {
-            id: Uuid::new_v4().to_string(),
-            role: ConversationRole::User,
-            full_text: content.clone(),
-            streaming: false,
-            tool_name: None,
-            tool_report: None,
-            tool_details: None,
-            is_error: false,
-            model: None,
-            attachments: attachments.clone(),
-        };
-        self.apply(Action::UpsertConversation(item));
+        // Only a fresh prompt is placed optimistically: it starts answering
+        // right away, so its place in the conversation is now. A steered or
+        // queued message would sit mid-transcript while the turn streams on
+        // below it — it waits in the queue block instead, and Pi's
+        // `message_start` places it at the end when it is consumed.
+        if matches!(mode, SubmitMode::Prompt) {
+            let item = ConversationItem {
+                id: Uuid::new_v4().to_string(),
+                role: ConversationRole::User,
+                full_text: content.clone(),
+                streaming: false,
+                tool_name: None,
+                tool_report: None,
+                tool_details: None,
+                is_error: false,
+                model: None,
+                attachments: attachments.clone(),
+            };
+            self.apply(Action::UpsertConversation(item));
+        }
         // A deferred model switch waits until the prompt that continues the
         // conversation, so the prior model compacts the existing history first
         // (cache-friendly). Skip when there's nothing to compact or it just did.
@@ -1976,6 +1990,14 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         let is_active = self.sessions.active_key() == Some(key);
         if let Some(session) = self.sessions.get_mut(key) {
             session.turn.running = true;
+            if matches!(mode, SubmitMode::Prompt) {
+                // What `message_start` will report, so the translation can tell
+                // this echo from a queued message it has never shown.
+                session
+                    .turn
+                    .optimistic_prompts
+                    .push_back(prompt_with_attachment_paths(&content, &attachments));
+            }
         }
         self.apply(Action::SessionRunning {
             path: key.to_owned(),
@@ -2469,7 +2491,7 @@ mod tests {
             one_shot_installs: crossbeam_channel::unbounded(),
             one_shot_completions: crossbeam_channel::unbounded(),
             pending_session_titles: HashMap::new(),
-            staged_session_title_prompts: HashMap::new(),
+            expected_session_title_names: HashMap::new(),
             title_eligible: HashSet::new(),
             title_attempted: HashSet::new(),
         }
@@ -2932,7 +2954,89 @@ mod tests {
     }
 
     #[test]
-    fn session_title_waits_for_the_first_runtime_name_and_uses_only_the_first_prompt() {
+    fn a_fresh_prompt_is_shown_now_and_remembered_for_its_echo() {
+        // The card goes up immediately — the reply starts now — and the wire
+        // text is remembered so Pi's `message_start` does not place it twice.
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = FakeRuntime::default();
+        let observer = runtime.clone();
+        let mut app = test_application(&directory, runtime);
+        start_test_session(&mut app, &directory);
+        app.apply(Action::SetSessionStatus(SessionStatus::Ready));
+
+        app.submit_prompt("what changed?".into(), Vec::new(), SubmitMode::Prompt);
+
+        assert_eq!(app.state().conversation.len(), 1);
+        assert_eq!(app.state().conversation[0].full_text, "what changed?");
+        let key = app
+            .sessions
+            .active_key()
+            .expect("an active session")
+            .to_owned();
+        let session = app.sessions.get(&key).expect("the pooled session");
+        assert_eq!(session.turn.optimistic_prompts.len(), 1);
+        assert_eq!(session.turn.optimistic_prompts[0], "what changed?");
+        assert!(observer.commands().iter().any(|command| {
+            command.get("type").and_then(Value::as_str) == Some("prompt")
+                && command.get("message").and_then(Value::as_str) == Some("what changed?")
+        }));
+    }
+
+    #[test]
+    fn a_queued_message_waits_in_the_queue_block_not_the_transcript() {
+        // A steered or follow-up message lands mid-transcript if placed now —
+        // the turn streams on below it — so it stays out of the conversation
+        // until Pi announces it consumed.
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = FakeRuntime::default();
+        let observer = runtime.clone();
+        let mut app = test_application(&directory, runtime);
+        start_test_session(&mut app, &directory);
+        app.apply(Action::SetSessionStatus(SessionStatus::Streaming));
+
+        for mode in [SubmitMode::Steer, SubmitMode::FollowUp] {
+            app.submit_prompt("hold on".into(), Vec::new(), mode);
+        }
+
+        assert!(
+            app.state().conversation.is_empty(),
+            "a queued message is placed when it is consumed, not when it is sent"
+        );
+        let key = app
+            .sessions
+            .active_key()
+            .expect("an active session")
+            .to_owned();
+        let session = app.sessions.get(&key).expect("the pooled session");
+        assert!(session.turn.optimistic_prompts.is_empty());
+        for expected in ["steer", "follow_up"] {
+            assert!(
+                observer.commands().iter().any(|command| {
+                    command.get("type").and_then(Value::as_str) == Some(expected)
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn clearing_the_queue_asks_pi_to_drop_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = FakeRuntime::default();
+        let observer = runtime.clone();
+        let mut app = test_application(&directory, runtime);
+        start_test_session(&mut app, &directory);
+
+        app.handle(Request::ClearQueue);
+
+        assert!(
+            observer.commands().iter().any(|command| {
+                command.get("type").and_then(Value::as_str) == Some("clear_queue")
+            })
+        );
+    }
+
+    #[test]
+    fn session_title_uses_the_first_prompt_immediately_and_only_once() {
         let directory = tempfile::tempdir().unwrap();
         let runtime = FakeRuntime::default();
         let observer = runtime.clone();
@@ -2952,16 +3056,6 @@ mod tests {
             SubmitMode::Prompt,
         );
         app.submit_prompt("second prompt".into(), Vec::new(), SubmitMode::Prompt);
-        assert!(!observer.commands().iter().any(|command| {
-            command.get("type").and_then(Value::as_str) == Some("set_session_name")
-        }));
-
-        observer.set_response("get_state", json!({"sessionName": "First default"}));
-        let key = app.sessions.active_key().unwrap().to_owned();
-        app.perform_effect(
-            &key,
-            events::Effect::RenameSessionFile(Some("First default".into())),
-        );
 
         let names = observer
             .commands()
@@ -2973,6 +3067,48 @@ mod tests {
         assert_eq!(names.len(), 1);
         assert_eq!(names[0]["name"], "给这个会话命名");
         assert!(!names[0].to_string().contains("secret-image"));
+    }
+
+    #[test]
+    fn the_initial_title_event_does_not_cancel_its_ai_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = FakeRuntime::default();
+        let observer = runtime.clone();
+        observer.set_response("get_state", json!({"sessionName": "First prompt"}));
+        let mut app = test_application(&directory, runtime);
+        start_test_session(&mut app, &directory);
+        let key = app.sessions.active_key().unwrap().to_owned();
+        let token = app.sessions.token_for(&key).unwrap();
+        let request_id = Uuid::new_v4();
+        app.one_shot_generation = 4;
+        app.expected_session_title_names
+            .insert(token, "First prompt".into());
+        app.pending_session_titles.insert(
+            request_id,
+            PendingSessionTitle {
+                session: token,
+                generation: 4,
+                fallback: "First prompt".into(),
+                baseline: "First prompt".into(),
+            },
+        );
+
+        app.perform_effect(
+            &key,
+            events::Effect::RenameSessionFile(Some("First prompt".into())),
+        );
+        assert!(app.pending_session_titles.contains_key(&request_id));
+        app.settle_one_shot_completions(vec![OneShotCompletion {
+            request_id,
+            generation: 4,
+            task_kind: "session_title".into(),
+            result: Ok("AI title".into()),
+        }]);
+
+        assert!(observer.commands().iter().any(|command| {
+            command.get("type").and_then(Value::as_str) == Some("set_session_name")
+                && command.get("name").and_then(Value::as_str) == Some("AI title")
+        }));
     }
 
     #[test]

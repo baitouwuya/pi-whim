@@ -9,15 +9,15 @@ use serde_json::{Value, json};
 
 pub const DEFAULT_TARGET_TOKENS: usize = 6_000;
 pub const DEFAULT_HARD_TOKENS: usize = 12_000;
-pub const DEFAULT_TARGET_BYTES: usize = 24 * 1024;
-pub const DEFAULT_HARD_BYTES: usize = 48 * 1024;
+pub const DEFAULT_TARGET_BYTES: usize = 96 * 1024;
+pub const DEFAULT_HARD_BYTES: usize = 128 * 1024;
 const MIN_GAIN_TOKENS: usize = 512;
 const MIN_GAIN_RATIO_NUMERATOR: usize = 15;
 const MIN_GAIN_RATIO_DENOMINATOR: usize = 100;
-const MAX_MARKER_BYTES: usize = 1_024;
+const MAX_MARKER_BYTES: usize = 2_048;
 const MAX_MARKER_RATIO_NUMERATOR: usize = 8;
 const MAX_MARKER_RATIO_DENOMINATOR: usize = 100;
-const MAX_OMITTED_SEGMENTS: usize = 64;
+const MAX_OMITTED_SEGMENTS: usize = 16;
 const MAX_STRUCTURED_ANCHORS: usize = 24;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -576,9 +576,16 @@ fn continuation_metadata(result: &CompressionResult, snapshot_id: Option<&str>) 
         .segments
         .iter()
         .filter(|segment| segment.kind == SegmentKind::Omitted)
-        .filter_map(|segment| segment.cursor.as_ref())
+        .filter_map(|segment| {
+            segment.cursor.as_ref().map(|cursor| {
+                let mut entry = json!({ "offset": cursor.offset, "limit": cursor.limit });
+                if let Some(label) = &segment.label {
+                    entry["label"] = json!(label);
+                }
+                entry
+            })
+        })
         .take(16)
-        .map(|cursor| json!({ "offset": cursor.offset, "limit": cursor.limit }))
         .collect::<Vec<_>>();
     let next_cursor = result
         .next
@@ -596,11 +603,13 @@ fn continuation_metadata(result: &CompressionResult, snapshot_id: Option<&str>) 
     // the omitted or paginated ranges before they are cited, never made from
     // the compressed excerpt alone.
     let warning = if omitted_total > 0 {
-        "以上为压缩视图：标记 `[... lines X-Y omitted]` 的行段已省略，并非完整原文。\
-         需要精确判断时请先按下方 omitted 游标回读对应行段，再下结论，避免断章取义。"
+        "以上为压缩视图：标记 `[... lines X-Y omitted: 摘要]` 的行段已省略，并非完整原文。\
+         需要精确判断时请先按下方 omitted 游标（含 label 提示）回读对应行段，再下结论，避免断章取义。\
+         若要获取完整无省略的内容，请使用 mode=raw 重新读取。"
     } else {
         "以上内容因长度被截断，仅展示部分原文。\
-         需要后续内容请按下方 next_cursor 继续，避免基于不完整信息断章取义。"
+         需要后续内容请按下方 next_cursor 继续，避免基于不完整信息断章取义。\
+         若要获取完整无省略的内容，请使用 mode=raw 重新读取。"
     };
     format!(
         "<read_warning>{warning}</read_warning>\n<read_metadata>{}</read_metadata>\n",
@@ -880,12 +889,23 @@ fn render_outline(
             let span = lines[first + start].start..lines[first + cursor - 1].end;
             // Keep the visible marker short. The complete byte cursor and
             // continuation coordinates remain in `segments`, so the model can
-            // resume the omitted range without inflating the useful view.
-            let marker = format!(
-                "[... lines {}-{} omitted]\n",
-                selected_start_line + start,
-                selected_start_line + cursor - 1,
-            );
+            // resume the omitted range without inflating the useful view. A
+            // short label from the first non-empty omitted line hints at what
+            // was elided so the model can judge whether to re-read it.
+            let label = first_omitted_label(&content[span.clone()]);
+            let marker = match &label {
+                Some(label) => format!(
+                    "[... lines {}-{} omitted: {}]\n",
+                    selected_start_line + start,
+                    selected_start_line + cursor - 1,
+                    label,
+                ),
+                None => format!(
+                    "[... lines {}-{} omitted]\n",
+                    selected_start_line + start,
+                    selected_start_line + cursor - 1,
+                ),
+            };
             output.push_str(&marker);
             let read_cursor =
                 cursor_for_bytes(lines, span.start, span.end, snapshot_id.map(str::to_owned));
@@ -895,13 +915,28 @@ fn render_outline(
                 end_line: selected_start_line + cursor - 1,
                 start_byte: span.start,
                 end_byte: span.end,
-                label: None,
+                label,
                 cursor: Some(read_cursor),
             });
             omitted_count += 1;
         }
     }
     (output, segments, omitted_count)
+}
+
+/// Pick a short human-readable hint for an omitted range: the first non-empty
+/// line, trimmed and capped so a marker stays a single scannable line.
+fn first_omitted_label(omitted: &str) -> Option<String> {
+    const MAX_LABEL_CHARS: usize = 60;
+    let line = omitted
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    let mut label = line.chars().take(MAX_LABEL_CHARS).collect::<String>();
+    if line.chars().count() > MAX_LABEL_CHARS {
+        label.push('…');
+    }
+    Some(label)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1750,5 +1785,99 @@ mod tests {
         assert!(result.content.contains("## Section"));
         assert!(result.content.contains("omitted"));
         assert!(result.output_bytes <= read.target_bytes);
+    }
+
+    #[test]
+    fn omitted_markers_carry_a_content_label() {
+        let mut source = String::from("use crate::Thing;\n\n");
+        for index in 0..40 {
+            source.push_str(&format!("pub fn task_{index}() {{\n"));
+            for body in 0..20 {
+                source.push_str(&format!("    let value_{body} = {body};\n"));
+            }
+            source.push_str("}\n\n");
+        }
+        let mut read = request(CompressionMode::Adaptive);
+        read.path = Some("tasks.rs".into());
+        read.target_tokens = 1_125;
+        read.hard_tokens = 1_500;
+        read.target_bytes = 4_500;
+        read.hard_bytes = 6_000;
+        let result = compress(&source, &read).unwrap();
+        assert_eq!(result.mode, CompressionMode::Adaptive);
+        let segment = result
+            .segments
+            .iter()
+            .find(|segment| segment.kind == SegmentKind::Omitted)
+            .expect("omitted segment");
+        let label = segment.label.as_deref().expect("omitted segment label");
+        assert!(
+            result.content.contains(&format!("omitted: {label}]")),
+            "marker should embed the label: {}",
+            result.content
+        );
+        let omitted_text = &source[segment.start_byte..segment.end_byte];
+        let first_line = omitted_text
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .expect("a non-empty omitted line");
+        assert!(
+            first_line.starts_with(label.trim_end_matches('…')),
+            "label must quote the first omitted line: {label} vs {first_line}"
+        );
+    }
+
+    #[test]
+    fn metadata_omitted_entries_and_warning_guide_recovery() {
+        let mut source = String::from("use crate::Thing;\n\n");
+        for index in 0..40 {
+            source.push_str(&format!("pub fn task_{index}() {{\n"));
+            for body in 0..20 {
+                source.push_str(&format!("    let value_{body} = {body};\n"));
+            }
+            source.push_str("}\n\n");
+        }
+        let rendered = render_text(
+            std::path::Path::new("tasks.rs"),
+            &source,
+            "adaptive",
+            None,
+            None,
+            1_500,
+            6_000,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            rendered.text.contains("mode=raw"),
+            "warning must point at mode=raw for the unabridged view"
+        );
+        let metadata = rendered
+            .text
+            .split_once("<read_metadata>")
+            .and_then(|(_, rest)| rest.split_once("</read_metadata>"))
+            .map(|(json_text, _)| json_text)
+            .expect("read metadata block");
+        let metadata: serde_json::Value = serde_json::from_str(metadata).unwrap();
+        let entry = metadata["omitted"]
+            .as_array()
+            .and_then(|entries| entries.first())
+            .expect("at least one omitted cursor");
+        assert!(
+            entry["label"]
+                .as_str()
+                .is_some_and(|label| !label.is_empty()),
+            "omitted cursor entries should carry a label hint: {entry}"
+        );
+        assert!(
+            rendered.details["segments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|segment| segment["kind"] == "omitted" && segment.get("label").is_some()),
+            "serialized segments should expose labels for omitted ranges"
+        );
     }
 }

@@ -1,12 +1,16 @@
 //! Pending steering and follow-up prompts shown beside the active draft.
 
 use gpui::{
-    IntoElement, ParentElement, RenderOnce, Styled, Window, div, prelude::FluentBuilder, px,
+    App, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, RenderOnce,
+    Styled, Window, div, prelude::FluentBuilder, px,
 };
 use pi_whim_core::{AppState, Language, strings::text as translate};
 use pi_whim_theme::{Tokens, text};
 
 use crate::theme::IntoHsla;
+
+/// The clear chip's click handler, named so the field stays readable.
+type OnClear = Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>;
 
 /// Compact queue chips for the prompt area.
 #[derive(IntoElement)]
@@ -15,6 +19,7 @@ pub struct QueueStatus {
     follow_ups: usize,
     language: Language,
     tokens: Tokens,
+    on_clear: Option<OnClear>,
 }
 
 impl QueueStatus {
@@ -27,7 +32,18 @@ impl QueueStatus {
             follow_ups,
             language: state.language,
             tokens,
+            on_clear: None,
         })
+    }
+
+    /// What the trailing chip does. Pi clears both queues together, so the
+    /// affordance is one button rather than one per kind.
+    pub fn on_clear(
+        mut self,
+        listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_clear = Some(Box::new(listener));
+        self
     }
 }
 
@@ -70,6 +86,27 @@ impl RenderOnce for QueueStatus {
                             translate("follow-ups", self.language),
                             self.follow_ups
                         )),
+                )
+            })
+            .when_some(self.on_clear, |this, on_clear| {
+                this.child(
+                    div()
+                        .id("queue-clear")
+                        .px(px(6.0))
+                        .py(px(2.0))
+                        .border_1()
+                        .border_color(tokens.line.hsla())
+                        .text_size(px(text::LABEL_SIZE))
+                        .text_color(tokens.muted.hsla())
+                        .cursor_pointer()
+                        .hover(|chip| {
+                            chip.border_color(tokens.line_strong.hsla())
+                                .text_color(tokens.text.hsla())
+                        })
+                        .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+                            on_clear(event, window, cx)
+                        })
+                        .child(translate("clear-queue", self.language)),
                 )
             })
     }

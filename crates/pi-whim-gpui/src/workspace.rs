@@ -5,12 +5,16 @@
 //! settings page, land as their own modules.
 
 use std::collections::BTreeSet;
+use std::time::{Duration, Instant};
 
 use gpui::{
     AppContext, Context, Entity, EventEmitter, InteractiveElement, IntoElement, ParentElement,
     Render, Styled, Window, div, prelude::FluentBuilder, px,
 };
-use gpui_component::theme::{Theme as ComponentTheme, ThemeMode as ComponentMode};
+use gpui_component::{
+    input::{Enter, IndentInline, MoveDown, MoveUp},
+    theme::{Theme as ComponentTheme, ThemeMode as ComponentMode},
+};
 use pi_whim_core::{
     AgentPermissionLevel, AgentTeamConfig, AppState, Attachment, BashPolicy, Language, ModelOption,
     OneShotAiConfig, ProjectId, ProviderId, ProviderProfile, ProviderProtocol, QueueMode,
@@ -19,13 +23,13 @@ use pi_whim_core::{
 use pi_whim_engine::dialogs::{Answer, Prompt};
 use pi_whim_engine::notice::Outbox;
 use pi_whim_engine::session::now_ms;
-use pi_whim_engine::slash_commands::SlashCommand;
+use pi_whim_engine::slash_commands::{self, SlashCommand};
 use pi_whim_theme::{ThemeMode, ThemePreference, Tokens, text};
 
 use crate::{
     chat::{
         self, Composer, ComposerEvent, Controls, ControlsEvent, Conversation, ConversationEvent,
-        Palette, PaletteEvent, Paste, QueueStatus, Sidebar, SidebarEvent,
+        Palette, PaletteEvent, PaletteKey, Paste, QueueStatus, Sidebar, SidebarEvent,
     },
     chrome::{Banner, TopBar},
     dialogs::{PromptEvent, Prompts, Rename, RenameEvent},
@@ -33,6 +37,45 @@ use crate::{
     settings::{Settings, SettingsEvent},
     theme::IntoHsla,
 };
+
+/// Two Escapes within this window read as one command: stop everything.
+///
+/// Wide enough to forgive a hesitant second press, narrow enough that a pause
+/// between interrupts does not surprise the next one with a queue wipe.
+const DOUBLE_ESCAPE: Duration = Duration::from_millis(600);
+
+/// One Escape press, decided.
+///
+/// The decision is pure so the whole matrix can be tested without a window:
+/// `handle_escape` only gathers the four inputs and runs the plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EscapePlan {
+    /// Not the workspace's business: fall through to the stream-reveal
+    /// shortcut (which may itself decline and let the input have the key).
+    RevealLatest,
+    /// Stop the running turn. `queue_draft` moves the composer's content
+    /// behind the turn it just stopped instead of losing it.
+    Interrupt { queue_draft: bool },
+    /// Second press inside the window: stop the turn and wipe the queue.
+    TerminateAll,
+}
+
+/// Decide what a single Escape means.
+///
+/// Interrupting only makes sense while a turn runs and the composer is where
+/// the user's hands are; anything else keeps Escape's idle meaning. Two
+/// presses escalate from "stop this turn" to "stop everything".
+fn escape_plan(busy: bool, composer_focused: bool, has_draft: bool, double: bool) -> EscapePlan {
+    if !(busy && composer_focused) {
+        return EscapePlan::RevealLatest;
+    }
+    if double {
+        return EscapePlan::TerminateAll;
+    }
+    EscapePlan::Interrupt {
+        queue_draft: has_draft,
+    }
+}
 
 /// Space around the prompt box.
 ///
@@ -125,6 +168,8 @@ pub enum Request {
     },
     /// Interrupt the turn in flight.
     Stop,
+    /// Drop every queued steering and follow-up message.
+    ClearQueue,
 
     // The settings page's requests. Preferences are stored as well as applied,
     // and some of them are process launch flags, so each of these is a change the
@@ -215,6 +260,8 @@ pub struct Workspace {
     expanded_projects: BTreeSet<ProjectId>,
     /// Requests waiting for the backend owner to drain.
     requests: Vec<Request>,
+    /// When Escape last interrupted a turn, for telling one press from two.
+    last_escape: Option<Instant>,
 }
 
 impl EventEmitter<RequestsRaised> for Workspace {}
@@ -269,6 +316,9 @@ impl Workspace {
                     // Routing through the existing slash command keeps session
                     // re-keying and indexing in one place.
                     workspace.request(Request::RunCommand(SlashCommand::Fork(id.clone())), cx);
+                }
+                ConversationEvent::ClearQueue => {
+                    workspace.request(Request::ClearQueue, cx);
                 }
                 ConversationEvent::CopyAssistant(id) => {
                     let text = conversation
@@ -350,6 +400,7 @@ impl Workspace {
             dismissed_error: None,
             expanded_projects: BTreeSet::new(),
             requests: Vec::new(),
+            last_escape: None,
         }
     }
 
@@ -574,13 +625,114 @@ impl Workspace {
                 });
             }
             PaletteEvent::Run(command) => {
+                // A query typed mid-sentence costs only its own token: the
+                // sentence around it was the reader's draft, not the command's.
+                let text = self.composer.read(cx).text(cx);
+                let restored = slash_commands::without_trailing_query(&text).unwrap_or_default();
                 self.composer.update(cx, |composer, cx| {
-                    composer.set_text("", window, cx);
+                    composer.set_text(&restored, window, cx);
                 });
                 self.request(Request::RunCommand(command), cx);
             }
         }
         cx.notify();
+    }
+
+    /// Offer a captured navigation key to the palette.
+    ///
+    /// Only the composer's own palette may take it: the action was captured at
+    /// the root, so with settings showing or a dialog's field focused the same
+    /// key still belongs to that field, palette open or not.
+    fn steer_palette(&mut self, key: PaletteKey, window: &mut Window, cx: &mut Context<Self>) {
+        if self.showing_settings || !self.composer.read(cx).focus_handle(cx).is_focused(window) {
+            return;
+        }
+        let consumed = self
+            .palette
+            .update(cx, |palette, cx| palette.handle_palette_key(key, cx));
+        if consumed {
+            cx.stop_propagation();
+        }
+    }
+
+    /// What one Escape means depends on the turn.
+    ///
+    /// While the agent works it interrupts; a typed draft is not lost to that
+    /// but queued behind the turn it just stopped. Two presses in a row stop
+    /// everything, queue included. Idle, Escape stays the stream-reveal
+    /// shortcut it always was.
+    fn handle_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let busy = matches!(
+            self.state.session_status,
+            SessionStatus::Streaming | SessionStatus::Compacting
+        );
+        let composer_focused =
+            !self.showing_settings && self.composer.read(cx).focus_handle(cx).is_focused(window);
+        let has_draft = !self.composer.read(cx).text(cx).trim().is_empty()
+            || !self.composer.read(cx).attachments().is_empty();
+        self.run_escape_plan(busy, composer_focused, has_draft, window, cx);
+    }
+
+    /// Carry out one Escape, its context already read.
+    ///
+    /// Split from [`Workspace::handle_escape`] so the behavior is testable
+    /// without focusing the composer: a focused input paints through the
+    /// component root, which a headless test window does not have.
+    fn run_escape_plan(
+        &mut self,
+        busy: bool,
+        composer_focused: bool,
+        has_draft: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let now = Instant::now();
+        let double = self
+            .last_escape
+            .is_some_and(|previous| now.duration_since(previous) < DOUBLE_ESCAPE);
+        let plan = escape_plan(busy, composer_focused, has_draft, double);
+        if plan == EscapePlan::RevealLatest {
+            self.last_escape = None;
+            if self
+                .conversation
+                .update(cx, |conversation, cx| conversation.reveal_latest(cx))
+            {
+                cx.stop_propagation();
+            }
+            return;
+        }
+        self.last_escape = if double { None } else { Some(now) };
+
+        // Interrupt either way; what else happens is what sets one press apart
+        // from two.
+        self.request(Request::Stop, cx);
+        if plan == EscapePlan::TerminateAll {
+            self.request(Request::ClearQueue, cx);
+        } else {
+            let draft = self.composer.read(cx).text(cx);
+            let attachments = self.composer.read(cx).attachments().to_vec();
+            if !draft.trim().is_empty() || !attachments.is_empty() {
+                let paths: Vec<String> = attachments
+                    .iter()
+                    .map(|attachment| attachment.path.clone())
+                    .collect();
+                self.composer.update(cx, |composer, cx| {
+                    composer.set_text("", window, cx);
+                    for path in paths {
+                        composer.remove_attachment(&path, cx);
+                    }
+                });
+                self.request(
+                    Request::SubmitPrompt {
+                        content: draft,
+                        attachments,
+                        mode: SubmitMode::FollowUp,
+                    },
+                    cx,
+                );
+            }
+        }
+        cx.stop_propagation();
     }
 
     /// Act on what the runtime controls reported.
@@ -848,11 +1000,14 @@ impl Workspace {
         let language = self.state.language;
         let has_project = self.state.selected_project.is_some();
         let generating = matches!(self.state.session_status, SessionStatus::Streaming);
+        let queued_steering = self.state.pending_steering.clone();
+        let queued_follow_up = self.state.pending_follow_up.clone();
         self.conversation.update(cx, |conversation, cx| {
             conversation.set_tokens(tokens, cx);
             conversation.set_language(language, cx);
             conversation.set_has_project(has_project, cx);
             conversation.set_generating(generating, cx);
+            conversation.set_queue(queued_steering, queued_follow_up, cx);
             conversation.set_messages(messages, cx);
         });
     }
@@ -1082,7 +1237,11 @@ impl Workspace {
             .child(div().flex_none().child(self.controls.clone()))
             .child(send);
 
-        let queue_status = QueueStatus::from_state(&self.state, tokens);
+        let queue_status = QueueStatus::from_state(&self.state, tokens).map(|status| {
+            status.on_clear(cx.listener(|workspace, _, _, cx| {
+                workspace.request(Request::ClearQueue, cx);
+            }))
+        });
 
         div()
             // The containing block the palette anchors against.
@@ -1266,12 +1425,31 @@ impl Render for Workspace {
             // over it translucently, so it belongs here rather than inside any
             // one pane. This box is the containing block it positions against.
             .relative()
-            // Captured rather than merely observed: this runs before the focused
-            // input handles the key, which is what lets an arrow move the palette
-            // selection instead of the caret, and Enter run the highlighted
-            // command instead of submitting the prompt. The composer keeps focus
-            // throughout, so typing still filters.
-            .capture_key_down(cx.listener(|workspace, event, _, cx| {
+            // The composer keeps focus while the palette is open, so typing
+            // still filters — but the input binds arrows, Enter, and Tab to its
+            // own actions, and a bound action never reaches a key listener.
+            // Capturing the actions instead is what lets an arrow move the
+            // palette selection instead of the caret, and Enter run the
+            // highlighted command instead of submitting the prompt.
+            .capture_action(cx.listener(|workspace, _: &MoveUp, window, cx| {
+                workspace.steer_palette(PaletteKey::Up, window, cx);
+            }))
+            .capture_action(cx.listener(|workspace, _: &MoveDown, window, cx| {
+                workspace.steer_palette(PaletteKey::Down, window, cx);
+            }))
+            .capture_action(cx.listener(|workspace, action: &Enter, window, cx| {
+                // Shift+Enter is the input's own newline, palette open or not.
+                if action.secondary || action.shift {
+                    return;
+                }
+                workspace.steer_palette(PaletteKey::Run, window, cx);
+            }))
+            .capture_action(cx.listener(|workspace, _: &IndentInline, window, cx| {
+                workspace.steer_palette(PaletteKey::Run, window, cx);
+            }))
+            // Escape the input lets propagate, so it still arrives as a key:
+            // first the palette's dismissal, then the turn's interrupt.
+            .capture_key_down(cx.listener(|workspace, event, window, cx| {
                 let consumed = workspace
                     .palette
                     .update(cx, |palette, cx| palette.handle_key(event, cx));
@@ -1279,12 +1457,8 @@ impl Render for Workspace {
                     cx.stop_propagation();
                     return;
                 }
-                if is_bare_escape(&event.keystroke)
-                    && workspace
-                        .conversation
-                        .update(cx, |conversation, cx| conversation.reveal_latest(cx))
-                {
-                    cx.stop_propagation();
+                if is_bare_escape(&event.keystroke) {
+                    workspace.handle_escape(window, cx);
                 }
             }))
             .bg(tokens.bg_canvas.hsla())
@@ -1548,6 +1722,12 @@ mod tests {
     ///
     /// Goes through the crate's own `init` so the shell is built the way the app
     /// builds it, rather than against a second setup path that could drift.
+    ///
+    /// Not wrapped in `gpui_component::Root` the way the app wraps it: the root
+    /// installs a macOS hit-test forwarder a headless window does not have.
+    /// Tests therefore never focus the composer — a focused input paints
+    /// through the root — and drive focus-gated methods with the gate answered,
+    /// the way [`Workspace::run_escape_plan`] takes its inputs.
     fn shell(cx: &mut gpui::TestAppContext) -> gpui::WindowHandle<Workspace> {
         let preference = ThemePreference::default();
         cx.update(|cx| {
@@ -1836,6 +2016,136 @@ mod tests {
                 assert!(!conversation.is_tool_report_expanded("m1"));
                 assert!(!conversation.is_tool_details_expanded("m1"));
                 assert!(!conversation.is_thinking_expanded("m1", 0));
+            })
+            .expect("the window is open");
+    }
+
+    #[test]
+    fn escape_only_interrupts_while_busy_with_hands_on_the_composer() {
+        // The whole matrix, without a window: anything else keeps Escape's
+        // idle meaning.
+        assert_eq!(
+            escape_plan(false, true, true, false),
+            EscapePlan::RevealLatest
+        );
+        assert_eq!(
+            escape_plan(true, false, true, false),
+            EscapePlan::RevealLatest
+        );
+        assert_eq!(
+            escape_plan(true, true, true, false),
+            EscapePlan::Interrupt { queue_draft: true }
+        );
+        assert_eq!(
+            escape_plan(true, true, false, false),
+            EscapePlan::Interrupt { queue_draft: false }
+        );
+        // A second press ignores the draft: stop everything, queue included.
+        assert_eq!(
+            escape_plan(true, true, true, true),
+            EscapePlan::TerminateAll
+        );
+        assert_eq!(
+            escape_plan(false, true, true, true),
+            EscapePlan::RevealLatest
+        );
+    }
+
+    /// The shell with a streaming turn: the interrupt shortcuts live there.
+    ///
+    /// The composer is never focused — a focused input paints through the
+    /// component root a headless window does not have — so the Escape tests
+    /// answer the focus gate themselves via `run_escape_plan`.
+    fn busy_shell(cx: &mut gpui::TestAppContext) -> gpui::WindowHandle<Workspace> {
+        let shell = shell(cx);
+        shell
+            .update(cx, |workspace, window, cx| {
+                workspace.set_state(
+                    AppState {
+                        session_status: SessionStatus::Streaming,
+                        ..AppState::default()
+                    },
+                    window,
+                    cx,
+                );
+            })
+            .expect("the window is open");
+        shell
+    }
+
+    #[gpui::test]
+    async fn one_escape_interrupts_and_queues_the_draft(cx: &mut gpui::TestAppContext) {
+        // What was typed is not lost to the interrupt: it waits behind the turn
+        // it just stopped.
+        let shell = busy_shell(cx);
+
+        shell
+            .update(cx, |workspace, window, cx| {
+                workspace.composer.update(cx, |composer, cx| {
+                    composer.set_text("hold that thought", window, cx);
+                });
+                workspace.run_escape_plan(true, true, true, window, cx);
+
+                let requests = workspace.take_requests();
+                assert_eq!(requests.len(), 2);
+                assert_eq!(requests[0], Request::Stop);
+                assert!(matches!(
+                    &requests[1],
+                    Request::SubmitPrompt { content, mode: SubmitMode::FollowUp, .. }
+                        if content == "hold that thought"
+                ));
+                assert_eq!(workspace.composer.read(cx).text(cx), "");
+            })
+            .expect("the window is open");
+    }
+
+    #[gpui::test]
+    async fn one_escape_without_a_draft_only_interrupts(cx: &mut gpui::TestAppContext) {
+        let shell = busy_shell(cx);
+
+        shell
+            .update(cx, |workspace, window, cx| {
+                workspace.run_escape_plan(true, true, false, window, cx);
+                assert_eq!(workspace.take_requests(), vec![Request::Stop]);
+            })
+            .expect("the window is open");
+    }
+
+    #[gpui::test]
+    async fn two_escapes_stop_everything_queue_included(cx: &mut gpui::TestAppContext) {
+        let shell = busy_shell(cx);
+
+        shell
+            .update(cx, |workspace, window, cx| {
+                workspace.run_escape_plan(true, true, false, window, cx);
+                workspace.run_escape_plan(true, true, false, window, cx);
+
+                let requests = workspace.take_requests();
+                assert_eq!(requests.len(), 3);
+                assert_eq!(requests[0], Request::Stop);
+                assert_eq!(requests[1], Request::Stop);
+                assert_eq!(requests[2], Request::ClearQueue);
+            })
+            .expect("the window is open");
+    }
+
+    #[gpui::test]
+    async fn an_idle_escape_interrupts_nothing(cx: &mut gpui::TestAppContext) {
+        let shell = shell(cx);
+
+        shell
+            .update(cx, |workspace, window, cx| {
+                workspace.set_state(
+                    AppState {
+                        session_status: SessionStatus::Ready,
+                        ..AppState::default()
+                    },
+                    window,
+                    cx,
+                );
+                workspace.run_escape_plan(false, true, true, window, cx);
+
+                assert!(workspace.take_requests().is_empty());
             })
             .expect("the window is open");
     }

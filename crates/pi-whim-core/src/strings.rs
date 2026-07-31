@@ -408,6 +408,8 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ("generating", "Generating", "正在生成"),
     ("queued", "Queued", "排队中"),
     ("follow-ups", "Follow-ups", "后续消息"),
+    ("queued-messages", "Queued messages", "排队消息"),
+    ("clear-queue", "Clear the queue", "清空排队"),
     (
         "blocked-patterns-help",
         "One Bash command blocking pattern per line.",

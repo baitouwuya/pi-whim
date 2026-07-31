@@ -11,6 +11,7 @@ pub const READ_MESSAGES_TOOL: &str = "read_messages";
 pub const WAIT_AGENT_TOOL: &str = "wait_agent";
 pub const INTERRUPT_AGENT_TOOL: &str = "interrupt_agent";
 pub const READ_SESSION_TOOL: &str = "read_session";
+pub const RESOLVE_SESSION_TOOL: &str = "resolve_session";
 pub const LIST_SESSIONS_TOOL: &str = "list_sessions";
 pub const SEARCH_SESSIONS_TOOL: &str = "search_sessions";
 pub const READ_FILE_TOOL: &str = "read";

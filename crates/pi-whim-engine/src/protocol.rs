@@ -158,6 +158,10 @@ pub(crate) fn tool_call_report(name: &str, arguments: Option<&Value>) -> String 
             "Reading session {}.",
             argument("session_id").unwrap_or("unknown")
         ),
+        "resolve_session" => format!(
+            "Resolving session {}.",
+            argument("target").unwrap_or("unknown")
+        ),
         "list_sessions" => "Discovering retained sessions.".into(),
         "search_sessions" => {
             let query = argument("query").unwrap_or_default();
@@ -665,6 +669,17 @@ fn agent_team_tool_summary(name: &str, text: &str) -> Option<String> {
             let name = agent.get("name")?.as_str()?;
             let level = agent.get("level")?.as_u64()?;
             Some(format!("Read {name} session (level {level})"))
+        }
+        "resolve_session" => {
+            let session = result.get("session_id")?.as_str()?;
+            let active = result
+                .get("active")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            Some(format!(
+                "Resolved {session} ({})",
+                if active { "active" } else { "retained" }
+            ))
         }
         "list_sessions" => result
             .get("sessions")

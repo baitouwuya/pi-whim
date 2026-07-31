@@ -25,8 +25,8 @@ use pi_whim_theme::{Rgba, Tokens, layout, text};
 
 use crate::{
     chat::{
-        Conversation, ConversationEvent, ToolCard, message_disclosure::disclosure_button,
-        reading_lane,
+        Conversation, ConversationEvent, CrossTaskMessage, ToolCard,
+        message_disclosure::disclosure_button, reading_lane,
     },
     icons,
     theme::IntoHsla,
@@ -367,6 +367,19 @@ impl RenderOnce for MessageCard {
                 tokens,
             )
             .into_any_element(),
+
+            ConversationRole::System
+                if self.message.tool_name.as_deref() == Some("peer_message") =>
+            {
+                CrossTaskMessage::new(
+                    self.index,
+                    self.message.tool_details.clone().unwrap_or_default(),
+                    self.visible_text.to_string(),
+                    language,
+                    tokens,
+                )
+                .into_any_element()
+            }
 
             ConversationRole::System => div()
                 .flex()

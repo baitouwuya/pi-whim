@@ -62,6 +62,37 @@ function resolveSearchPath(projectRoot: string, input: string): string {
 }
 
 export default function agentTeamExtension(pi: ExtensionAPI) {
+	let peerInboxRunning = true;
+	let peerInboxStarted = false;
+	const pollPeerInbox = async () => {
+		while (peerInboxRunning) {
+			try {
+				const response = await callAgentHost("_take_peer_messages", {});
+				const payload = response.content as { messages?: Array<Record<string, unknown>> };
+				for (const message of payload.messages ?? []) {
+					const senderName = typeof message.sender_name === "string" ? message.sender_name : "Pi";
+					const senderSessionId = typeof message.sender_session_id === "string" ? message.sender_session_id : "unknown";
+					const content = typeof message.content === "string" ? message.content : "";
+					pi.sendMessage(
+						{
+							customType: "pi-whim-peer-message",
+							content: `<peer_message sender="${senderName}" sender_session_id="${senderSessionId}">\n${content}\n</peer_message>`,
+							display: true,
+							details: message,
+						},
+						{ triggerTurn: true, deliverAs: "followUp" },
+					);
+				}
+			} catch {
+				// The optional supervisor may stop before the extension runtime does.
+			}
+			await new Promise((resolve) => setTimeout(resolve, 750));
+		}
+	};
+	pi.on("session_shutdown", () => {
+		peerInboxRunning = false;
+	});
+
 	pi.on("session_start", async (_event, ctx) => {
 		if (process.env.PI_WHIM_AGENT_LEVEL === "0") {
 			// Pi keeps find and grep opt-in by default. Children receive an explicit
@@ -74,6 +105,10 @@ export default function agentTeamExtension(pi: ExtensionAPI) {
 			} catch {
 				// A project can still chat if the optional team host is unavailable.
 			}
+		}
+		if (process.env.PI_WHIM_AGENT_LEVEL === "0" && !peerInboxStarted) {
+			peerInboxStarted = true;
+			void pollPeerInbox();
 		}
 	});
 
@@ -394,7 +429,7 @@ export default function agentTeamExtension(pi: ExtensionAPI) {
 		name: "read",
 		label: "read (coordinated)",
 		description:
-			"The single entry point for reading text, images, directories, and file metadata through the Rust coordinator. UTF-8 text supports bounded paginated reads; PNG, JPEG, GIF, WebP, and BMP return image content; directories return sorted immediate children; unsupported or binary files return metadata. Large images are automatically compressed without cropping, with transparent pixels preserved; mode=raw returns exact image bytes.",
+			"The single entry point for reading text, images, directories, and file metadata through the Rust coordinator. UTF-8 text supports bounded paginated reads; PNG, JPEG, GIF, WebP, and BMP return image content; directories return sorted immediate children; unsupported or binary files return metadata. Large images are automatically compressed without cropping, with transparent pixels preserved; mode=raw returns exact image bytes. For text files, mode=auto may omit large sections with [... lines X-Y omitted] markers; mode=raw returns exact uncompressed text; mode=adaptive returns a structured outline.",
 		promptSnippet: "Read text, images, directories, or file metadata through the coordinated Rust file gateway",
 		promptGuidelines: [
 			"Use this instead of an image-specific reader; it returns supported image content directly.",
@@ -402,6 +437,7 @@ export default function agentTeamExtension(pi: ExtensionAPI) {
 			"Large supported images are automatically compressed as a complete uncropped frame; transparency is preserved. Use mode=raw for exact original bytes up to the 8 MiB hard limit.",
 			"Use offset and limit for exact text ranges or a directory page; directories are immediate children only.",
 			"When the result includes next_cursor, pass it back as cursor; use snapshot_id to detect a stale file or directory.",
+			"When reading a text file, mode=auto may omit large sections. Use mode=raw to get the complete uncompressed content without omission markers.",
 			"Use mode=raw when exact uncompressed content is required.",
 		],
 		executionMode: "parallel",
@@ -411,12 +447,12 @@ export default function agentTeamExtension(pi: ExtensionAPI) {
 			limit: Type.Optional(Type.Integer({ minimum: 1, description: "Number of lines" })),
 			mode: Type.Optional(
 				Type.Union([Type.Literal("auto"), Type.Literal("raw"), Type.Literal("adaptive")], {
-					description: 'Read mode; defaults to "auto"',
+					description: '"auto" compresses large text with omission markers; "raw" returns exact uncompressed content (up to max_bytes); "adaptive" returns a structured outline with anchors. Defaults to "auto".',
 					default: "auto",
 				}),
 			),
 			max_tokens: Type.Optional(Type.Integer({ minimum: 1, maximum: 12000 })),
-			max_bytes: Type.Optional(Type.Integer({ minimum: 1, maximum: 49152 })),
+			max_bytes: Type.Optional(Type.Integer({ minimum: 1, maximum: 131072 })),
 			snapshot_id: Type.Optional(Type.String({ description: "Expected file revision" })),
 			cursor: Type.Optional(Type.String({ description: "Opaque continuation cursor from a prior read" })),
 			approval_ticket: Type.Optional(Type.String({ description: "One-time ticket returned after approved host file access" })),
@@ -468,7 +504,7 @@ export default function agentTeamExtension(pi: ExtensionAPI) {
 			"Apply precise unique oldText/newText replacements through the Rust coordinator. Non-overlapping queued edits are rebased; overlapping changes report the preceding agent and conflict range.",
 		promptSnippet: "Make precise coordinated replacements in a file",
 		promptGuidelines: [
-			"Keep each oldText unique and as small as possible.",
+			"Keep each oldText unique and as small as possible. If an edit fails due to non-unique oldText, use grep to find exact occurrences, then narrow oldText with more surrounding context.",
 			"Use one edit call with multiple disjoint replacements in the same file.",
 		],
 		executionMode: "parallel",
@@ -507,7 +543,7 @@ export default function agentTeamExtension(pi: ExtensionAPI) {
 		name: "send_message",
 		label: "Send message",
 		description:
-			'Send by session ID to a same-level peer, notify a direct parent/child, or use target="all_children" to broadcast. Level-0 sessions can message across teams; an offline root receives the message when it resumes. Subagents remain team-isolated.',
+			'Send directly by a known session ID without listing sessions or agents first; also accepts a runtime agent ID, unique visible name, or target="all_children". Level-0 sessions can message across teams; an offline root receives the message when it resumes. Subagents remain team-isolated.',
 		promptSnippet: "Message an authorized sibling or notify a direct parent/child.",
 		executionMode: "parallel",
 		parameters: Type.Object({
@@ -516,6 +552,20 @@ export default function agentTeamExtension(pi: ExtensionAPI) {
 		}),
 		async execute(_toolCallId, params, signal) {
 			const response = await callAgentHost("send_message", params, signal);
+			return { content: [{ type: "text", text: responseText(response) }], details: response.content };
+		},
+	});
+
+	pi.registerTool({
+		name: "resolve_session",
+		label: "Resolve session",
+		description:
+			"Resolve one known session ID, runtime agent ID, or unique visible name and report whether it is active and messageable. Use this for exact lookup; do not enumerate list_sessions and list_agents when the target is already known.",
+		promptSnippet: "Resolve one exact agent or session address.",
+		executionMode: "parallel",
+		parameters: Type.Object({ target: Target.properties.target }),
+		async execute(_toolCallId, params, signal) {
+			const response = await callAgentHost("resolve_session", params, signal);
 			return { content: [{ type: "text", text: responseText(response) }], details: response.content };
 		},
 	});
@@ -627,7 +677,8 @@ export default function agentTeamExtension(pi: ExtensionAPI) {
 			"Discover retained agent sessions, including historical level-0 sessions and bounded subagent snapshots. This is separate from list_agents, which only shows the caller's live coordination neighborhood.",
 		promptSnippet: "Discover historical and retained agent sessions.",
 		promptGuidelines: [
-			"Use list_sessions when you do not already know a session ID.",
+			"Use list_sessions only to browse retained history when you do not already know a session ID.",
+			"If you already have an ID, call resolve_session for inspection or send_message directly; never call list_sessions and list_agents to validate it.",
 			"Use the returned session_id with read_session or search_sessions.",
 		],
 		executionMode: "parallel",
