@@ -3198,6 +3198,48 @@ mod tests {
     use super::*;
     use std::sync::{Barrier, mpsc};
 
+    #[test]
+    fn find_tool_resolves_every_registered_const_and_rejects_unknown() {
+        // Guards against losing `match`'s compile-time exhaustiveness: every
+        // tool-name const must resolve through the TOOLS registry, and an
+        // unknown name must return None (dispatch maps that to unknown_tool).
+        for name in [
+            SPAWN_AGENT_TOOL,
+            SEND_MESSAGE_TOOL,
+            LIST_AGENTS_TOOL,
+            READ_MESSAGES_TOOL,
+            READ_SESSION_TOOL,
+            RESOLVE_SESSION_TOOL,
+            LIST_SESSIONS_TOOL,
+            SEARCH_SESSIONS_TOOL,
+            WAIT_AGENT_TOOL,
+            INTERRUPT_AGENT_TOOL,
+            RESET_TEAM_TOOL,
+            READ_FILE_TOOL,
+            WRITE_FILE_TOOL,
+            EDIT_FILE_TOOL,
+            BASH_TOOL,
+            FETCH_TOOL,
+            WEB_SEARCH_TOOL,
+            LIST_PROCESSES_TOOL,
+            READ_PROCESS_TOOL,
+            STOP_PROCESS_TOOL,
+            LIST_AVAILABLE_MODELS_TOOL,
+            LIST_PENDING_REQUESTS_TOOL,
+            RESOLVE_INTERACTION_TOOL,
+            ASK_USER_TOOL,
+        ] {
+            let spec =
+                find_tool(name).unwrap_or_else(|| panic!("find_tool({name:?}) returned None"));
+            assert_eq!(spec.name, name);
+        }
+        // Internal string-literal tools are registered too.
+        assert!(find_tool("_prompt_context").is_some());
+        assert!(find_tool("_take_peer_messages").is_some());
+        // Unknown names resolve to None (dispatch reports unknown_tool).
+        assert!(find_tool("not_a_real_tool").is_none());
+    }
+
     fn test_host(config: AgentTeamConfig) -> (AgentSupervisor, String) {
         test_host_at(config, "/tmp")
     }
