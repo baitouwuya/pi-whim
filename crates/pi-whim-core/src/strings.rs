@@ -229,6 +229,46 @@ const STRINGS: &[(&str, &str, &str)] = &[
         "This session has no usable conversation text.",
         "该会话没有可用于命名的对话文本。",
     ),
+    (
+        "notice-smart-rename-unchanged",
+        "The model returned the current title. The session was not changed.",
+        "模型返回了当前标题，会话名称未更改。",
+    ),
+    (
+        "notice-smart-rename-timeout",
+        "Smart rename timed out. Try again.",
+        "智能重命名请求超时，请重试。",
+    ),
+    (
+        "notice-smart-rename-unauthorized",
+        "Smart rename was rejected. Check the provider API key.",
+        "智能重命名认证失败，请检查提供商 API Key。",
+    ),
+    (
+        "notice-smart-rename-rate-limited",
+        "Smart rename was rate limited. Try again later.",
+        "智能重命名触发了速率限制，请稍后重试。",
+    ),
+    (
+        "notice-smart-rename-network",
+        "Smart rename could not reach the provider.",
+        "智能重命名无法连接提供商。",
+    ),
+    (
+        "notice-smart-rename-rejected",
+        "The provider rejected the smart rename request.",
+        "提供商拒绝了智能重命名请求。",
+    ),
+    (
+        "notice-smart-rename-invalid-response",
+        "The provider returned an invalid title response.",
+        "提供商返回的标题响应无效。",
+    ),
+    (
+        "notice-smart-rename-invalid-input",
+        "This session contains too much or invalid text for smart rename.",
+        "该会话文本过长或无效，无法智能重命名。",
+    ),
     ("background-ai-resources", "Resource limits", "资源限制"),
     (
         "background-ai-enabled",

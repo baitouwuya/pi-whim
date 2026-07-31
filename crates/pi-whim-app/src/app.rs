@@ -19,8 +19,8 @@ use pi_whim_core::{
     normalize_provider_display_name, provider_name_key, stable_session_id, strings,
 };
 use pi_whim_one_shot_ai::{
-    OneShotAiService, OneShotCompletion, OneShotRequestId, ResolvedOneShotAiConfig,
-    SessionHistoryTitleTask, SessionTitleTask, fallback_session_title,
+    OneShotAiService, OneShotCompletion, OneShotErrorKind, OneShotRequestId,
+    ResolvedOneShotAiConfig, SessionHistoryTitleTask, SessionTitleTask, fallback_session_title,
 };
 use pi_whim_persistence::{
     AppPreferences, AttachmentStore, MacosKeychainStore, PreferencesRepository, ProjectRepository,
@@ -142,6 +142,13 @@ struct PendingSessionTitle {
     generation: u64,
     fallback: String,
     baseline: String,
+    source: SessionTitleSource,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionTitleSource {
+    Automatic,
+    ExplicitSmartRename,
 }
 
 struct DeferredSessionTitle {
@@ -731,10 +738,21 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         let retired = self
             .pending_session_titles
             .drain()
-            .map(|(_, pending)| (pending.target, pending.fallback, pending.baseline))
+            .map(|(_, pending)| {
+                (
+                    pending.target,
+                    pending.fallback,
+                    pending.baseline,
+                    pending.source,
+                )
+            })
             .collect::<Vec<_>>();
-        for (target, fallback, baseline) in retired {
-            self.apply_pending_session_title(target, fallback, &baseline);
+        for (target, fallback, baseline, source) in retired {
+            if source == SessionTitleSource::Automatic {
+                self.apply_pending_session_title(target, fallback, &baseline, source);
+            } else {
+                self.report("notice-smart-rename-unavailable");
+            }
         }
         self.one_shot_generation = self.one_shot_generation.wrapping_add(1);
         let generation = self.one_shot_generation;
@@ -2091,6 +2109,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 SessionTitleTask::new(content),
                 fallback,
                 baseline,
+                SessionTitleSource::Automatic,
             );
         }
     }
@@ -2110,6 +2129,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 SessionTitleTask::new(title.content),
                 title.fallback,
                 title.baseline,
+                SessionTitleSource::Automatic,
             );
         }
     }
@@ -2120,6 +2140,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         task: T,
         fallback: String,
         baseline: String,
+        source: SessionTitleSource,
     ) -> bool {
         let Some(service) = self.one_shot_ai.as_ref() else {
             return false;
@@ -2134,12 +2155,15 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                         generation,
                         fallback,
                         baseline,
+                        source,
                     },
                 );
                 true
             }
             Err(_) => {
-                self.apply_pending_session_title(target, fallback, &baseline);
+                if source == SessionTitleSource::Automatic {
+                    self.apply_pending_session_title(target, fallback, &baseline, source);
+                }
                 false
             }
         }
@@ -2181,6 +2205,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             SessionHistoryTitleTask::new(context),
             baseline.clone(),
             baseline,
+            SessionTitleSource::ExplicitSmartRename,
         ) {
             self.report("notice-smart-rename-unavailable");
         }
@@ -2197,9 +2222,52 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             {
                 continue;
             }
-            let title = completion.result.unwrap_or(pending.fallback);
-            self.apply_pending_session_title(pending.target, title, &pending.baseline);
+            match completion.result {
+                Ok(title)
+                    if pending.source == SessionTitleSource::ExplicitSmartRename
+                        && title.trim() == pending.baseline.trim() =>
+                {
+                    self.report("notice-smart-rename-unchanged");
+                }
+                Ok(title) => self.apply_pending_session_title(
+                    pending.target,
+                    title,
+                    &pending.baseline,
+                    pending.source,
+                ),
+                Err(error) if pending.source == SessionTitleSource::ExplicitSmartRename => {
+                    self.report_smart_rename_error(error);
+                }
+                Err(_) => self.apply_pending_session_title(
+                    pending.target,
+                    pending.fallback,
+                    &pending.baseline,
+                    pending.source,
+                ),
+            }
         }
+    }
+
+    fn report_smart_rename_error(&mut self, error: OneShotErrorKind) {
+        let key = match error {
+            OneShotErrorKind::TimedOut => "notice-smart-rename-timeout",
+            OneShotErrorKind::Unauthorized => "notice-smart-rename-unauthorized",
+            OneShotErrorKind::RateLimited => "notice-smart-rename-rate-limited",
+            OneShotErrorKind::Network => "notice-smart-rename-network",
+            OneShotErrorKind::ProviderRejected => "notice-smart-rename-rejected",
+            OneShotErrorKind::InvalidResponse
+            | OneShotErrorKind::ResponseTooLarge
+            | OneShotErrorKind::InvalidOutput => "notice-smart-rename-invalid-response",
+            OneShotErrorKind::InputTooLarge | OneShotErrorKind::InvalidInput => {
+                "notice-smart-rename-invalid-input"
+            }
+            OneShotErrorKind::Disabled
+            | OneShotErrorKind::InvalidConfiguration
+            | OneShotErrorKind::Cancelled
+            | OneShotErrorKind::ShuttingDown => "notice-smart-rename-unavailable",
+            _ => "notice-smart-rename-unavailable",
+        };
+        self.report(key);
     }
 
     fn apply_pending_session_title(
@@ -2207,10 +2275,11 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         target: SessionTitleTarget,
         title: String,
         baseline: &str,
+        source: SessionTitleSource,
     ) {
         match target {
             SessionTitleTarget::Live(token) => {
-                self.apply_live_session_title(token, title, baseline)
+                self.apply_live_session_title(token, title, baseline, source)
             }
             SessionTitleTarget::Stored { project_id, path } => {
                 let still_current = self
@@ -2223,7 +2292,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                     return;
                 }
                 if let Some(token) = self.sessions.token_for(&path) {
-                    self.apply_live_session_title(token, title, baseline);
+                    self.apply_live_session_title(token, title, baseline, source);
                     return;
                 }
                 if title.trim() == baseline.trim() {
@@ -2249,7 +2318,13 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         }
     }
 
-    fn apply_live_session_title(&mut self, token: SessionToken, title: String, baseline: &str) {
+    fn apply_live_session_title(
+        &mut self,
+        token: SessionToken,
+        title: String,
+        baseline: &str,
+        source: SessionTitleSource,
+    ) {
         self.expected_session_title_names.remove(&token);
         let Some(key) = self.sessions.key_for(token).map(str::to_owned) else {
             return;
@@ -2258,6 +2333,9 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             return;
         };
         let Ok(state) = session.runtime.command(json!({"type":"get_state"})) else {
+            if source == SessionTitleSource::ExplicitSmartRename {
+                self.report("notice-smart-rename-unavailable");
+            }
             return;
         };
         let app_title_matches = self
@@ -2266,12 +2344,21 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             .get(&session.project_id)
             .and_then(|sessions| sessions.iter().find(|summary| summary.pi_path == key))
             .is_some_and(|summary| summary.title.trim() == baseline.trim());
-        if let Some(runtime_title) = state.get("sessionName").and_then(Value::as_str) {
-            if runtime_title.trim() != baseline.trim() {
+        if source == SessionTitleSource::ExplicitSmartRename {
+            // Explicit requests are guarded by the sidebar baseline and are
+            // cancelled immediately by manual or session_info renames. Pi's
+            // sessionName can lag the indexed title for the selected session.
+            if !app_title_matches {
                 return;
             }
-        } else if !app_title_matches {
-            return;
+        } else {
+            if let Some(runtime_title) = state.get("sessionName").and_then(Value::as_str) {
+                if runtime_title.trim() != baseline.trim() {
+                    return;
+                }
+            } else if !app_title_matches {
+                return;
+            }
         }
         let project_id = session.project_id;
         if session
@@ -2279,6 +2366,9 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             .command(json!({"type":"set_session_name", "name": title}))
             .is_err()
         {
+            if source == SessionTitleSource::ExplicitSmartRename {
+                self.report("notice-smart-rename-unavailable");
+            }
             return;
         }
         if let Some(path) = state.get("sessionFile").and_then(Value::as_str) {
@@ -3278,6 +3368,7 @@ mod tests {
                 generation: 4,
                 fallback: "First prompt".into(),
                 baseline: "First prompt".into(),
+                source: SessionTitleSource::Automatic,
             },
         );
 
@@ -3329,6 +3420,7 @@ mod tests {
                 generation: 6,
                 fallback: "Initial".into(),
                 baseline: "Initial".into(),
+                source: SessionTitleSource::ExplicitSmartRename,
             },
         );
 
@@ -3343,6 +3435,169 @@ mod tests {
             command.get("type").and_then(Value::as_str) == Some("set_session_name")
                 && command.get("name").and_then(Value::as_str) == Some("跨会话发送消息")
         }));
+    }
+
+    #[test]
+    fn live_smart_rename_uses_the_sidebar_title_when_pi_name_is_stale() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = FakeRuntime::default();
+        let observer = runtime.clone();
+        observer.set_response("get_state", json!({"sessionName": "Stale Pi title"}));
+        let mut app = test_application(&directory, runtime);
+        start_test_session(&mut app, &directory);
+        let key = app.sessions.active_key().unwrap().to_owned();
+        let token = app.sessions.token_for(&key).unwrap();
+        let project_id = app.sessions.get(&key).unwrap().project_id;
+        app.apply(Action::SessionsLoaded {
+            project_id,
+            sessions: vec![SessionSummary {
+                id: stable_session_id(&key),
+                project_id,
+                pi_path: key.clone(),
+                title: "Sidebar title".into(),
+                preview: "Prompt".into(),
+                updated_at_ms: now_ms(),
+            }],
+        });
+        let request_id = Uuid::new_v4();
+        app.one_shot_generation = 7;
+        app.pending_session_titles.insert(
+            request_id,
+            PendingSessionTitle {
+                target: SessionTitleTarget::Live(token),
+                generation: 7,
+                fallback: "Sidebar title".into(),
+                baseline: "Sidebar title".into(),
+                source: SessionTitleSource::ExplicitSmartRename,
+            },
+        );
+
+        app.settle_one_shot_completions(vec![OneShotCompletion {
+            request_id,
+            generation: 7,
+            task_kind: "session_title".into(),
+            result: Ok("Corrected task title".into()),
+        }]);
+
+        assert!(observer.commands().iter().any(|command| {
+            command.get("type").and_then(Value::as_str) == Some("set_session_name")
+                && command.get("name").and_then(Value::as_str) == Some("Corrected task title")
+        }));
+    }
+
+    #[test]
+    fn explicit_smart_rename_failure_reports_error_without_rewriting_title() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = FakeRuntime::default();
+        let observer = runtime.clone();
+        let mut app = test_application(&directory, runtime);
+        start_test_session(&mut app, &directory);
+        let key = app.sessions.active_key().unwrap().to_owned();
+        let token = app.sessions.token_for(&key).unwrap();
+        let request_id = Uuid::new_v4();
+        app.one_shot_generation = 7;
+        app.pending_session_titles.insert(
+            request_id,
+            PendingSessionTitle {
+                target: SessionTitleTarget::Live(token),
+                generation: 7,
+                fallback: "Current title".into(),
+                baseline: "Current title".into(),
+                source: SessionTitleSource::ExplicitSmartRename,
+            },
+        );
+
+        app.settle_one_shot_completions(vec![OneShotCompletion {
+            request_id,
+            generation: 7,
+            task_kind: "session_title".into(),
+            result: Err(OneShotErrorKind::TimedOut),
+        }]);
+
+        assert!(!observer.commands().iter().any(|command| {
+            command.get("type").and_then(Value::as_str) == Some("set_session_name")
+        }));
+        assert!(
+            app.take_notices()
+                .iter()
+                .any(|notice| notice.message.contains("timed out"))
+        );
+    }
+
+    #[test]
+    fn explicit_smart_rename_does_not_rewrite_an_unchanged_title() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = FakeRuntime::default();
+        let observer = runtime.clone();
+        let mut app = test_application(&directory, runtime);
+        start_test_session(&mut app, &directory);
+        let key = app.sessions.active_key().unwrap().to_owned();
+        let token = app.sessions.token_for(&key).unwrap();
+        let request_id = Uuid::new_v4();
+        app.one_shot_generation = 8;
+        app.pending_session_titles.insert(
+            request_id,
+            PendingSessionTitle {
+                target: SessionTitleTarget::Live(token),
+                generation: 8,
+                fallback: "Current title".into(),
+                baseline: "Current title".into(),
+                source: SessionTitleSource::ExplicitSmartRename,
+            },
+        );
+
+        app.settle_one_shot_completions(vec![OneShotCompletion {
+            request_id,
+            generation: 8,
+            task_kind: "session_title".into(),
+            result: Ok(" Current title ".into()),
+        }]);
+
+        assert!(!observer.commands().iter().any(|command| {
+            command.get("type").and_then(Value::as_str) == Some("set_session_name")
+        }));
+        assert!(
+            app.take_notices()
+                .iter()
+                .any(|notice| notice.message.contains("current title"))
+        );
+    }
+
+    #[test]
+    fn automatic_title_failure_keeps_its_silent_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = FakeRuntime::default();
+        let observer = runtime.clone();
+        observer.set_response("get_state", json!({"sessionName": "Initial"}));
+        let mut app = test_application(&directory, runtime);
+        start_test_session(&mut app, &directory);
+        let key = app.sessions.active_key().unwrap().to_owned();
+        let token = app.sessions.token_for(&key).unwrap();
+        let request_id = Uuid::new_v4();
+        app.one_shot_generation = 9;
+        app.pending_session_titles.insert(
+            request_id,
+            PendingSessionTitle {
+                target: SessionTitleTarget::Live(token),
+                generation: 9,
+                fallback: "Fallback title".into(),
+                baseline: "Initial".into(),
+                source: SessionTitleSource::Automatic,
+            },
+        );
+
+        app.settle_one_shot_completions(vec![OneShotCompletion {
+            request_id,
+            generation: 9,
+            task_kind: "session_title".into(),
+            result: Err(OneShotErrorKind::Network),
+        }]);
+
+        assert!(observer.commands().iter().any(|command| {
+            command.get("type").and_then(Value::as_str) == Some("set_session_name")
+                && command.get("name").and_then(Value::as_str) == Some("Fallback title")
+        }));
+        assert!(app.take_notices().is_empty());
     }
 
     #[test]
@@ -3363,6 +3618,7 @@ mod tests {
                 generation: 9,
                 fallback: "fallback".into(),
                 baseline: "Initial".into(),
+                source: SessionTitleSource::Automatic,
             },
         );
         app.deferred_session_titles.insert(
@@ -3441,6 +3697,7 @@ mod tests {
                 generation: 5,
                 fallback: "Original".into(),
                 baseline: "Original".into(),
+                source: SessionTitleSource::ExplicitSmartRename,
             },
         );
         app.settle_one_shot_completions(vec![OneShotCompletion {
@@ -3476,6 +3733,7 @@ mod tests {
                 generation: 5,
                 fallback: "AI title".into(),
                 baseline: "AI title".into(),
+                source: SessionTitleSource::ExplicitSmartRename,
             },
         );
         app.rename_session(path.clone(), "Manual".into());
@@ -3523,6 +3781,7 @@ mod tests {
                 generation: 3,
                 fallback: "fallback".into(),
                 baseline: "Initial".into(),
+                source: SessionTitleSource::Automatic,
             },
         );
         app.sessions.rekey(&old_key, "rekeyed.jsonl", now_ms());
@@ -3541,6 +3800,7 @@ mod tests {
                 generation: 3,
                 fallback: "fallback".into(),
                 baseline: "Initial".into(),
+                source: SessionTitleSource::Automatic,
             },
         );
         app.sessions.remove("rekeyed.jsonl");
