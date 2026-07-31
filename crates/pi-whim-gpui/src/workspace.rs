@@ -123,6 +123,12 @@ pub enum Request {
         path: String,
         title: String,
     },
+    /// Read a session transcript off the UI thread and generate a replacement title.
+    SmartRenameSession {
+        project_id: ProjectId,
+        path: String,
+        title: String,
+    },
     /// Copy the visible session's transcript into a new one.
     CloneSession,
     /// Put text on the clipboard.
@@ -530,6 +536,18 @@ impl Workspace {
                     rename.open(pi_path, &title, window, cx);
                 });
             }
+            SidebarEvent::SmartRenameSession {
+                project_id,
+                pi_path,
+                title,
+            } => self.request(
+                Request::SmartRenameSession {
+                    project_id,
+                    path: pi_path,
+                    title,
+                },
+                cx,
+            ),
         }
         self.sync_views(window, cx);
         cx.notify();

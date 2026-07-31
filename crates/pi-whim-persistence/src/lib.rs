@@ -4,7 +4,10 @@ mod attachments;
 mod sessions;
 
 pub use attachments::AttachmentStore;
-pub use sessions::{content_text, session_summary_from_jsonl};
+pub use sessions::{
+    content_text, persist_session_title_to_jsonl, session_summary_from_jsonl,
+    session_title_context_from_jsonl,
+};
 
 use std::{
     io,

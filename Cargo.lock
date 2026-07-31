@@ -4747,6 +4747,7 @@ dependencies = [
 name = "pi-whim-persistence"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "dirs",
  "image",
  "keyring",

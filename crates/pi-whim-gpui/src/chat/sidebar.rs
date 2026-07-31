@@ -58,6 +58,12 @@ pub enum SidebarEvent {
     RemoveProject(ProjectId),
     /// Give the session at `pi_path` a new title, starting from `title`.
     RenameSession { pi_path: String, title: String },
+    /// Generate a new title from the session's sanitized transcript.
+    SmartRenameSession {
+        project_id: ProjectId,
+        pi_path: String,
+        title: String,
+    },
     /// Copy the visible session's transcript into a new one.
     CloneSession,
     /// Put the session id on the clipboard.
@@ -81,11 +87,23 @@ fn row_actions(row: &Row, language: Language) -> Vec<(&'static str, SidebarEvent
             (label("remove"), SidebarEvent::RemoveProject(*id)),
         ],
         Row::Session {
-            id, pi_path, title, ..
+            id,
+            project_id,
+            pi_path,
+            title,
+            ..
         } => vec![
             (
                 label("rename"),
                 SidebarEvent::RenameSession {
+                    pi_path: pi_path.clone(),
+                    title: title.clone(),
+                },
+            ),
+            (
+                label("smart-rename"),
+                SidebarEvent::SmartRenameSession {
+                    project_id: *project_id,
                     pi_path: pi_path.clone(),
                     title: title.clone(),
                 },
@@ -277,7 +295,9 @@ impl Sidebar {
             cx.on_next_frame(window, move |sidebar, window, cx| {
                 sidebar.advance_marquee(epoch, scroll, started, window, cx);
             });
-            window.request_animation_frame();
+            // `cx.notify()` above already invalidates this view and schedules
+            // the next draw. Requesting another frame here can re-borrow GPUI's
+            // frame callback queue while it is being drained and abort the app.
         }
     }
 
@@ -739,6 +759,7 @@ mod tests {
             session,
             vec![
                 "Rename",
+                "Smart rename",
                 "Clone session",
                 "Copy session ID",
                 "Move to trash"
@@ -772,6 +793,31 @@ mod tests {
         let SidebarEvent::RenameSession { pi_path, title } = event else {
             panic!("expected a rename event");
         };
+        assert_eq!(pi_path, "/tmp/a.jsonl");
+        assert_eq!(title, "Migrate the UI");
+    }
+
+    #[test]
+    fn smart_rename_carries_only_local_session_identity() {
+        let row = session_row();
+        let actions = row_actions(&row, Language::English);
+        let (_, event) = &actions[1];
+        let SidebarEvent::SmartRenameSession {
+            project_id,
+            pi_path,
+            title,
+        } = event
+        else {
+            panic!("expected a smart rename event");
+        };
+        let Row::Session {
+            project_id: expected_project,
+            ..
+        } = row
+        else {
+            panic!("expected a session row");
+        };
+        assert_eq!(*project_id, expected_project);
         assert_eq!(pi_path, "/tmp/a.jsonl");
         assert_eq!(title, "Migrate the UI");
     }

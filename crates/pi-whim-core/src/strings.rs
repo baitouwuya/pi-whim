@@ -34,6 +34,7 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ("show-finder", "Show in Finder", "在 Finder 中显示"),
     ("remove", "Remove", "移除"),
     ("rename", "Rename", "重命名"),
+    ("smart-rename", "Smart rename", "智能重命名"),
     ("rename-session", "Rename session", "重命名会话"),
     ("clone", "Clone session", "克隆会话"),
     ("delete", "Move to trash", "移至废纸篓"),
@@ -217,6 +218,16 @@ const STRINGS: &[(&str, &str, &str)] = &[
         "background-ai-session-title-help",
         "Generate a title from the first plain user prompt.",
         "根据第一条普通用户提示生成标题。",
+    ),
+    (
+        "notice-smart-rename-unavailable",
+        "Background AI is not ready for smart rename.",
+        "后台 AI 尚未就绪，无法智能重命名。",
+    ),
+    (
+        "notice-smart-rename-empty",
+        "This session has no usable conversation text.",
+        "该会话没有可用于命名的对话文本。",
     ),
     ("background-ai-resources", "Resource limits", "资源限制"),
     (

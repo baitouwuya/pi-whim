@@ -10,6 +10,6 @@ pub use service::{
     OneShotStats, OneShotSubmitError, ResolvedOneShotAiConfig,
 };
 pub use task::{
-    MAX_ONE_SHOT_INPUT_BYTES, OneShotTask, SessionTitleTask, fallback_session_title,
-    normalize_session_title,
+    MAX_ONE_SHOT_INPUT_BYTES, OneShotTask, SessionHistoryTitleTask, SessionTitleTask,
+    fallback_session_title, normalize_session_title,
 };

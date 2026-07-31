@@ -20,12 +20,12 @@ use pi_whim_core::{
 };
 use pi_whim_one_shot_ai::{
     OneShotAiService, OneShotCompletion, OneShotRequestId, ResolvedOneShotAiConfig,
-    SessionTitleTask, fallback_session_title,
+    SessionHistoryTitleTask, SessionTitleTask, fallback_session_title,
 };
 use pi_whim_persistence::{
     AppPreferences, AttachmentStore, MacosKeychainStore, PreferencesRepository, ProjectRepository,
     ProviderRepository, SearchEngineRepository, SecretStore, SessionRepository, SqliteStore,
-    session_summary_from_jsonl,
+    persist_session_title_to_jsonl, session_summary_from_jsonl,
 };
 use pi_whim_runtime::{AgentRuntime, PiRpcRuntime, RuntimeEvent, RuntimeStart};
 use serde_json::{Value, json};
@@ -134,10 +134,16 @@ pub struct PiWhimApplication<R: AgentRuntime = PiRpcRuntime> {
 
 #[derive(Clone)]
 struct PendingSessionTitle {
-    session: SessionToken,
+    target: SessionTitleTarget,
     generation: u64,
     fallback: String,
     baseline: String,
+}
+
+#[derive(Clone)]
+enum SessionTitleTarget {
+    Live(SessionToken),
+    Stored { project_id: ProjectId, path: String },
 }
 
 type OneShotInstall = (u64, Option<ResolvedOneShotAiConfig>);
@@ -378,6 +384,9 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             Request::NewSession(project_id) => self.start_new_session(project_id),
             Request::ActivateSession { project_id, path } => self.switch_session(project_id, path),
             Request::RenameSession { path, title } => self.rename_session(path, title),
+            // Transcript loading belongs to `Host`, where it can run on the
+            // background executor without blocking GPUI's main thread.
+            Request::SmartRenameSession { .. } => self.report("notice-smart-rename-unavailable"),
             Request::CloneSession => self.clone_session(),
             Request::DeleteSession(path) => self.delete_session(path),
             Request::SubmitPrompt {
@@ -711,10 +720,10 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         let retired = self
             .pending_session_titles
             .drain()
-            .map(|(_, pending)| (pending.session, pending.fallback, pending.baseline))
+            .map(|(_, pending)| (pending.target, pending.fallback, pending.baseline))
             .collect::<Vec<_>>();
-        for (session, fallback, baseline) in retired {
-            self.apply_session_title(session, fallback, &baseline);
+        for (target, fallback, baseline) in retired {
+            self.apply_pending_session_title(target, fallback, &baseline);
         }
         self.one_shot_generation = self.one_shot_generation.wrapping_add(1);
         let generation = self.one_shot_generation;
@@ -1625,18 +1634,20 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     }
 
     fn rename_session(&mut self, path: String, title: String) {
-        if let Some(token) = self.sessions.token_for(&path) {
-            self.cancel_pending_title(token);
-        }
+        self.cancel_pending_titles_for_path(&path);
         // A live session renames through its own process so the name lands in
         // the session file; renaming a background session never disturbs it.
         // Without a live process the rename is store-only and may be
         // overwritten by a later disk rescan.
-        if let Some(session) = self.sessions.get(&path)
-            && let Err(error) = session
+        if let Some(session) = self.sessions.get(&path) {
+            if let Err(error) = session
                 .runtime
                 .command(json!({"type":"set_session_name", "name": title}))
-        {
+            {
+                self.notices.error(error.to_string());
+                return;
+            }
+        } else if let Err(error) = persist_session_title_to_jsonl(Path::new(&path), &title) {
             self.notices.error(error.to_string());
             return;
         }
@@ -1736,9 +1747,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         // Stop the session's own process first so it cannot rewrite the file
         // after the delete; the conversation moves to another live session.
         let was_visible = self.sessions.active_key() == Some(path.as_str());
-        if let Some(token) = self.sessions.token_for(&path) {
-            self.cancel_pending_title(token);
-        }
+        self.cancel_pending_titles_for_path(&path);
         if let Some(mut session) = self.sessions.remove(&path) {
             let _ = session.runtime.stop();
             self.apply(Action::SessionRunning {
@@ -2055,33 +2064,83 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         if let Some(path) = session_file {
             self.index_session(project_id, &path, Some(&baseline));
         }
-        self.schedule_session_title(token, content, fallback, baseline);
+        let _ = self.schedule_session_title(
+            SessionTitleTarget::Live(token),
+            SessionTitleTask::new(content),
+            fallback,
+            baseline,
+        );
     }
 
-    fn schedule_session_title(
+    fn schedule_session_title<T: pi_whim_one_shot_ai::OneShotTask>(
         &mut self,
-        token: SessionToken,
-        content: String,
+        target: SessionTitleTarget,
+        task: T,
         fallback: String,
         baseline: String,
-    ) {
+    ) -> bool {
         let Some(service) = self.one_shot_ai.as_ref() else {
-            return;
+            return false;
         };
         let generation = service.generation();
-        match service.try_submit(SessionTitleTask::new(content)) {
+        match service.try_submit(task) {
             Ok(request_id) => {
                 self.pending_session_titles.insert(
                     request_id,
                     PendingSessionTitle {
-                        session: token,
+                        target,
                         generation,
                         fallback,
                         baseline,
                     },
                 );
+                true
             }
-            Err(_) => self.apply_session_title(token, fallback, &baseline),
+            Err(_) => {
+                self.apply_pending_session_title(target, fallback, &baseline);
+                false
+            }
+        }
+    }
+
+    pub(crate) fn start_smart_session_rename(
+        &mut self,
+        project_id: ProjectId,
+        path: String,
+        baseline: String,
+        context: Option<String>,
+    ) {
+        let still_current = self
+            .state()
+            .sessions
+            .get(&project_id)
+            .and_then(|sessions| sessions.iter().find(|session| session.pi_path == path))
+            .is_some_and(|session| session.title.trim() == baseline.trim());
+        if !still_current {
+            return;
+        }
+        let Some(context) = context else {
+            self.report("notice-smart-rename-empty");
+            return;
+        };
+        if self.one_shot_ai.is_none() {
+            self.report("notice-smart-rename-unavailable");
+            return;
+        }
+
+        self.cancel_pending_titles_for_path(&path);
+        let target = self
+            .sessions
+            .token_for(&path)
+            .map(SessionTitleTarget::Live)
+            .unwrap_or(SessionTitleTarget::Stored { project_id, path });
+        if !self.schedule_session_title(
+            target,
+            SessionHistoryTitleTask::new(context),
+            baseline.clone(),
+            baseline,
+        ) {
+            self.report("notice-smart-rename-unavailable");
         }
     }
 
@@ -2097,11 +2156,58 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 continue;
             }
             let title = completion.result.unwrap_or(pending.fallback);
-            self.apply_session_title(pending.session, title, &pending.baseline);
+            self.apply_pending_session_title(pending.target, title, &pending.baseline);
         }
     }
 
-    fn apply_session_title(&mut self, token: SessionToken, title: String, baseline: &str) {
+    fn apply_pending_session_title(
+        &mut self,
+        target: SessionTitleTarget,
+        title: String,
+        baseline: &str,
+    ) {
+        match target {
+            SessionTitleTarget::Live(token) => {
+                self.apply_live_session_title(token, title, baseline)
+            }
+            SessionTitleTarget::Stored { project_id, path } => {
+                let still_current = self
+                    .state()
+                    .sessions
+                    .get(&project_id)
+                    .and_then(|sessions| sessions.iter().find(|session| session.pi_path == path))
+                    .is_some_and(|session| session.title.trim() == baseline.trim());
+                if !still_current {
+                    return;
+                }
+                if let Some(token) = self.sessions.token_for(&path) {
+                    self.apply_live_session_title(token, title, baseline);
+                    return;
+                }
+                if title.trim() == baseline.trim() {
+                    return;
+                }
+                if let Err(error) = persist_session_title_to_jsonl(Path::new(&path), &title) {
+                    self.notices.error(error.to_string());
+                    return;
+                }
+                if let Some(store) = self.store.as_ref() {
+                    if let Err(error) = store.rename_session(stable_session_id(&path), &title) {
+                        self.notices.error(error.to_string());
+                        return;
+                    }
+                    if let Ok(sessions) = store.list_sessions(project_id) {
+                        self.apply(Action::SessionsLoaded {
+                            project_id,
+                            sessions,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    fn apply_live_session_title(&mut self, token: SessionToken, title: String, baseline: &str) {
         self.expected_session_title_names.remove(&token);
         let Some(key) = self.sessions.key_for(token).map(str::to_owned) else {
             return;
@@ -2137,7 +2243,32 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         let request_ids = self
             .pending_session_titles
             .iter()
-            .filter_map(|(request_id, pending)| (pending.session == token).then_some(*request_id))
+            .filter_map(|(request_id, pending)| {
+                matches!(pending.target, SessionTitleTarget::Live(pending_token) if pending_token == token)
+                    .then_some(*request_id)
+            })
+            .collect::<Vec<_>>();
+        for request_id in request_ids {
+            self.pending_session_titles.remove(&request_id);
+            if let Some(service) = self.one_shot_ai.as_ref() {
+                service.cancel(request_id);
+            }
+        }
+    }
+
+    fn cancel_pending_titles_for_path(&mut self, path: &str) {
+        let request_ids = self
+            .pending_session_titles
+            .iter()
+            .filter_map(|(request_id, pending)| {
+                let matches = match &pending.target {
+                    SessionTitleTarget::Live(token) => self.sessions.key_for(*token) == Some(path),
+                    SessionTitleTarget::Stored {
+                        path: pending_path, ..
+                    } => pending_path == path,
+                };
+                matches.then_some(*request_id)
+            })
             .collect::<Vec<_>>();
         for request_id in request_ids {
             self.pending_session_titles.remove(&request_id);
@@ -3086,7 +3217,7 @@ mod tests {
         app.pending_session_titles.insert(
             request_id,
             PendingSessionTitle {
-                session: token,
+                target: SessionTitleTarget::Live(token),
                 generation: 4,
                 fallback: "First prompt".into(),
                 baseline: "First prompt".into(),
@@ -3125,7 +3256,7 @@ mod tests {
         app.pending_session_titles.insert(
             request_id,
             PendingSessionTitle {
-                session: token,
+                target: SessionTitleTarget::Live(token),
                 generation: 9,
                 fallback: "fallback".into(),
                 baseline: "Initial".into(),
@@ -3152,6 +3283,116 @@ mod tests {
     }
 
     #[test]
+    fn stored_session_smart_rename_updates_without_pi_and_manual_rename_wins() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = FakeRuntime::default();
+        let observer = runtime.clone();
+        let mut app = test_application(&directory, runtime);
+        let project = project("test", directory.path());
+        let path = directory
+            .path()
+            .join("stored.jsonl")
+            .to_string_lossy()
+            .into_owned();
+        fs::write(
+            &path,
+            r#"{"type":"message","message":{"role":"user","content":"Prompt"}}"#,
+        )
+        .unwrap();
+        let summary = SessionSummary {
+            id: stable_session_id(&path),
+            project_id: project.id,
+            pi_path: path.clone(),
+            title: "Original".into(),
+            preview: "Prompt".into(),
+            updated_at_ms: 1,
+        };
+        let store = app.store.as_ref().unwrap();
+        store.save_project(&project).unwrap();
+        store.save_session(&summary).unwrap();
+        app.apply(Action::ProjectsLoaded(vec![project.clone()]));
+        app.apply(Action::SelectProject(project.id));
+        app.apply(Action::SessionsLoaded {
+            project_id: project.id,
+            sessions: vec![summary],
+        });
+        app.one_shot_generation = 5;
+
+        let successful = Uuid::new_v4();
+        app.pending_session_titles.insert(
+            successful,
+            PendingSessionTitle {
+                target: SessionTitleTarget::Stored {
+                    project_id: project.id,
+                    path: path.clone(),
+                },
+                generation: 5,
+                fallback: "Original".into(),
+                baseline: "Original".into(),
+            },
+        );
+        app.settle_one_shot_completions(vec![OneShotCompletion {
+            request_id: successful,
+            generation: 5,
+            task_kind: "session_title".into(),
+            result: Ok("AI title".into()),
+        }]);
+        assert_eq!(
+            app.store
+                .as_ref()
+                .unwrap()
+                .list_sessions(project.id)
+                .unwrap()[0]
+                .title,
+            "AI title"
+        );
+        assert_eq!(
+            session_summary_from_jsonl(project.id, Path::new(&path))
+                .unwrap()
+                .title,
+            "AI title"
+        );
+
+        let late = Uuid::new_v4();
+        app.pending_session_titles.insert(
+            late,
+            PendingSessionTitle {
+                target: SessionTitleTarget::Stored {
+                    project_id: project.id,
+                    path: path.clone(),
+                },
+                generation: 5,
+                fallback: "AI title".into(),
+                baseline: "AI title".into(),
+            },
+        );
+        app.rename_session(path.clone(), "Manual".into());
+        app.settle_one_shot_completions(vec![OneShotCompletion {
+            request_id: late,
+            generation: 5,
+            task_kind: "session_title".into(),
+            result: Ok("Late AI".into()),
+        }]);
+
+        assert_eq!(
+            app.store
+                .as_ref()
+                .unwrap()
+                .list_sessions(project.id)
+                .unwrap()[0]
+                .title,
+            "Manual"
+        );
+        assert_eq!(
+            session_summary_from_jsonl(project.id, Path::new(&path))
+                .unwrap()
+                .title,
+            "Manual"
+        );
+        assert!(observer.commands().is_empty());
+    }
+
+    #[test]
     fn a_background_title_follows_rekey_but_not_session_deletion() {
         let directory = tempfile::tempdir().unwrap();
         let runtime = FakeRuntime::default();
@@ -3166,7 +3407,7 @@ mod tests {
         app.pending_session_titles.insert(
             first,
             PendingSessionTitle {
-                session: token,
+                target: SessionTitleTarget::Live(token),
                 generation: 3,
                 fallback: "fallback".into(),
                 baseline: "Initial".into(),
@@ -3184,7 +3425,7 @@ mod tests {
         app.pending_session_titles.insert(
             late,
             PendingSessionTitle {
-                session: token,
+                target: SessionTitleTarget::Live(token),
                 generation: 3,
                 fallback: "fallback".into(),
                 baseline: "Initial".into(),

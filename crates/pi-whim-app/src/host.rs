@@ -10,8 +10,12 @@
 //! do the waking: [`pi_whim_gpui::pump`] blocks on a background thread and returns
 //! to the main thread with each batch, so an idle app costs nothing.
 
+use std::path::Path;
+
 use gpui::{ClipboardItem, Context, Entity, IntoElement, PathPromptOptions, Render, Task, Window};
 use pi_whim_gpui::{Request, RequestsRaised, Workspace, pump};
+use pi_whim_one_shot_ai::MAX_ONE_SHOT_INPUT_BYTES;
+use pi_whim_persistence::session_title_context_from_jsonl;
 use pi_whim_runtime::{AgentRuntime, test_search_engine};
 
 use crate::app::{PiWhimApplication, Picker};
@@ -270,6 +274,32 @@ impl<R: AgentRuntime + 'static> Host<R> {
             }
             Request::CopyToClipboard(text) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            Request::SmartRenameSession {
+                project_id,
+                path,
+                title,
+            } => {
+                let transcript_path = path.clone();
+                cx.spawn_in(window, async move |host, cx| {
+                    let context = cx
+                        .background_executor()
+                        .spawn(async move {
+                            session_title_context_from_jsonl(
+                                Path::new(&transcript_path),
+                                MAX_ONE_SHOT_INPUT_BYTES,
+                            )
+                            .ok()
+                            .flatten()
+                        })
+                        .await;
+                    let _ = host.update_in(cx, |host, window, cx| {
+                        host.application
+                            .start_smart_session_rename(project_id, path, title, context);
+                        host.publish(window, cx);
+                    });
+                })
+                .detach();
             }
             Request::PickAttachments => self.open_picker(Picker::Attachments, window, cx),
             Request::SubmitPrompt {
