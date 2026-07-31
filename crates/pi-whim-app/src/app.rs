@@ -127,6 +127,10 @@ pub struct PiWhimApplication<R: AgentRuntime = PiRpcRuntime> {
         crossbeam_channel::Receiver<OneShotCompletion>,
     ),
     pending_session_titles: HashMap<OneShotRequestId, PendingSessionTitle>,
+    /// First-prompt title jobs held only while the keychain-backed service is
+    /// initializing. Keeping the raw prompt here avoids losing auto naming to
+    /// a startup race without persisting conversation text.
+    deferred_session_titles: HashMap<SessionToken, DeferredSessionTitle>,
     expected_session_title_names: HashMap<SessionToken, String>,
     title_eligible: HashSet<SessionToken>,
     title_attempted: HashSet<SessionToken>,
@@ -136,6 +140,12 @@ pub struct PiWhimApplication<R: AgentRuntime = PiRpcRuntime> {
 struct PendingSessionTitle {
     target: SessionTitleTarget,
     generation: u64,
+    fallback: String,
+    baseline: String,
+}
+
+struct DeferredSessionTitle {
+    content: String,
     fallback: String,
     baseline: String,
 }
@@ -227,6 +237,7 @@ impl Default for PiWhimApplication<PiRpcRuntime> {
             one_shot_installs: crossbeam_channel::unbounded(),
             one_shot_completions: crossbeam_channel::unbounded(),
             pending_session_titles: HashMap::new(),
+            deferred_session_titles: HashMap::new(),
             expected_session_title_names: HashMap::new(),
             title_eligible: HashSet::new(),
             title_attempted: HashSet::new(),
@@ -792,6 +803,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             }
         });
         self.one_shot_ai = Some(service);
+        self.submit_deferred_session_titles();
     }
 
     fn reload_search_engine_profiles(&mut self) {
@@ -2064,12 +2076,42 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         if let Some(path) = session_file {
             self.index_session(project_id, &path, Some(&baseline));
         }
-        let _ = self.schedule_session_title(
-            SessionTitleTarget::Live(token),
-            SessionTitleTask::new(content),
-            fallback,
-            baseline,
-        );
+        if self.one_shot_ai.is_none() {
+            self.deferred_session_titles.insert(
+                token,
+                DeferredSessionTitle {
+                    content,
+                    fallback,
+                    baseline,
+                },
+            );
+        } else {
+            let _ = self.schedule_session_title(
+                SessionTitleTarget::Live(token),
+                SessionTitleTask::new(content),
+                fallback,
+                baseline,
+            );
+        }
+    }
+
+    fn submit_deferred_session_titles(&mut self) {
+        let deferred = std::mem::take(&mut self.deferred_session_titles);
+        for (token, title) in deferred {
+            let still_current = self
+                .expected_session_title_names
+                .get(&token)
+                .is_some_and(|expected| expected.trim() == title.baseline.trim());
+            if !still_current || self.sessions.key_for(token).is_none() {
+                continue;
+            }
+            let _ = self.schedule_session_title(
+                SessionTitleTarget::Live(token),
+                SessionTitleTask::new(title.content),
+                title.fallback,
+                title.baseline,
+            );
+        }
     }
 
     fn schedule_session_title<T: pi_whim_one_shot_ai::OneShotTask>(
@@ -2246,6 +2288,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
 
     fn cancel_pending_title(&mut self, token: SessionToken) {
         self.expected_session_title_names.remove(&token);
+        self.deferred_session_titles.remove(&token);
         let request_ids = self
             .pending_session_titles
             .iter()
@@ -2263,6 +2306,9 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     }
 
     fn cancel_pending_titles_for_path(&mut self, path: &str) {
+        if let Some(token) = self.sessions.token_for(path) {
+            self.cancel_pending_title(token);
+        }
         let request_ids = self
             .pending_session_titles
             .iter()
@@ -2628,6 +2674,7 @@ mod tests {
             one_shot_installs: crossbeam_channel::unbounded(),
             one_shot_completions: crossbeam_channel::unbounded(),
             pending_session_titles: HashMap::new(),
+            deferred_session_titles: HashMap::new(),
             expected_session_title_names: HashMap::new(),
             title_eligible: HashSet::new(),
             title_attempted: HashSet::new(),
@@ -3204,6 +3251,10 @@ mod tests {
         assert_eq!(names.len(), 1);
         assert_eq!(names[0]["name"], "给这个会话命名");
         assert!(!names[0].to_string().contains("secret-image"));
+        let deferred = app.deferred_session_titles.values().next().unwrap();
+        assert_eq!(app.deferred_session_titles.len(), 1);
+        assert_eq!(deferred.content, "  给这个会话命名  ");
+        assert!(!deferred.content.contains("secret-image"));
     }
 
     #[test]
@@ -3314,8 +3365,17 @@ mod tests {
                 baseline: "Initial".into(),
             },
         );
+        app.deferred_session_titles.insert(
+            token,
+            DeferredSessionTitle {
+                content: "private prompt".into(),
+                fallback: "fallback".into(),
+                baseline: "Initial".into(),
+            },
+        );
 
         app.rename_session(key, "Manual".into());
+        assert!(!app.deferred_session_titles.contains_key(&token));
         app.settle_one_shot_completions(vec![OneShotCompletion {
             request_id,
             generation: 9,
