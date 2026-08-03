@@ -25,8 +25,10 @@ the application and no hooks from that manifest run.
 }
 ```
 
-Hook IDs must be unique, command entrypoints must be absolute files, and timeouts must
-be between 1 and 30000 ms. Hooks run in manifest order.
+Hook IDs must be unique stable identifiers containing only ASCII letters, digits, `.`,
+`_`, and `-`. Command entrypoints must be absolute files, and timeouts must be between
+1 and 30000 ms. Unknown fields are rejected at every Manifest level so a misspelled
+security matcher cannot silently broaden a Hook. Hooks run in Manifest order.
 
 Compile-time Rust hooks run before command hooks and cannot be disabled by a Manifest.
 The initial `builtin.safety_floor` rejects malformed spawn and message events before
@@ -66,7 +68,8 @@ never be blocked by a Hook.
 
 Gate events fail closed on launch, timeout, oversized output, or invalid JSON. Transform
 failures preserve the prior arguments. Observe events are best effort. Hook output is
-limited to 64 KiB.
+limited to 64 KiB. Gate `decision` values must be `allow` or `deny`; malformed values and
+invalid UTF-8 are failures rather than implicit approval.
 
 Each invocation writes bounded audit metadata to SQLite: hook ID, event, outcome,
 duration, output-truncation flag, configuration revision, and timestamp. Arguments,

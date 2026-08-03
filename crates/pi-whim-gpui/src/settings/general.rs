@@ -141,7 +141,7 @@ fn project_hook_rows(state: &AppState, tokens: Tokens, emit: Emit) -> Vec<AnyEle
             entry.event, entry.outcome, entry.duration_ms
         );
         form::row(
-            &entry.hook_id,
+            compact_display(&entry.hook_id, 28),
             Some(&details),
             tokens,
             div().into_any_element(),
@@ -154,7 +154,10 @@ fn project_hooks_row(state: &AppState, tokens: Tokens, emit: Emit) -> AnyElement
     let (status, action) = match &state.project_hook_status {
         ProjectHookStatus::NotPresent => (tr(state, "project-hooks-none").to_owned(), None),
         ProjectHookStatus::Invalid(error) => (
-            format!("{}: {error}", tr(state, "project-hooks-invalid")),
+            compact_display(
+                &format!("{}: {error}", tr(state, "project-hooks-invalid")),
+                36,
+            ),
             None,
         ),
         ProjectHookStatus::ApprovalRequired {
@@ -211,6 +214,16 @@ fn project_hooks_row(state: &AppState, tokens: Tokens, emit: Emit) -> AnyElement
         tokens,
         action.unwrap_or_else(|| div().into_any_element()),
     )
+}
+
+fn compact_display(value: &str, maximum_chars: usize) -> String {
+    let mut characters = value.chars();
+    let prefix = characters.by_ref().take(maximum_chars).collect::<String>();
+    if characters.next().is_some() {
+        format!("{prefix}...")
+    } else {
+        prefix
+    }
 }
 
 /// Keep destructive launch settings as a draft until the reader applies them.
@@ -435,5 +448,12 @@ mod tests {
             parse_blocked_patterns("rm  -rf  /"),
             vec!["rm  -rf  /".to_owned()]
         );
+    }
+
+    #[test]
+    fn hook_labels_are_bounded_without_splitting_unicode() {
+        assert_eq!(compact_display("short-hook", 28), "short-hook");
+        assert_eq!(compact_display("abcdef", 3), "abc...");
+        assert_eq!(compact_display("项目策略钩子", 4), "项目策略...");
     }
 }

@@ -537,10 +537,12 @@ fn invoke(
         let (sender, receiver) = mpsc::sync_channel(1);
         thread::spawn(move || {
             let mut output = String::new();
-            let _ = BufReader::new(stdout)
+            let result = BufReader::new(stdout)
                 .take((MAX_HOOK_OUTPUT + 1) as u64)
-                .read_to_string(&mut output);
-            let _ = sender.send(output);
+                .read_to_string(&mut output)
+                .map(|_| output)
+                .map_err(|error| format!("failed to read hook stdout: {error}"));
+            let _ = sender.send(result);
         });
         let timeout = Duration::from_millis(
             hook.timeout_ms
@@ -548,7 +550,7 @@ fn invoke(
         );
         receiver
             .recv_timeout(timeout)
-            .map_err(|_| "timed out".to_owned())
+            .map_err(|_| "timed out".to_owned())?
     })();
     let mut status = None;
     if result.is_ok() {
@@ -583,10 +585,37 @@ fn invoke(
     if !status.success() {
         return Err(format!("hook exited with status {status}"));
     }
-    if line.trim().is_empty() {
-        return Ok(Value::Null);
+    let response = if line.trim().is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_str(&line).map_err(|error| format!("invalid JSON response: {error}"))?
+    };
+    if matches!(hook.kind, HookKind::Gate) {
+        validate_gate_response(&response)?;
     }
-    serde_json::from_str(&line).map_err(|error| format!("invalid JSON response: {error}"))
+    Ok(response)
+}
+
+fn validate_gate_response(response: &Value) -> Result<(), String> {
+    if response.is_null() {
+        return Ok(());
+    }
+    let object = response
+        .as_object()
+        .ok_or_else(|| "gate hook response must be a JSON object".to_owned())?;
+    if let Some(decision) = object.get("decision") {
+        match decision.as_str() {
+            Some("allow" | "deny") => {}
+            _ => return Err("gate hook decision must be 'allow' or 'deny'".into()),
+        }
+    }
+    if object
+        .get("message")
+        .is_some_and(|message| !message.is_string())
+    {
+        return Err("gate hook message must be a string".into());
+    }
+    Ok(())
 }
 
 fn sandbox_profile(project_root: &Path, temporary_directory: &Path, program: &Path) -> String {
@@ -769,6 +798,74 @@ mod tests {
             .unwrap_err()
             .contains("exited with status")
         );
+    }
+
+    #[test]
+    fn invalid_utf8_stdout_is_a_hook_failure() {
+        if !Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+        let hook = HookDefinition {
+            id: "invalid-utf8".into(),
+            event: HookEvent::ToolDispatching,
+            kind: HookKind::Gate,
+            command: vec!["/usr/bin/printf".into(), "\\377".into()],
+            timeout_ms: Some(1_000),
+            matcher: HookMatcher::default(),
+            entrypoint_fingerprint: None,
+        };
+        assert!(
+            invoke(
+                &hook,
+                HookEvent::ToolDispatching,
+                &json!({"arguments":{}}),
+                Path::new("/tmp")
+            )
+            .unwrap_err()
+            .starts_with("failed to read hook stdout")
+        );
+    }
+
+    #[test]
+    fn gate_responses_reject_ambiguous_decisions() {
+        assert!(validate_gate_response(&Value::Null).is_ok());
+        assert!(validate_gate_response(&json!({})).is_ok());
+        assert!(validate_gate_response(&json!({"decision":"allow"})).is_ok());
+        assert!(validate_gate_response(&json!({"decision":"deny"})).is_ok());
+        assert!(validate_gate_response(&json!({"decision":"unknown"})).is_err());
+        assert!(validate_gate_response(&json!([])).is_err());
+        assert!(validate_gate_response(&json!({"message": 42})).is_err());
+    }
+
+    #[test]
+    fn malformed_gate_decisions_fail_closed() {
+        if !Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+        let dispatcher = HookDispatcher::new(
+            HookConfig {
+                version: 1,
+                revision: "sha256:test".into(),
+                hooks: vec![HookDefinition {
+                    id: "ambiguous".into(),
+                    event: HookEvent::ToolDispatching,
+                    kind: HookKind::Gate,
+                    command: vec!["/bin/echo".into(), r#"{"decision":"maybe"}"#.into()],
+                    timeout_ms: Some(1_000),
+                    matcher: HookMatcher::default(),
+                    entrypoint_fingerprint: None,
+                }],
+            },
+            PathBuf::from("/tmp"),
+            mpsc::sync_channel(16).0,
+        );
+        assert!(matches!(
+            dispatcher.gate(
+                HookEvent::ToolDispatching,
+                json!({"tool":"bash", "arguments":{}})
+            ),
+            HookDecision::Deny(message) if message.contains("decision must be")
+        ));
     }
 
     #[test]

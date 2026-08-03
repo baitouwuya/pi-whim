@@ -277,6 +277,7 @@ pub struct AgentTeamConfig {
 /// The executable is deliberately kept outside agent permission policy: hooks run
 /// in a host-controlled sandbox and never inherit an agent capability or API key.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HookConfig {
     #[serde(default = "hook_manifest_version")]
     pub version: u32,
@@ -334,6 +335,16 @@ impl HookConfig {
             }
             if hook.id.len() > 128 {
                 return Err(format!("hook {} id exceeds 128 bytes", hook.id));
+            }
+            if !hook
+                .id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            {
+                return Err(format!(
+                    "hook {} id may contain only ASCII letters, digits, '.', '_' and '-'",
+                    hook.id
+                ));
             }
             if !ids.insert(hook.id.as_str()) {
                 return Err(format!("duplicate hook id {}", hook.id));
@@ -408,6 +419,7 @@ const fn hook_manifest_version() -> u32 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HookDefinition {
     pub id: String,
     pub event: HookEvent,
@@ -478,6 +490,7 @@ pub struct HookAuditSummary {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HookMatcher {
     #[serde(default)]
     pub tools: Vec<String>,
@@ -1255,6 +1268,38 @@ mod tests {
         oversized.command.push("x".repeat(4 * 1024 + 1));
         config.hooks = vec![oversized];
         assert!(config.validate().is_err());
+
+        config.hooks = vec![valid_hook(
+            "unsafe id",
+            HookEvent::ToolDispatching,
+            HookKind::Gate,
+        )];
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn hook_manifest_rejects_unknown_fields_in_every_layer() {
+        for manifest in [
+            serde_json::json!({"hooks": [], "unexpected": true}),
+            serde_json::json!({
+                "hooks": [{
+                    "id": "hook",
+                    "event": "tool_dispatching",
+                    "command": ["/usr/bin/true"],
+                    "timeot_ms": 1000
+                }]
+            }),
+            serde_json::json!({
+                "hooks": [{
+                    "id": "hook",
+                    "event": "tool_dispatching",
+                    "command": ["/usr/bin/true"],
+                    "matcher": {"tool": ["bash"]}
+                }]
+            }),
+        ] {
+            assert!(serde_json::from_value::<HookConfig>(manifest).is_err());
+        }
     }
 
     #[test]
