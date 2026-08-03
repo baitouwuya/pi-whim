@@ -36,7 +36,7 @@ use uuid::Uuid;
 use pi_whim_catalog::ModelCapabilityResolver;
 use pi_whim_engine::mailbox::Delivery;
 use pi_whim_engine::mailbox::SessionToken;
-use pi_whim_engine::pool::{SessionPool, SessionRuntime, is_draft};
+use pi_whim_engine::pool::{PendingPrompt, SessionPool, SessionRuntime, is_draft};
 use pi_whim_engine::protocol::queue_mode_name;
 use pi_whim_engine::providers::{
     configured_search_engine_api_keys, discover_models, normalize_base_url,
@@ -106,6 +106,7 @@ pub struct PiWhimApplication<R: AgentRuntime = PiRpcRuntime> {
     agent_directory_override: Option<PathBuf>,
     hook_config_root_override: Option<PathBuf>,
     hook_revisions: HashMap<ProjectId, String>,
+    pending_hook_inputs: HashMap<ProjectId, VecDeque<PendingPrompt>>,
     attachment_store: AttachmentStore,
     /// Messages bound for the user, oldest first.
     ///
@@ -246,6 +247,7 @@ impl Default for PiWhimApplication<PiRpcRuntime> {
             agent_directory_override: None,
             hook_config_root_override: None,
             hook_revisions: HashMap::new(),
+            pending_hook_inputs: HashMap::new(),
             attachment_store: AttachmentStore::open_default(),
             notices: notice::Outbox::new(),
             control_updates: crossbeam_channel::unbounded(),
@@ -2149,12 +2151,6 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             self.report_submission_unavailable();
             return;
         }
-        if matches!(self.state().session_status, SessionStatus::Ready)
-            && self.restart_for_changed_hooks()
-        {
-            self.submit_prompt(content, attachments, mode);
-            return;
-        }
         // Capture this before adding the optimistic user entry: failure to find
         // an active session must leave both transcript and draft untouched.
         let key = self
@@ -2162,6 +2158,30 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             .active_key()
             .expect("can_submit_prompt requires an active session")
             .to_owned();
+        let project_id = self
+            .sessions
+            .get(&key)
+            .expect("active session is present")
+            .project_id;
+        if self.hooks_changed() {
+            if matches!(self.state().session_status, SessionStatus::Ready) {
+                self.restart_selected_project();
+                if self.can_submit_prompt() {
+                    self.submit_prompt(content, attachments, mode);
+                } else {
+                    self.pending_hook_inputs
+                        .entry(project_id)
+                        .or_default()
+                        .push_back((content, attachments, mode));
+                }
+            } else {
+                self.pending_hook_inputs
+                    .entry(project_id)
+                    .or_default()
+                    .push_back((content, attachments, mode));
+            }
+            return;
+        }
         let first_plain_prompt = matches!(mode, SubmitMode::Prompt)
             && !content.trim().is_empty()
             && !self.state().conversation.iter().any(|message| {
@@ -2789,6 +2809,8 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     /// The reading of the event lives in `engine::events`; what stays here is
     /// only what needs this process's store, window, and Pi connection.
     fn apply_agent_event(&mut self, key: &str, event: Value) {
+        let settled = event.get("type").and_then(Value::as_str) == Some("agent_settled");
+        let ready = event.get("type").and_then(Value::as_str) == Some("agent_ready");
         let is_active = self.sessions.active_key() == Some(key);
         let now = now_ms();
         // The conversation is cloned because `translate` reads it while holding
@@ -2814,6 +2836,12 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         }
         for effect in outcome.effects {
             self.perform_effect(key, effect);
+        }
+        if settled {
+            self.restart_for_pending_hook_inputs(key);
+        }
+        if ready {
+            self.flush_pending_hook_inputs(key);
         }
     }
 
@@ -2916,7 +2944,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         }
     }
 
-    fn restart_for_changed_hooks(&mut self) -> bool {
+    fn hooks_changed(&mut self) -> bool {
         let Some(project) = self
             .state()
             .selected_project
@@ -2926,11 +2954,32 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         };
         let config = self.load_hooks(&project.path);
         let revision = config.revision;
-        if self.hook_revisions.get(&project.id) == Some(&revision) {
-            return false;
+        self.hook_revisions.get(&project.id) != Some(&revision)
+    }
+
+    fn restart_for_pending_hook_inputs(&mut self, key: &str) {
+        let Some(project_id) = self.sessions.get(key).map(|session| session.project_id) else {
+            return;
+        };
+        if self.pending_hook_inputs.contains_key(&project_id) {
+            self.restart_selected_project();
         }
-        self.restart_selected_project();
-        true
+    }
+
+    fn flush_pending_hook_inputs(&mut self, key: &str) {
+        let Some(project_id) = self.sessions.get(key).map(|session| session.project_id) else {
+            return;
+        };
+        let Some(mut pending) = self.pending_hook_inputs.remove(&project_id) else {
+            return;
+        };
+        if !self.can_submit_prompt() {
+            self.pending_hook_inputs.insert(project_id, pending);
+            return;
+        }
+        while let Some((content, attachments, mode)) = pending.pop_front() {
+            self.submit_prompt(content, attachments, mode);
+        }
     }
 
     /// Carry a decision back over whichever channel asked.
@@ -3092,6 +3141,7 @@ mod tests {
             agent_directory_override: Some(directory.path().join("agent")),
             hook_config_root_override: Some(directory.path().join("config")),
             hook_revisions: HashMap::new(),
+            pending_hook_inputs: HashMap::new(),
             attachment_store: AttachmentStore::open(directory.path().join("attachments")).unwrap(),
             notices: notice::Outbox::new(),
             control_updates: crossbeam_channel::unbounded(),
@@ -3151,6 +3201,49 @@ mod tests {
             app.state().project_hook_status,
             ProjectHookStatus::ApprovalRequired { .. }
         ));
+    }
+
+    #[test]
+    fn changed_hooks_wait_for_a_busy_turn_and_preserve_the_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = FakeRuntime::default();
+        let observer = runtime.clone();
+        let mut app = test_application(&directory, runtime);
+        start_test_session(&mut app, &directory);
+        let project_id = app.state().selected_project.unwrap();
+        app.apply(Action::SetSessionStatus(SessionStatus::Streaming));
+
+        let config_root = directory.path().join("config");
+        fs::create_dir_all(&config_root).unwrap();
+        fs::write(
+            config_root.join("hooks.json"),
+            br#"{"version":1,"hooks":[{"id":"gate","event":"tool_dispatching","command":["/bin/true"]}]}"#,
+        )
+        .unwrap();
+        app.submit_prompt("held input".into(), Vec::new(), SubmitMode::Prompt);
+        assert_eq!(
+            app.pending_hook_inputs.get(&project_id).map(VecDeque::len),
+            Some(1)
+        );
+        assert_eq!(observer.starts().len(), 1);
+
+        let old_key = app.sessions.active_key().unwrap().to_owned();
+        app.apply_agent_event(&old_key, json!({"type":"agent_settled"}));
+        assert_eq!(observer.starts().len(), 2);
+        assert_eq!(
+            app.pending_hook_inputs.get(&project_id).map(VecDeque::len),
+            Some(1)
+        );
+
+        let new_key = app.sessions.active_key().unwrap().to_owned();
+        app.apply_agent_event(&new_key, json!({"type":"agent_ready"}));
+        assert!(!app.pending_hook_inputs.contains_key(&project_id));
+        assert!(
+            app.state()
+                .conversation
+                .iter()
+                .any(|item| item.full_text == "held input")
+        );
     }
 
     fn project(name: &str, path: &Path) -> Project {
