@@ -29,7 +29,8 @@ be between 1 and 30000 ms. Hooks run in manifest order.
 
 A project may add `.pi-whim/hooks.json`. Project hooks remain disabled until the user
 approves the displayed SHA-256 fingerprint under Settings > Execution > Project hooks.
-Changing any byte of the Manifest invalidates approval. Global hooks run first, followed
+The fingerprint covers the Manifest plus every command entrypoint path and file content;
+changing any of them invalidates approval. Global hooks run first, followed
 by approved project hooks, in their respective Manifest order. Duplicate IDs across the
 merged configuration invalidate the merged set.
 

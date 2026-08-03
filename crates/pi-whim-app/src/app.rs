@@ -26,8 +26,8 @@ use pi_whim_one_shot_ai::{
 use pi_whim_persistence::{
     AppPreferences, AttachmentStore, HookAuditEntry, HookRepository, MacosKeychainStore,
     PreferencesRepository, ProjectRepository, ProviderRepository, SearchEngineRepository,
-    SecretStore, SessionRepository, SqliteStore, hook_manifest_fingerprint,
-    persist_session_title_to_jsonl, session_summary_from_jsonl,
+    SecretStore, SessionRepository, SqliteStore, hook_configuration_fingerprint,
+    hook_manifest_fingerprint, persist_session_title_to_jsonl, session_summary_from_jsonl,
 };
 use pi_whim_runtime::{AgentRuntime, PiRpcRuntime, RuntimeEvent, RuntimeStart};
 use serde_json::{Value, json};
@@ -522,8 +522,15 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             return;
         };
         let path = Path::new(&project.path).join(".pi-whim/hooks.json");
-        let fingerprint = match fs::read(&path) {
-            Ok(source) => hook_manifest_fingerprint(&source),
+        let fingerprint = match fs::read(&path).and_then(|source| {
+            let config = serde_json::from_slice::<HookConfig>(&source)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            config
+                .validate()
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            hook_configuration_fingerprint(&source, &config)
+        }) {
+            Ok(fingerprint) => fingerprint,
             Err(error) => {
                 self.notices.error(error.to_string());
                 return;
@@ -1375,7 +1382,6 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 return config;
             }
         };
-        let fingerprint = hook_manifest_fingerprint(&source);
         let project_config = match serde_json::from_slice::<HookConfig>(&source)
             .map_err(|error| error.to_string())
             .and_then(|config| config.validate().map(|()| config))
@@ -1389,6 +1395,17 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                     "invalid project hook manifest {}: {error}",
                     path.display()
                 ));
+                return config;
+            }
+        };
+        let fingerprint = match hook_configuration_fingerprint(&source, &project_config) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                let message = format!("failed to fingerprint project hooks: {error}");
+                self.apply(Action::SetProjectHookStatus(ProjectHookStatus::Invalid(
+                    message.clone(),
+                )));
+                self.notices.error(message);
                 return config;
             }
         };
@@ -3096,8 +3113,17 @@ mod tests {
         let project_path = directory.path().join("project");
         fs::create_dir_all(project_path.join(".pi-whim")).unwrap();
         let manifest_path = project_path.join(".pi-whim/hooks.json");
-        let manifest = br#"{"version":1,"hooks":[{"id":"policy","event":"tool_dispatching","command":["/bin/true"]}]}"#;
-        fs::write(&manifest_path, manifest).unwrap();
+        let entrypoint = project_path.join("policy-hook");
+        fs::write(&entrypoint, "#!/bin/sh\nexit 0\n").unwrap();
+        let manifest = json!({
+            "version": 1,
+            "hooks": [{
+                "id": "policy",
+                "event": "tool_dispatching",
+                "command": [entrypoint]
+            }]
+        });
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
         let mut app = test_application(&directory, FakeRuntime::default());
         let project = project("hooks", &project_path);
         app.apply(Action::ProjectsLoaded(vec![project.clone()]));
@@ -3119,7 +3145,7 @@ mod tests {
             ProjectHookStatus::Approved { .. }
         ));
 
-        fs::write(&manifest_path, br#"{"version":1,"hooks":[]}"#).unwrap();
+        fs::write(project_path.join("policy-hook"), "#!/bin/sh\nexit 1\n").unwrap();
         assert!(app.load_hooks(&project.path).hooks.is_empty());
         assert!(matches!(
             app.state().project_hook_status,

@@ -16,10 +16,10 @@ use std::{
 
 use keyring::Entry;
 use pi_whim_core::{
-    AgentTeamConfig, BashPolicy, Language, OneShotAiConfig, Project, ProjectId, ProviderId,
-    ProviderModel, ProviderProfile, ProviderProtocol, SearchEngineKind, SearchEngineProfile,
-    SessionId, SessionSummary, normalize_bash_patterns, normalize_provider_display_name,
-    provider_name_key,
+    AgentTeamConfig, BashPolicy, HookConfig, Language, OneShotAiConfig, Project, ProjectId,
+    ProviderId, ProviderModel, ProviderProfile, ProviderProtocol, SearchEngineKind,
+    SearchEngineProfile, SessionId, SessionSummary, normalize_bash_patterns,
+    normalize_provider_display_name, provider_name_key,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
@@ -139,6 +139,31 @@ pub fn hook_manifest_fingerprint(source: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+pub fn hook_configuration_fingerprint(
+    manifest_source: &[u8],
+    config: &HookConfig,
+) -> Result<String, io::Error> {
+    let mut digest = Sha256::new();
+    digest.update((manifest_source.len() as u64).to_le_bytes());
+    digest.update(manifest_source);
+    for hook in &config.hooks {
+        let Some(program) = hook.command.first() else {
+            continue;
+        };
+        let path = Path::new(program);
+        let content = std::fs::read(path)?;
+        digest.update((program.len() as u64).to_le_bytes());
+        digest.update(program.as_bytes());
+        digest.update((content.len() as u64).to_le_bytes());
+        digest.update(content);
+    }
+    Ok(digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 pub struct SqliteStore {
