@@ -6,6 +6,7 @@ mod catalog;
 mod fetch;
 mod file_compression;
 mod file_dispatch;
+mod hooks;
 mod image_compression;
 mod model;
 mod process;
@@ -37,8 +38,8 @@ use model::{
     SessionSnapshot, SpawnAgentArguments, TargetArguments, TeamState, WaitAgentArguments,
 };
 use pi_whim_core::{
-    AgentModelSelection, AgentPermissionLevel, AgentPermissionPolicy, AgentTeamConfig,
-    SearchEngineId, SearchEngineProfile, normalize_agent_policy, stable_session_id,
+    AgentModelSelection, AgentPermissionLevel, AgentPermissionPolicy, AgentTeamConfig, HookConfig,
+    HookEvent, SearchEngineId, SearchEngineProfile, normalize_agent_policy, stable_session_id,
 };
 use pi_whim_tool_protocol::{
     ASK_USER_TOOL, BASH_TOOL, EDIT_FILE_TOOL, FETCH_TOOL, INTERRUPT_AGENT_TOOL, LIST_AGENTS_TOOL,
@@ -145,6 +146,7 @@ pub struct AgentLaunchConfig {
     pub team_config: AgentTeamConfig,
     pub search_engines: Vec<SearchEngineProfile>,
     pub search_engine_api_keys: SearchEngineApiKeys,
+    pub hooks: HookConfig,
 }
 
 #[derive(Debug, Error)]
@@ -171,6 +173,7 @@ pub(crate) struct HostContext {
     files: Arc<file_dispatch::FileCoordinator>,
     interactions: Arc<Mutex<HashMap<Uuid, PendingInteraction>>>,
     interaction_sender: std::sync::mpsc::Sender<Value>,
+    hooks: Arc<hooks::HookDispatcher>,
 }
 
 pub struct AgentSupervisor {
@@ -243,6 +246,10 @@ impl AgentSupervisor {
         }
         let files = file_dispatch::FileCoordinator::for_project(launch.project_path.clone());
         let (interaction_sender, interaction_receiver) = std::sync::mpsc::channel();
+        let hooks = Arc::new(hooks::HookDispatcher::new(
+            launch.hooks.clone(),
+            launch.project_path.clone(),
+        ));
         let host = HostContext {
             shared,
             team_config: Arc::new(RwLock::new(launch.team_config.clone())),
@@ -251,6 +258,7 @@ impl AgentSupervisor {
             files,
             interactions: Arc::new(Mutex::new(HashMap::new())),
             interaction_sender,
+            hooks,
         };
         let stopping = Arc::new(AtomicBool::new(false));
         let server_thread = Some(start_server(listener, host.clone(), stopping.clone()));
@@ -433,7 +441,7 @@ fn dispatch_request(host: &HostContext, request: ToolRequest) -> ToolResponse {
 
 fn dispatch_request_cancellable(
     host: &HostContext,
-    request: ToolRequest,
+    mut request: ToolRequest,
     cancelled: Option<&AtomicBool>,
 ) -> ToolResponse {
     if request.version != PROTOCOL_VERSION {
@@ -474,6 +482,45 @@ fn dispatch_request_cancellable(
             error.details,
         );
     }
+    if !spec.internal {
+        let agent_level = {
+            let (lock, _) = &*host.shared;
+            lock.lock()
+                .ok()
+                .and_then(|state| {
+                    state
+                        .actors
+                        .get(&actor_id)
+                        .map(|actor| actor.descriptor.level)
+                })
+                .unwrap_or(0)
+        };
+        let event = match spec.name {
+            SPAWN_AGENT_TOOL => Some(HookEvent::AgentSpawning),
+            SEND_MESSAGE_TOOL => Some(HookEvent::MessageSending),
+            _ => Some(HookEvent::ToolDispatching),
+        };
+        if let Some(event) = event {
+            match host.hooks.gate(
+                event,
+                json!({
+                    "tool": spec.name,
+                    "agent_id": actor_id,
+                    "agent_level": agent_level,
+                    "arguments": request.arguments,
+                }),
+            ) {
+                hooks::HookDecision::Continue(payload) => {
+                    if let Some(arguments) = payload.get("arguments") {
+                        request.arguments = arguments.clone();
+                    }
+                }
+                hooks::HookDecision::Deny(message) => {
+                    return ToolResponse::error(request.request_id, "hook_denied", message);
+                }
+            }
+        }
+    }
     if matches!(spec.permission, ToolPermission::NeedsApproval)
         && let Err(error) = ensure_tool_enabled(host, actor_id, spec.name)
     {
@@ -485,7 +532,17 @@ fn dispatch_request_cancellable(
         );
     }
     match (spec.handler)(host, actor_id, &request, cancelled) {
-        Ok(content) => ToolResponse::success(request.request_id, content),
+        Ok(content) => {
+            host.hooks.observe(
+                HookEvent::ToolCompleted,
+                json!({
+                    "tool": spec.name,
+                    "agent_id": actor_id,
+                    "success": true,
+                }),
+            );
+            ToolResponse::success(request.request_id, content)
+        }
         Err(error) => ToolResponse::error_with_details(
             request.request_id,
             error.code,
@@ -1204,6 +1261,10 @@ fn spawn_agent(host: &HostContext, parent_id: AgentId, value: &Value) -> HostRes
         condition.notify_all();
         return Err(HostError::new("spawn_failed", error));
     }
+    host.hooks.observe(
+        HookEvent::AgentStarted,
+        json!({"agent_id": agent_id, "agent_level": level}),
+    );
     Ok(json!({
         "agent_id": agent_id,
         "session_id": agent_id,
@@ -1603,6 +1664,19 @@ fn resolve_interaction_for_owner(
     decision: &str,
     from_l0_user: bool,
 ) -> HostResult {
+    let decision = decision.trim();
+    if matches!(
+        host.hooks.gate(
+            HookEvent::PermissionResolving,
+            json!({"request_id": request_id, "owner_id": owner_id, "decision": decision}),
+        ),
+        hooks::HookDecision::Deny(_)
+    ) {
+        return Err(HostError::new(
+            "hook_denied",
+            "permission resolution was denied by a hook",
+        ));
+    }
     let mut interactions = host
         .interactions
         .lock()
@@ -1622,7 +1696,6 @@ fn resolve_interaction_for_owner(
             "interaction was already resolved",
         ));
     }
-    let decision = decision.trim();
     if decision == "escalate" {
         if from_l0_user {
             return Err(HostError::new(
@@ -1702,6 +1775,10 @@ fn resolve_interaction_for_owner(
             "interaction_resolved"
         },
         &format!("Interaction {id} resolved: {decision}"),
+    );
+    host.hooks.observe(
+        HookEvent::InteractionResolved,
+        json!({"request_id": id, "requester_id": requester, "decision": decision}),
     );
     Ok(json!({
         "request_id": id,
@@ -1901,6 +1978,10 @@ fn create_interaction(
         requester_id,
         "interaction_created",
         &format!("Interaction {} created", request.id),
+    );
+    host.hooks.observe(
+        HookEvent::InteractionCreated,
+        json!({"request_id": request.id, "requester_id": requester_id, "owner_id": owner_id}),
     );
     Ok(request)
 }
@@ -2193,12 +2274,18 @@ fn send_message(host: &HostContext, sender_id: AgentId, value: &Value) -> HostRe
         kinds.push(kind);
     }
     condition.notify_all();
-    Ok(json!({
+    let response = json!({
         "delivered": true,
         "targets": delivered,
         "kind": kinds.first().copied(),
         "count": kinds.len()
-    }))
+    });
+    drop(state);
+    host.hooks.observe(
+        HookEvent::MessageDelivered,
+        json!({"sender_id": sender_id, "count": kinds.len()}),
+    );
+    Ok(response)
 }
 
 fn queue_historical_root_message(
@@ -2995,10 +3082,12 @@ fn reset_team(host: &HostContext, actor_id: AgentId, value: &Value) -> HostResul
         .actors
         .get(&root_id)
         .ok_or_else(|| HostError::new("internal", "root agent is unavailable"))?;
-    Ok(json!({
+    let response = json!({
         "team_id": root.descriptor.team_id,
         "session_id": root.descriptor.session_id
-    }))
+    });
+    host.hooks.observe(HookEvent::TeamReset, response.clone());
+    Ok(response)
 }
 
 fn has_message_from(state: &TeamState, recipient_id: AgentId, sender_id: AgentId) -> bool {
@@ -3311,6 +3400,7 @@ mod tests {
             team_config: config,
             search_engines: Vec::new(),
             search_engine_api_keys: SearchEngineApiKeys::default(),
+            hooks: HookConfig::default(),
         })
         .unwrap();
         let capability = supervisor.root_capability.clone();

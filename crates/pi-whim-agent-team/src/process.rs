@@ -11,7 +11,8 @@ use crate::{
     capture::{MAX_CAPTURE_BYTES, RunCapture, truncate_utf8},
     model::{AgentId, AgentStatus, ProcessCommand, SpawnAgentArguments},
 };
-use pi_whim_core::{AgentModelSelection, AgentPermissionPolicy};
+use pi_whim_core::{AgentModelSelection, AgentPermissionPolicy, HookEvent};
+use serde_json::json;
 
 const MAX_JSONL_RECORD_BYTES: usize = 1024 * 1024;
 
@@ -134,6 +135,7 @@ pub fn launch_child(
 
     let shared = host.shared.clone();
     let interactions = host.interactions.clone();
+    let hooks = host.hooks.clone();
     let temporary_directory = environment.temporary_directory;
     thread::spawn(move || {
         let mut interrupted = false;
@@ -174,19 +176,24 @@ pub fn launch_child(
             .lock()
             .map(|capture| capture.entries.iter().cloned().collect())
             .unwrap_or_default();
+        let exit_code = exit_status
+            .as_ref()
+            .and_then(std::process::ExitStatus::code);
         finish_agent(
             &shared,
             &interactions,
             agent_id,
             AgentFinish {
                 interrupted,
-                exit_code: exit_status
-                    .as_ref()
-                    .and_then(std::process::ExitStatus::code),
+                exit_code,
                 output,
                 error,
                 transcript_entries,
             },
+        );
+        hooks.observe(
+            HookEvent::AgentFinished,
+            json!({"agent_id": agent_id, "interrupted": interrupted, "exit_code": exit_code}),
         );
         let _ = std::fs::remove_dir_all(temporary_directory);
     });

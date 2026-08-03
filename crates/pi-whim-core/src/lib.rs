@@ -272,6 +272,105 @@ pub struct AgentTeamConfig {
     pub presets: Vec<AgentPermissionPreset>,
 }
 
+/// Declarative hook configuration loaded from the user or project hook manifest.
+///
+/// The executable is deliberately kept outside agent permission policy: hooks run
+/// in a host-controlled sandbox and never inherit an agent capability or API key.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookConfig {
+    #[serde(default = "hook_manifest_version")]
+    pub version: u32,
+    #[serde(default)]
+    pub hooks: Vec<HookDefinition>,
+}
+
+impl Default for HookConfig {
+    fn default() -> Self {
+        Self {
+            version: hook_manifest_version(),
+            hooks: Vec::new(),
+        }
+    }
+}
+
+impl HookConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.version != hook_manifest_version() {
+            return Err(format!(
+                "unsupported hook manifest version {}",
+                self.version
+            ));
+        }
+        let mut ids = std::collections::HashSet::new();
+        for hook in &self.hooks {
+            if hook.id.trim().is_empty() {
+                return Err("hook id cannot be empty".into());
+            }
+            if !ids.insert(hook.id.as_str()) {
+                return Err(format!("duplicate hook id {}", hook.id));
+            }
+            let Some(program) = hook.command.first() else {
+                return Err(format!("hook {} command cannot be empty", hook.id));
+            };
+            if !std::path::Path::new(program).is_absolute() {
+                return Err(format!(
+                    "hook {} command must use an absolute path",
+                    hook.id
+                ));
+            }
+            if hook
+                .timeout_ms
+                .is_some_and(|timeout| !(1..=30_000).contains(&timeout))
+            {
+                return Err(format!(
+                    "hook {} timeout must be between 1 and 30000 ms",
+                    hook.id
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+const fn hook_manifest_version() -> u32 {
+    1
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookDefinition {
+    pub id: String,
+    pub event: HookEvent,
+    pub command: Vec<String>,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub matcher: HookMatcher,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookEvent {
+    ToolDispatching,
+    AgentSpawning,
+    MessageSending,
+    PermissionResolving,
+    ToolCompleted,
+    AgentStarted,
+    AgentFinished,
+    MessageDelivered,
+    InteractionCreated,
+    InteractionResolved,
+    TeamReset,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookMatcher {
+    #[serde(default)]
+    pub tools: Vec<String>,
+    #[serde(default)]
+    pub agent_levels: Vec<u8>,
+}
+
 impl Default for AgentTeamConfig {
     fn default() -> Self {
         Self {

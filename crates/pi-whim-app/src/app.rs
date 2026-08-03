@@ -13,10 +13,11 @@ use std::{
 
 use pi_whim_core::{
     Action, AgentPermissionLevel, AppState, Attachment, ConversationItem, ConversationRole,
-    Language, ModelOption, Project, ProjectId, ProviderId, ProviderProfile, ProviderProtocol,
-    QueueMode, SESSION_TITLE_TASK_KIND, SearchEngineId, SearchEngineProfile, SessionMetrics,
-    SessionStatus, SessionSummary, SubmitMode, ThinkingLevel, normalize_bash_patterns,
-    normalize_provider_display_name, provider_name_key, stable_session_id, strings,
+    HookConfig, Language, ModelOption, Project, ProjectId, ProviderId, ProviderProfile,
+    ProviderProtocol, QueueMode, SESSION_TITLE_TASK_KIND, SearchEngineId, SearchEngineProfile,
+    SessionMetrics, SessionStatus, SessionSummary, SubmitMode, ThinkingLevel,
+    normalize_bash_patterns, normalize_provider_display_name, provider_name_key, stable_session_id,
+    strings,
 };
 use pi_whim_one_shot_ai::{
     OneShotAiService, OneShotCompletion, OneShotErrorKind, OneShotRequestId,
@@ -1263,6 +1264,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             agent_team_config: self.state().agent_team_config.clone(),
             search_engines: self.state().search_engine_profiles.clone(),
             search_engine_api_keys,
+            hooks: self.load_global_hooks(),
         }) {
             if self.sessions.active_key().is_none() {
                 self.apply(Action::SetSessionStatus(SessionStatus::Failed(
@@ -1291,6 +1293,40 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         );
         self.discover_sessions(project_id, &sessions_path);
         Some(key)
+    }
+
+    /// Global manifests are user-owned; project manifests are deliberately not
+    /// loaded until their fingerprint has been approved and persisted.
+    fn load_global_hooks(&mut self) -> HookConfig {
+        let Some(root) = dirs::data_dir().map(|path| path.join("pi-whim")) else {
+            return HookConfig::default();
+        };
+        let path = root.join("hooks.json");
+        match fs::read_to_string(&path) {
+            Ok(source) => match serde_json::from_str::<HookConfig>(&source) {
+                Ok(config) => match config.validate() {
+                    Ok(()) => config,
+                    Err(error) => {
+                        self.notices
+                            .error(format!("invalid hook manifest {}: {error}", path.display()));
+                        HookConfig::default()
+                    }
+                },
+                Err(error) => {
+                    self.notices
+                        .error(format!("invalid hook manifest {}: {error}", path.display()));
+                    HookConfig::default()
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => HookConfig::default(),
+            Err(error) => {
+                self.notices.error(format!(
+                    "failed to read hook manifest {}: {error}",
+                    path.display()
+                ));
+                HookConfig::default()
+            }
+        }
     }
 
     /// Bring a pooled session to the foreground: the conversation view binds to
