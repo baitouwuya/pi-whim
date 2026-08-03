@@ -22,6 +22,7 @@ use sha2::{Digest, Sha256};
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_HOOK_OUTPUT: usize = 64 * 1024;
 const OBSERVE_QUEUE_CAPACITY: usize = 64;
+const FINALIZE_BUDGET: Duration = Duration::from_secs(5);
 
 struct ObserveTask {
     hook: HookDefinition,
@@ -83,7 +84,7 @@ pub(crate) struct HookDispatcher {
     rust_hooks: Vec<Arc<dyn RustHook>>,
     hooks: Vec<HookDefinition>,
     project_root: PathBuf,
-    audit_sender: mpsc::Sender<HookAuditRecord>,
+    audit_sender: mpsc::SyncSender<HookAuditRecord>,
     revision: String,
     observe_sender: mpsc::SyncSender<ObserveTask>,
     observe_stopping: Arc<AtomicBool>,
@@ -111,7 +112,7 @@ impl HookDispatcher {
     pub(crate) fn new(
         config: HookConfig,
         project_root: PathBuf,
-        audit_sender: mpsc::Sender<HookAuditRecord>,
+        audit_sender: mpsc::SyncSender<HookAuditRecord>,
     ) -> Self {
         let (observe_sender, observe_receiver) =
             mpsc::sync_channel::<ObserveTask>(OBSERVE_QUEUE_CAPACITY);
@@ -151,7 +152,7 @@ impl HookDispatcher {
         for hook in &self.rust_hooks {
             let started = std::time::Instant::now();
             let result = hook.gate(event, &payload);
-            let _ = self.audit_sender.send(HookAuditRecord {
+            let _ = self.audit_sender.try_send(HookAuditRecord {
                 hook_id: hook.id().into(),
                 event,
                 outcome: if result.is_ok() {
@@ -200,15 +201,34 @@ impl HookDispatcher {
                     );
                 }
                 (HookKind::Transform, Ok(result)) => {
-                    self.audit(
-                        hook,
-                        event,
-                        HookAuditOutcome::Succeeded,
-                        started.elapsed(),
-                        false,
-                    );
                     if let Some(arguments) = result.get("arguments") {
-                        payload["arguments"] = arguments.clone();
+                        match validate_transform(event, &payload["arguments"], arguments) {
+                            Ok(()) => {
+                                payload["arguments"] = arguments.clone();
+                                self.audit(
+                                    hook,
+                                    event,
+                                    HookAuditOutcome::Succeeded,
+                                    started.elapsed(),
+                                    false,
+                                );
+                            }
+                            Err(_) => self.audit(
+                                hook,
+                                event,
+                                HookAuditOutcome::Failed,
+                                started.elapsed(),
+                                false,
+                            ),
+                        }
+                    } else {
+                        self.audit(
+                            hook,
+                            event,
+                            HookAuditOutcome::Succeeded,
+                            started.elapsed(),
+                            false,
+                        );
                     }
                 }
                 (HookKind::Gate, Err(error)) => {
@@ -275,8 +295,26 @@ impl HookDispatcher {
             .filter(|hook| matches!(hook.kind, HookKind::Observe))
             .cloned()
             .collect::<Vec<_>>();
+        let finalize_started = std::time::Instant::now();
         for hook in &hooks {
-            self.observe_once(hook, event, &payload, &self.project_root);
+            let Some(remaining) = FINALIZE_BUDGET.checked_sub(finalize_started.elapsed()) else {
+                self.audit(
+                    hook,
+                    event,
+                    HookAuditOutcome::TimedOut,
+                    Duration::ZERO,
+                    false,
+                );
+                continue;
+            };
+            let mut bounded_hook = hook.clone();
+            bounded_hook.timeout_ms = Some(
+                bounded_hook
+                    .timeout_ms
+                    .unwrap_or(DEFAULT_TIMEOUT.as_millis() as u64)
+                    .min(remaining.as_millis().max(1) as u64),
+            );
+            self.observe_once(&bounded_hook, event, &payload, &self.project_root);
         }
     }
 
@@ -305,7 +343,7 @@ impl HookDispatcher {
         duration: Duration,
         output_truncated: bool,
     ) {
-        let _ = self.audit_sender.send(HookAuditRecord {
+        let _ = self.audit_sender.try_send(HookAuditRecord {
             hook_id: hook.id.clone(),
             event,
             outcome,
@@ -334,8 +372,85 @@ impl HookDispatcher {
     }
 }
 
+fn validate_transform(event: HookEvent, original: &Value, transformed: &Value) -> Result<(), ()> {
+    let original = original.as_object().ok_or(())?;
+    let transformed = transformed.as_object().ok_or(())?;
+    match event {
+        HookEvent::ToolDispatching => Ok(()),
+        HookEvent::MessageSending => {
+            let mut original = original.clone();
+            let mut transformed = transformed.clone();
+            let message_valid = transformed_message_is_valid(transformed.get("message"));
+            original.remove("message");
+            transformed.remove("message");
+            (original == transformed && message_valid)
+                .then_some(())
+                .ok_or(())
+        }
+        HookEvent::AgentSpawning => validate_spawn_transform(original, transformed),
+        _ => Err(()),
+    }
+}
+
+fn transformed_message_is_valid(message: Option<&Value>) -> bool {
+    message.and_then(Value::as_str).is_some_and(|message| {
+        !message.trim().is_empty() && message.len() <= crate::MAX_MESSAGE_BYTES
+    })
+}
+
+fn validate_spawn_transform(
+    original: &serde_json::Map<String, Value>,
+    transformed: &serde_json::Map<String, Value>,
+) -> Result<(), ()> {
+    const PERMISSION_FIELDS: &[&str] = &["permission_level", "enabled_tools", "trusted_extensions"];
+    for key in original.keys().chain(transformed.keys()) {
+        if !PERMISSION_FIELDS.contains(&key.as_str()) && original.get(key) != transformed.get(key) {
+            return Err(());
+        }
+    }
+    if original.get("permission_level") != transformed.get("permission_level") {
+        let requested = transformed
+            .get("permission_level")
+            .and_then(Value::as_str)
+            .and_then(permission_rank)
+            .ok_or(())?;
+        let original = original
+            .get("permission_level")
+            .and_then(Value::as_str)
+            .and_then(permission_rank)
+            .unwrap_or(0);
+        if requested > original {
+            return Err(());
+        }
+    }
+    for field in ["enabled_tools", "trusted_extensions"] {
+        if original.get(field) == transformed.get(field) {
+            continue;
+        }
+        let original = string_set(original.get(field)).ok_or(())?;
+        let transformed = string_set(transformed.get(field)).ok_or(())?;
+        if transformed.is_empty() || !transformed.is_subset(&original) {
+            return Err(());
+        }
+    }
+    Ok(())
+}
+
+fn permission_rank(value: &str) -> Option<u8> {
+    match value {
+        "read_only" => Some(1),
+        "controlled" => Some(2),
+        "full" => Some(3),
+        _ => None,
+    }
+}
+
+fn string_set(value: Option<&Value>) -> Option<std::collections::HashSet<&str>> {
+    value?.as_array()?.iter().map(Value::as_str).collect()
+}
+
 fn observe_once(
-    audit_sender: &mpsc::Sender<HookAuditRecord>,
+    audit_sender: &mpsc::SyncSender<HookAuditRecord>,
     revision: &str,
     hook: &HookDefinition,
     event: HookEvent,
@@ -348,7 +463,7 @@ fn observe_once(
         Err(error) if error == "timed out" => (HookAuditOutcome::TimedOut, false),
         Err(error) => (HookAuditOutcome::Failed, error == "output exceeds limit"),
     };
-    let _ = audit_sender.send(HookAuditRecord {
+    let _ = audit_sender.try_send(HookAuditRecord {
         hook_id: hook.id.clone(),
         event,
         outcome,
@@ -518,7 +633,7 @@ mod tests {
                 }],
             },
             PathBuf::from("/tmp"),
-            mpsc::channel().0,
+            mpsc::sync_channel(16).0,
         );
         let payload = json!({"tool":"read", "arguments":{}});
         assert_eq!(
@@ -532,7 +647,7 @@ mod tests {
         if !Path::new("/usr/bin/sandbox-exec").is_file() {
             return;
         }
-        let (audit_sender, audit_receiver) = mpsc::channel();
+        let (audit_sender, audit_receiver) = mpsc::sync_channel(16);
         let dispatcher = HookDispatcher::new(
             HookConfig {
                 version: 1,
@@ -568,7 +683,7 @@ mod tests {
 
     #[test]
     fn failed_transform_preserves_the_original_arguments() {
-        let (audit_sender, audit_receiver) = mpsc::channel();
+        let (audit_sender, audit_receiver) = mpsc::sync_channel(16);
         let dispatcher = HookDispatcher::new(
             HookConfig {
                 version: 1,
@@ -618,7 +733,7 @@ mod tests {
                 }],
             },
             PathBuf::from("/tmp"),
-            mpsc::channel().0,
+            mpsc::sync_channel(16).0,
         );
         assert!(matches!(
             dispatcher.gate(
@@ -652,6 +767,52 @@ mod tests {
             )
             .unwrap_err()
             .contains("exited with status")
+        );
+    }
+
+    #[test]
+    fn event_specific_transforms_cannot_widen_their_contract() {
+        assert!(
+            validate_transform(
+                HookEvent::MessageSending,
+                &json!({"target":"child", "message":"old"}),
+                &json!({"target":"child", "message":"new"})
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_transform(
+                HookEvent::MessageSending,
+                &json!({"target":"child", "message":"old"}),
+                &json!({"target":"other", "message":"new"})
+            )
+            .is_err()
+        );
+        assert!(
+            validate_transform(
+                HookEvent::AgentSpawning,
+                &json!({
+                    "name":"worker",
+                    "task":"task",
+                    "permission_level":"controlled",
+                    "enabled_tools":["read", "bash"]
+                }),
+                &json!({
+                    "name":"worker",
+                    "task":"task",
+                    "permission_level":"read_only",
+                    "enabled_tools":["read"]
+                })
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_transform(
+                HookEvent::AgentSpawning,
+                &json!({"name":"worker", "task":"task", "permission_level":"controlled"}),
+                &json!({"name":"worker", "task":"changed", "permission_level":"read_only"})
+            )
+            .is_err()
         );
     }
 }

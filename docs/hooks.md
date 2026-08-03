@@ -29,8 +29,8 @@ Hook IDs must be unique, command entrypoints must be absolute files, and timeout
 be between 1 and 30000 ms. Hooks run in manifest order.
 
 Compile-time Rust hooks run before command hooks and cannot be disabled by a Manifest.
-The initial `builtin.safety_floor` rejects malformed spawn, message, tool, and permission
-events before external code runs; typed Supervisor handlers validate transformed values
+The initial `builtin.safety_floor` rejects malformed spawn and message events before
+external code runs; typed Supervisor handlers validate every transformed value
 again before carrying out an operation.
 
 A project may add `.pi-whim/hooks.json`. Project hooks remain disabled until the user
@@ -57,6 +57,13 @@ A `gate` hook returns an empty response or one JSON document. `{"decision":"deny
 arguments when returned by a `transform` hook; the normal typed handler validates the
 replacement before use. `observe` hook output is ignored.
 
+Transforms are event-specific. `tool_dispatching` may replace its argument object;
+`message_sending` may replace only `message`; `agent_spawning` may only lower an explicit
+permission level or shrink explicit non-empty tool/extension allowlists. Task, identity,
+model, target, and unrelated fields cannot be changed. `permission_resolving` is a
+deny-only Gate and runs only before an approval is granted; denials and cancellations can
+never be blocked by a Hook.
+
 Gate events fail closed on launch, timeout, oversized output, or invalid JSON. Transform
 failures preserve the prior arguments. Observe events are best effort. Hook output is
 limited to 64 KiB.
@@ -74,8 +81,9 @@ At most 10000 entries are retained per project.
   `session_expired`, `tool_completed`, `agent_started`, `agent_finished`,
   `message_delivered`, `interaction_created`, `interaction_resolved`, `team_reset`.
 
-`supervisor_stopping` and the final `session_expired` run synchronously with each Hook's
-normal timeout. Their failure is audited but never prevents process and capability cleanup.
+`supervisor_stopping` and the final `session_expired` run synchronously within a five-second
+phase budget. Individual timeouts are capped by the remaining budget; failure never
+prevents process and capability cleanup.
 
 Internal supervisor tools and hook execution do not recursively invoke hooks.
 
@@ -84,5 +92,5 @@ Internal supervisor tools and hook execution do not recursively invoke hooks.
 Command hooks run through macOS `sandbox-exec` with an empty environment. They can read
 the project and command directory, write only a per-invocation temporary directory, and
 have no network rule, provider keys, supervisor endpoint, or agent capability. If
-`sandbox-exec` is unavailable, gate hooks reject the operation and observe hooks are
-skipped.
+`sandbox-exec` is unavailable, gate hooks reject the operation, transform hooks preserve
+the original value, and observe failures are audited without affecting the operation.

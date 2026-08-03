@@ -248,7 +248,7 @@ impl AgentSupervisor {
         }
         let files = file_dispatch::FileCoordinator::for_project(launch.project_path.clone());
         let (interaction_sender, interaction_receiver) = std::sync::mpsc::channel();
-        let (hook_audit_sender, hook_audit_receiver) = std::sync::mpsc::channel();
+        let (hook_audit_sender, hook_audit_receiver) = std::sync::mpsc::sync_channel(512);
         let hooks = Arc::new(hooks::HookDispatcher::new(
             launch.hooks.clone(),
             launch.project_path.clone(),
@@ -1709,22 +1709,30 @@ fn resolve_interaction_for_owner(
     from_l0_user: bool,
 ) -> HostResult {
     let decision = decision.trim();
-    let resolving_permission = host
-        .interactions
-        .lock()
-        .ok()
-        .and_then(|interactions| {
-            interactions
-                .get(&request_id)
-                .map(|request| request.kind.clone())
+    let approval_context = host.interactions.lock().ok().and_then(|interactions| {
+        interactions.get(&request_id).and_then(|request| {
+            matches!(request.kind, InteractionKind::Approval).then(|| {
+                (
+                    request.requester_id,
+                    request.title.clone(),
+                    request.operation_hash.clone(),
+                )
+            })
         })
-        .is_some_and(|kind| matches!(kind, InteractionKind::Approval));
-    if resolving_permission
+    });
+    if let Some((requester_id, title, operation_hash)) = approval_context
         && decision == "approve"
         && matches!(
             host.hooks.gate(
                 HookEvent::PermissionResolving,
-                json!({"request_id": request_id, "owner_id": owner_id, "decision": decision}),
+                json!({
+                    "request_id": request_id,
+                    "requester_id": requester_id,
+                    "owner_id": owner_id,
+                    "title": title,
+                    "operation_hash": operation_hash,
+                    "decision": decision
+                }),
             ),
             hooks::HookDecision::Deny(_)
         )

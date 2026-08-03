@@ -1524,6 +1524,9 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         let project_id = session.project_id;
         let running = session.is_running();
         self.apply(Action::SelectProject(project_id));
+        if let Some(project) = self.find_project(project_id) {
+            let _ = self.load_hooks(&project.path);
+        }
         if !is_draft(key) {
             self.apply(Action::SelectSession(stable_session_id(key)));
         }
