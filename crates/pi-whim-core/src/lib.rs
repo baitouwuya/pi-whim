@@ -446,6 +446,17 @@ pub enum ProjectHookStatus {
     Invalid(String),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HookAuditSummary {
+    pub hook_id: String,
+    pub event: String,
+    pub outcome: String,
+    pub duration_ms: u64,
+    pub output_truncated: bool,
+    pub revision: String,
+    pub created_at_ms: i64,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HookMatcher {
     #[serde(default)]
@@ -883,6 +894,7 @@ pub struct AppState {
     pub provider_profiles: Vec<ProviderProfile>,
     pub search_engine_profiles: Vec<SearchEngineProfile>,
     pub project_hook_status: ProjectHookStatus,
+    pub hook_audit: Vec<HookAuditSummary>,
 }
 
 /// Where the visible session's Pi process stands.
@@ -926,6 +938,7 @@ pub enum Action {
     SetAgentTeamConfig(AgentTeamConfig),
     SetOneShotAiConfig(OneShotAiConfig),
     SetProjectHookStatus(ProjectHookStatus),
+    SetHookAudit(Vec<HookAuditSummary>),
     ProviderProfilesLoaded(Vec<ProviderProfile>),
     /// Which providers have a key in the OS keychain.
     ///
@@ -1003,6 +1016,7 @@ impl AppState {
                 self.agent_team_config = config.normalized();
             }
             Action::SetProjectHookStatus(status) => self.project_hook_status = status,
+            Action::SetHookAudit(entries) => self.hook_audit = entries,
             Action::SetOneShotAiConfig(config) => {
                 self.one_shot_ai_config = config.normalized();
             }

@@ -13,11 +13,11 @@ use std::{
 
 use pi_whim_core::{
     Action, AgentPermissionLevel, AppState, Attachment, ConversationItem, ConversationRole,
-    HookAuditRecord, HookConfig, Language, ModelOption, Project, ProjectHookStatus, ProjectId,
-    ProviderId, ProviderProfile, ProviderProtocol, QueueMode, SESSION_TITLE_TASK_KIND,
-    SearchEngineId, SearchEngineProfile, SessionMetrics, SessionStatus, SessionSummary, SubmitMode,
-    ThinkingLevel, normalize_bash_patterns, normalize_provider_display_name, provider_name_key,
-    stable_session_id, strings,
+    HookAuditRecord, HookAuditSummary, HookConfig, Language, ModelOption, Project,
+    ProjectHookStatus, ProjectId, ProviderId, ProviderProfile, ProviderProtocol, QueueMode,
+    SESSION_TITLE_TASK_KIND, SearchEngineId, SearchEngineProfile, SessionMetrics, SessionStatus,
+    SessionSummary, SubmitMode, ThinkingLevel, normalize_bash_patterns,
+    normalize_provider_display_name, provider_name_key, stable_session_id, strings,
 };
 use pi_whim_one_shot_ai::{
     OneShotAiService, OneShotCompletion, OneShotErrorKind, OneShotRequestId,
@@ -1367,6 +1367,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     }
 
     fn load_hooks(&mut self, project_path: &str) -> HookConfig {
+        self.refresh_hook_audit(project_path);
         let mut config = self.load_global_hooks();
         let path = Path::new(project_path).join(".pi-whim/hooks.json");
         let source = match fs::read(&path) {
@@ -1443,6 +1444,26 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             hook_count,
         }));
         config
+    }
+
+    fn refresh_hook_audit(&mut self, project_path: &str) {
+        let entries = self
+            .store
+            .as_ref()
+            .and_then(|store| store.recent_hook_audit(project_path, 20).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|entry| HookAuditSummary {
+                hook_id: entry.hook_id,
+                event: entry.event,
+                outcome: entry.outcome,
+                duration_ms: entry.duration_ms,
+                output_truncated: entry.output_truncated,
+                revision: entry.revision,
+                created_at_ms: entry.created_at_ms,
+            })
+            .collect();
+        self.apply(Action::SetHookAudit(entries));
     }
 
     fn load_global_hooks(&mut self) -> HookConfig {
@@ -2791,7 +2812,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             .and_then(|value| value.as_str().map(str::to_owned))
             .unwrap_or_else(|| "failed".into());
         if let Err(error) = store.append_hook_audit(&HookAuditEntry {
-            project_path: project.path,
+            project_path: project.path.clone(),
             hook_id: record.hook_id,
             event,
             outcome,
@@ -2801,6 +2822,8 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             created_at_ms: now_ms(),
         }) {
             self.notices.error(error.to_string());
+        } else if self.state().selected_project == Some(project.id) {
+            self.refresh_hook_audit(&project.path);
         }
     }
 
@@ -3244,6 +3267,28 @@ mod tests {
                 .iter()
                 .any(|item| item.full_text == "held input")
         );
+    }
+
+    #[test]
+    fn hook_audit_events_persist_only_metadata_and_refresh_settings_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = test_application(&directory, FakeRuntime::default());
+        start_test_session(&mut app, &directory);
+        let key = app.sessions.active_key().unwrap().to_owned();
+        app.handle_runtime_event(
+            &key,
+            RuntimeEvent::HookAudit(HookAuditRecord {
+                hook_id: "policy".into(),
+                event: pi_whim_core::HookEvent::ToolDispatching,
+                outcome: pi_whim_core::HookAuditOutcome::Denied,
+                duration_ms: 7,
+                output_truncated: false,
+                revision: "sha256:test".into(),
+            }),
+        );
+        assert_eq!(app.state().hook_audit.len(), 1);
+        assert_eq!(app.state().hook_audit[0].hook_id, "policy");
+        assert_eq!(app.state().hook_audit[0].outcome, "denied");
     }
 
     fn project(name: &str, path: &Path) -> Project {

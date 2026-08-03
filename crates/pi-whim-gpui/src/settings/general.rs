@@ -121,10 +121,33 @@ pub fn render_execution(
                 tr(state, "project-hooks"),
                 None,
                 tokens,
-                vec![project_hooks_row(state, tokens, emit)],
+                project_hook_rows(state, tokens, emit),
             ),
         ]))
         .into_any_element()
+}
+
+fn project_hook_rows(state: &AppState, tokens: Tokens, emit: Emit) -> Vec<AnyElement> {
+    let mut rows = vec![project_hooks_row(state, tokens, emit)];
+    rows.extend(state.hook_audit.iter().take(5).map(|entry| {
+        let revision = entry.revision.get(..19).unwrap_or(&entry.revision);
+        let truncation = if entry.output_truncated {
+            " truncated"
+        } else {
+            ""
+        };
+        let details = format!(
+            "{} / {} / {} ms{truncation} / {revision}",
+            entry.event, entry.outcome, entry.duration_ms
+        );
+        form::row(
+            &entry.hook_id,
+            Some(&details),
+            tokens,
+            div().into_any_element(),
+        )
+    }));
+    rows
 }
 
 fn project_hooks_row(state: &AppState, tokens: Tokens, emit: Emit) -> AnyElement {
