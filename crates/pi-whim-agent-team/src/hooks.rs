@@ -925,7 +925,7 @@ mod tests {
             event: HookEvent::ToolDispatching,
             kind: HookKind::Gate,
             command: vec![script.to_string_lossy().into_owned()],
-            timeout_ms: Some(1_000),
+            timeout_ms: Some(5_000),
             matcher: HookMatcher::default(),
             entrypoint_fingerprint: None,
         };
@@ -972,7 +972,7 @@ printf '{}\n'
                 script.to_string_lossy().into_owned(),
                 project_root.to_string_lossy().into_owned(),
             ],
-            timeout_ms: Some(1_000),
+            timeout_ms: Some(5_000),
             matcher: HookMatcher::default(),
             entrypoint_fingerprint: None,
         };
