@@ -266,7 +266,7 @@ impl AgentSupervisor {
         };
         let stopping = Arc::new(AtomicBool::new(false));
         let server_thread = Some(start_server(listener, host.clone(), stopping.clone()));
-        Ok(Self {
+        let supervisor = Self {
             host,
             root_id,
             root_capability,
@@ -274,7 +274,16 @@ impl AgentSupervisor {
             hook_audit_receiver: Some(hook_audit_receiver),
             stopping,
             server_thread,
-        })
+        };
+        supervisor.host.hooks.observe(
+            HookEvent::SupervisorStarted,
+            json!({"root_agent_id": root_id}),
+        );
+        supervisor.host.hooks.observe(
+            HookEvent::SessionPublished,
+            json!({"agent_id": root_id, "session_id": root_session_id, "agent_level": 0}),
+        );
+        Ok(supervisor)
     }
 
     pub fn root_environment(&self) -> [(String, String); 4] {
@@ -329,6 +338,16 @@ impl AgentSupervisor {
         if self.stopping.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
+        let root_session_id = self.host.shared.0.lock().ok().and_then(|state| {
+            state
+                .actors
+                .get(&self.root_id)
+                .map(|node| node.descriptor.session_id)
+        });
+        self.host.hooks.finalize(
+            HookEvent::SupervisorStopping,
+            json!({"root_agent_id": self.root_id}),
+        );
         {
             bash_dispatch::terminate_all(&self.host.shared);
             clear_interactions(&self.host);
@@ -361,6 +380,10 @@ impl AgentSupervisor {
         if let Some(server_thread) = self.server_thread.take() {
             let _ = server_thread.join();
         }
+        self.host.hooks.finalize(
+            HookEvent::SessionExpired,
+            json!({"agent_id": self.root_id, "session_id": root_session_id, "agent_level": 0}),
+        );
         Ok(())
     }
 }
@@ -3025,7 +3048,7 @@ fn interrupt_agent(host: &HostContext, owner_id: AgentId, value: &Value) -> Host
 
 fn reset_team(host: &HostContext, actor_id: AgentId, value: &Value) -> HostResult {
     let arguments: ResetTeamArguments = parse_optional_arguments(value)?;
-    let root_id = {
+    let (root_id, old_session_id) = {
         let (lock, _) = &*host.shared;
         let state = lock
             .lock()
@@ -3036,7 +3059,13 @@ fn reset_team(host: &HostContext, actor_id: AgentId, value: &Value) -> HostResul
                 "only the level-0 owner can reset a team",
             ));
         }
-        state.root_id
+        let root_id = state.root_id;
+        let session_id = state
+            .actors
+            .get(&root_id)
+            .map(|node| node.descriptor.session_id)
+            .ok_or_else(|| HostError::new("internal", "root agent is unavailable"))?;
+        (root_id, session_id)
     };
     let new_session_id = arguments
         .session_path
@@ -3101,6 +3130,15 @@ fn reset_team(host: &HostContext, actor_id: AgentId, value: &Value) -> HostResul
         "team_id": root.descriptor.team_id,
         "session_id": root.descriptor.session_id
     });
+    drop(state);
+    host.hooks.observe(
+        HookEvent::SessionExpired,
+        json!({"agent_id": root_id, "session_id": old_session_id, "agent_level": 0}),
+    );
+    host.hooks.observe(
+        HookEvent::SessionPublished,
+        json!({"agent_id": root_id, "session_id": new_session_id, "agent_level": 0}),
+    );
     host.hooks.observe(HookEvent::TeamReset, response.clone());
     Ok(response)
 }

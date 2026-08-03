@@ -138,15 +138,36 @@ impl HookDispatcher {
             let project_root = project_root.clone();
             let dispatcher = dispatcher.clone();
             thread::spawn(move || {
-                let started = std::time::Instant::now();
-                let (outcome, truncated) = match invoke(&hook, event, &payload, &project_root) {
-                    Ok(_) => (HookAuditOutcome::Succeeded, false),
-                    Err(error) if error == "timed out" => (HookAuditOutcome::TimedOut, false),
-                    Err(error) => (HookAuditOutcome::Failed, error == "output exceeds limit"),
-                };
-                dispatcher.audit(&hook, event, outcome, started.elapsed(), truncated);
+                dispatcher.observe_once(&hook, event, &payload, &project_root);
             });
         }
+    }
+
+    pub(crate) fn finalize(&self, event: HookEvent, payload: Value) {
+        let hooks = self
+            .matching(event, &payload)
+            .filter(|hook| matches!(hook.kind, HookKind::Observe))
+            .cloned()
+            .collect::<Vec<_>>();
+        for hook in &hooks {
+            self.observe_once(hook, event, &payload, &self.project_root);
+        }
+    }
+
+    fn observe_once(
+        &self,
+        hook: &HookDefinition,
+        event: HookEvent,
+        payload: &Value,
+        project_root: &Path,
+    ) {
+        let started = std::time::Instant::now();
+        let (outcome, truncated) = match invoke(hook, event, payload, project_root) {
+            Ok(_) => (HookAuditOutcome::Succeeded, false),
+            Err(error) if error == "timed out" => (HookAuditOutcome::TimedOut, false),
+            Err(error) => (HookAuditOutcome::Failed, error == "output exceeds limit"),
+        };
+        self.audit(hook, event, outcome, started.elapsed(), truncated);
     }
 
     fn audit(

@@ -60,8 +60,12 @@ message bodies, credentials, capabilities, and raw command output are never pers
 
 - Gates: `tool_dispatching`, `agent_spawning`, `message_sending`,
   `permission_resolving`.
-- Observe: `tool_completed`, `agent_started`, `agent_finished`, `message_delivered`,
-  `interaction_created`, `interaction_resolved`, `team_reset`.
+- Observe: `supervisor_started`, `supervisor_stopping`, `session_published`,
+  `session_expired`, `tool_completed`, `agent_started`, `agent_finished`,
+  `message_delivered`, `interaction_created`, `interaction_resolved`, `team_reset`.
+
+`supervisor_stopping` and the final `session_expired` run synchronously with each Hook's
+normal timeout. Their failure is audited but never prevents process and capability cleanup.
 
 Internal supervisor tools and hook execution do not recursively invoke hooks.
 

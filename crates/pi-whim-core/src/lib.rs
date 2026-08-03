@@ -352,7 +352,11 @@ impl HookConfig {
             }
             let observe_event = matches!(
                 hook.event,
-                HookEvent::ToolCompleted
+                HookEvent::SupervisorStarted
+                    | HookEvent::SupervisorStopping
+                    | HookEvent::SessionPublished
+                    | HookEvent::SessionExpired
+                    | HookEvent::ToolCompleted
                     | HookEvent::AgentStarted
                     | HookEvent::AgentFinished
                     | HookEvent::MessageDelivered
@@ -365,6 +369,16 @@ impl HookConfig {
                     "hook {} kind does not match its event phase",
                     hook.id
                 ));
+            }
+            if matches!(hook.kind, HookKind::Transform)
+                && !matches!(
+                    hook.event,
+                    HookEvent::ToolDispatching
+                        | HookEvent::AgentSpawning
+                        | HookEvent::MessageSending
+                )
+            {
+                return Err(format!("hook {} cannot transform this event", hook.id));
             }
         }
         Ok(())
@@ -400,6 +414,10 @@ pub enum HookKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HookEvent {
+    SupervisorStarted,
+    SupervisorStopping,
+    SessionPublished,
+    SessionExpired,
     ToolDispatching,
     AgentSpawning,
     MessageSending,
