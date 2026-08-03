@@ -344,6 +344,7 @@ impl AgentSupervisor {
                 .get(&self.root_id)
                 .map(|node| node.descriptor.session_id)
         });
+        self.host.hooks.stop_observers();
         self.host.hooks.finalize(
             HookEvent::SupervisorStopping,
             json!({"root_agent_id": self.root_id}),

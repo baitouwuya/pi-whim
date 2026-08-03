@@ -4,7 +4,11 @@ use std::{
     io::{BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{Arc, mpsc},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::Duration,
 };
@@ -82,6 +86,7 @@ pub(crate) struct HookDispatcher {
     audit_sender: mpsc::Sender<HookAuditRecord>,
     revision: String,
     observe_sender: mpsc::SyncSender<ObserveTask>,
+    observe_stopping: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for HookDispatcher {
@@ -113,8 +118,13 @@ impl HookDispatcher {
         let worker_project_root = project_root.clone();
         let worker_audit_sender = audit_sender.clone();
         let worker_revision = config.revision.clone();
+        let observe_stopping = Arc::new(AtomicBool::new(false));
+        let worker_stopping = observe_stopping.clone();
         thread::spawn(move || {
             for task in observe_receiver {
+                if worker_stopping.load(Ordering::Acquire) {
+                    break;
+                }
                 observe_once(
                     &worker_audit_sender,
                     &worker_revision,
@@ -132,6 +142,7 @@ impl HookDispatcher {
             project_root,
             audit_sender,
             observe_sender,
+            observe_stopping,
         }
     }
 
@@ -234,6 +245,9 @@ impl HookDispatcher {
     }
 
     pub(crate) fn observe(&self, event: HookEvent, payload: Value) {
+        if self.observe_stopping.load(Ordering::Acquire) {
+            return;
+        }
         let hooks = self
             .matching(event, &payload)
             .filter(|hook| matches!(hook.kind, HookKind::Observe))
@@ -249,6 +263,10 @@ impl HookDispatcher {
                 self.audit(hook, event, HookAuditOutcome::Failed, Duration::ZERO, false);
             }
         }
+    }
+
+    pub(crate) fn stop_observers(&self) {
+        self.observe_stopping.store(true, Ordering::Release);
     }
 
     pub(crate) fn finalize(&self, event: HookEvent, payload: Value) {
