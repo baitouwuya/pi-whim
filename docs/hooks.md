@@ -35,6 +35,10 @@ changing any of them invalidates approval. Global hooks run first, followed
 by approved project hooks, in their respective Manifest order. Duplicate IDs across the
 merged configuration invalidate the merged set.
 
+Approved project entrypoints are hashed again immediately before every invocation. A
+post-launch replacement therefore follows the Hook kind's failure policy and cannot run
+under a stale approval.
+
 ## Protocol
 
 The command receives one JSON document on stdin:

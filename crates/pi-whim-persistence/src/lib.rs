@@ -141,11 +141,17 @@ pub fn hook_manifest_fingerprint(source: &[u8]) -> String {
         .collect()
 }
 
-pub fn hook_configuration_fingerprint(
+pub struct HookConfigurationFingerprint {
+    pub combined: String,
+    pub entrypoints: Vec<String>,
+}
+
+pub fn hook_configuration_fingerprints(
     manifest_source: &[u8],
     config: &HookConfig,
-) -> Result<String, io::Error> {
+) -> Result<HookConfigurationFingerprint, io::Error> {
     let mut digest = Sha256::new();
+    let mut entrypoints = Vec::with_capacity(config.hooks.len());
     digest.update((manifest_source.len() as u64).to_le_bytes());
     digest.update(manifest_source);
     for hook in &config.hooks {
@@ -154,16 +160,21 @@ pub fn hook_configuration_fingerprint(
         };
         let path = Path::new(program);
         let content = std::fs::read(path)?;
+        entrypoints.push(hook_manifest_fingerprint(&content));
         digest.update((program.len() as u64).to_le_bytes());
         digest.update(program.as_bytes());
         digest.update((content.len() as u64).to_le_bytes());
         digest.update(content);
     }
-    Ok(digest
+    let combined = digest
         .finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect())
+        .collect();
+    Ok(HookConfigurationFingerprint {
+        combined,
+        entrypoints,
+    })
 }
 
 pub struct SqliteStore {

@@ -13,6 +13,7 @@ use pi_whim_core::{
     HookAuditOutcome, HookAuditRecord, HookConfig, HookDefinition, HookEvent, HookKind,
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_HOOK_OUTPUT: usize = 64 * 1024;
@@ -271,6 +272,16 @@ fn invoke(
     if !program.is_file() {
         return Err("command is not an existing file".into());
     }
+    if let Some(expected) = hook.entrypoint_fingerprint.as_deref() {
+        let content = std::fs::read(program).map_err(|error| error.to_string())?;
+        let actual = Sha256::digest(content)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        if actual != expected {
+            return Err("approved command entrypoint changed".into());
+        }
+    }
     if !Path::new("/usr/bin/sandbox-exec").is_file() {
         return Err("sandbox-exec is unavailable".into());
     }
@@ -371,6 +382,7 @@ mod tests {
                         tools: vec!["bash".into()],
                         agent_levels: vec![],
                     },
+                    entrypoint_fingerprint: None,
                 }],
             },
             PathBuf::from("/tmp"),
@@ -402,6 +414,7 @@ mod tests {
                     ],
                     timeout_ms: Some(1_000),
                     matcher: HookMatcher::default(),
+                    entrypoint_fingerprint: None,
                 }],
             },
             PathBuf::from("/tmp"),
@@ -433,6 +446,7 @@ mod tests {
                     command: vec!["/missing/hook".into()],
                     timeout_ms: None,
                     matcher: HookMatcher::default(),
+                    entrypoint_fingerprint: None,
                 }],
             },
             PathBuf::from("/tmp"),
@@ -450,5 +464,30 @@ mod tests {
                 .outcome,
             HookAuditOutcome::Failed
         );
+    }
+
+    #[test]
+    fn changed_approved_entrypoint_fails_a_gate_closed() {
+        let dispatcher = HookDispatcher::new(
+            HookConfig {
+                version: 1,
+                revision: "sha256:test".into(),
+                hooks: vec![HookDefinition {
+                    id: "approved".into(),
+                    event: HookEvent::ToolDispatching,
+                    kind: HookKind::Gate,
+                    command: vec!["/usr/bin/true".into()],
+                    timeout_ms: None,
+                    matcher: HookMatcher::default(),
+                    entrypoint_fingerprint: Some("00".repeat(32)),
+                }],
+            },
+            PathBuf::from("/tmp"),
+            mpsc::channel().0,
+        );
+        assert!(matches!(
+            dispatcher.gate(HookEvent::ToolDispatching, json!({"tool":"bash"})),
+            HookDecision::Deny(message) if message.contains("entrypoint changed")
+        ));
     }
 }

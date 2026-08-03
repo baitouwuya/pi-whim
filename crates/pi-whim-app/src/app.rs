@@ -26,7 +26,7 @@ use pi_whim_one_shot_ai::{
 use pi_whim_persistence::{
     AppPreferences, AttachmentStore, HookAuditEntry, HookRepository, MacosKeychainStore,
     PreferencesRepository, ProjectRepository, ProviderRepository, SearchEngineRepository,
-    SecretStore, SessionRepository, SqliteStore, hook_configuration_fingerprint,
+    SecretStore, SessionRepository, SqliteStore, hook_configuration_fingerprints,
     hook_manifest_fingerprint, persist_session_title_to_jsonl, session_summary_from_jsonl,
 };
 use pi_whim_runtime::{AgentRuntime, PiRpcRuntime, RuntimeEvent, RuntimeStart};
@@ -530,7 +530,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             config
                 .validate()
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-            hook_configuration_fingerprint(&source, &config)
+            hook_configuration_fingerprints(&source, &config).map(|value| value.combined)
         }) {
             Ok(fingerprint) => fingerprint,
             Err(error) => {
@@ -1385,7 +1385,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 return config;
             }
         };
-        let project_config = match serde_json::from_slice::<HookConfig>(&source)
+        let mut project_config = match serde_json::from_slice::<HookConfig>(&source)
             .map_err(|error| error.to_string())
             .and_then(|config| config.validate().map(|()| config))
         {
@@ -1401,8 +1401,8 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 return config;
             }
         };
-        let fingerprint = match hook_configuration_fingerprint(&source, &project_config) {
-            Ok(fingerprint) => fingerprint,
+        let fingerprints = match hook_configuration_fingerprints(&source, &project_config) {
+            Ok(fingerprints) => fingerprints,
             Err(error) => {
                 let message = format!("failed to fingerprint project hooks: {error}");
                 self.apply(Action::SetProjectHookStatus(ProjectHookStatus::Invalid(
@@ -1412,6 +1412,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 return config;
             }
         };
+        let fingerprint = fingerprints.combined;
         let hook_count = project_config.hooks.len();
         let trusted = self
             .store
@@ -1426,6 +1427,13 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 },
             ));
             return config;
+        }
+        for (hook, entrypoint_fingerprint) in project_config
+            .hooks
+            .iter_mut()
+            .zip(fingerprints.entrypoints)
+        {
+            hook.entrypoint_fingerprint = Some(entrypoint_fingerprint);
         }
         config.hooks.extend(project_config.hooks);
         if let Err(error) = config.validate() {

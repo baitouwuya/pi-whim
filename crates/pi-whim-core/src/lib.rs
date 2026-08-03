@@ -400,6 +400,8 @@ pub struct HookDefinition {
     pub timeout_ms: Option<u64>,
     #[serde(default)]
     pub matcher: HookMatcher,
+    #[serde(skip)]
+    pub entrypoint_fingerprint: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
