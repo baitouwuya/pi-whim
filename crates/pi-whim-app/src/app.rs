@@ -1298,7 +1298,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     /// Global manifests are user-owned; project manifests are deliberately not
     /// loaded until their fingerprint has been approved and persisted.
     fn load_global_hooks(&mut self) -> HookConfig {
-        let Some(root) = dirs::data_dir().map(|path| path.join("pi-whim")) else {
+        let Some(root) = dirs::config_dir().map(|path| path.join("pi-whim")) else {
             return HookConfig::default();
         };
         let path = root.join("hooks.json");

@@ -5,7 +5,7 @@ internal model-loop extension events.
 
 ## Manifest
 
-The global manifest is `${data_dir}/pi-whim/hooks.json` (`~/Library/Application Support`
+The global manifest is `${config_dir}/pi-whim/hooks.json` (`~/Library/Application Support`
 on macOS). It is read when a session runtime starts. Invalid manifests are reported in
 the application and no hooks from that manifest run.
 
