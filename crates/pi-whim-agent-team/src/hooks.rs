@@ -16,6 +16,13 @@ use serde_json::{Value, json};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_HOOK_OUTPUT: usize = 64 * 1024;
+const OBSERVE_QUEUE_CAPACITY: usize = 64;
+
+struct ObserveTask {
+    hook: HookDefinition,
+    event: HookEvent,
+    payload: Value,
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct HookDispatcher {
@@ -23,6 +30,7 @@ pub(crate) struct HookDispatcher {
     project_root: PathBuf,
     audit_sender: mpsc::Sender<HookAuditRecord>,
     revision: String,
+    observe_sender: mpsc::SyncSender<ObserveTask>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -37,11 +45,29 @@ impl HookDispatcher {
         project_root: PathBuf,
         audit_sender: mpsc::Sender<HookAuditRecord>,
     ) -> Self {
+        let (observe_sender, observe_receiver) =
+            mpsc::sync_channel::<ObserveTask>(OBSERVE_QUEUE_CAPACITY);
+        let worker_project_root = project_root.clone();
+        let worker_audit_sender = audit_sender.clone();
+        let worker_revision = config.revision.clone();
+        thread::spawn(move || {
+            for task in observe_receiver {
+                observe_once(
+                    &worker_audit_sender,
+                    &worker_revision,
+                    &task.hook,
+                    task.event,
+                    &task.payload,
+                    &worker_project_root,
+                );
+            }
+        });
         Self {
             revision: config.revision.clone(),
             hooks: config.hooks,
             project_root,
             audit_sender,
+            observe_sender,
         }
     }
 
@@ -130,16 +156,15 @@ impl HookDispatcher {
             .filter(|hook| matches!(hook.kind, HookKind::Observe))
             .cloned()
             .collect::<Vec<_>>();
-        let project_root = self.project_root.clone();
-        let dispatcher = self.clone();
         for hook in &hooks {
-            let hook = hook.clone();
-            let payload = payload.clone();
-            let project_root = project_root.clone();
-            let dispatcher = dispatcher.clone();
-            thread::spawn(move || {
-                dispatcher.observe_once(&hook, event, &payload, &project_root);
-            });
+            let task = ObserveTask {
+                hook: hook.clone(),
+                event,
+                payload: payload.clone(),
+            };
+            if self.observe_sender.try_send(task).is_err() {
+                self.audit(hook, event, HookAuditOutcome::Failed, Duration::ZERO, false);
+            }
         }
     }
 
@@ -161,13 +186,14 @@ impl HookDispatcher {
         payload: &Value,
         project_root: &Path,
     ) {
-        let started = std::time::Instant::now();
-        let (outcome, truncated) = match invoke(hook, event, payload, project_root) {
-            Ok(_) => (HookAuditOutcome::Succeeded, false),
-            Err(error) if error == "timed out" => (HookAuditOutcome::TimedOut, false),
-            Err(error) => (HookAuditOutcome::Failed, error == "output exceeds limit"),
-        };
-        self.audit(hook, event, outcome, started.elapsed(), truncated);
+        observe_once(
+            &self.audit_sender,
+            &self.revision,
+            hook,
+            event,
+            payload,
+            project_root,
+        );
     }
 
     fn audit(
@@ -205,6 +231,30 @@ impl HookDispatcher {
                         .is_some_and(|level| hook.matcher.agent_levels.contains(&(level as u8))))
         })
     }
+}
+
+fn observe_once(
+    audit_sender: &mpsc::Sender<HookAuditRecord>,
+    revision: &str,
+    hook: &HookDefinition,
+    event: HookEvent,
+    payload: &Value,
+    project_root: &Path,
+) {
+    let started = std::time::Instant::now();
+    let (outcome, truncated) = match invoke(hook, event, payload, project_root) {
+        Ok(_) => (HookAuditOutcome::Succeeded, false),
+        Err(error) if error == "timed out" => (HookAuditOutcome::TimedOut, false),
+        Err(error) => (HookAuditOutcome::Failed, error == "output exceeds limit"),
+    };
+    let _ = audit_sender.send(HookAuditRecord {
+        hook_id: hook.id.clone(),
+        event,
+        outcome,
+        duration_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+        output_truncated: truncated,
+        revision: revision.to_owned(),
+    });
 }
 
 fn invoke(
