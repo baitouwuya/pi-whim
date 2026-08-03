@@ -9,7 +9,9 @@ use std::{
     time::Duration,
 };
 
-use pi_whim_core::{HookAuditOutcome, HookAuditRecord, HookConfig, HookDefinition, HookEvent};
+use pi_whim_core::{
+    HookAuditOutcome, HookAuditRecord, HookConfig, HookDefinition, HookEvent, HookKind,
+};
 use serde_json::{Value, json};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -48,8 +50,11 @@ impl HookDispatcher {
         let hooks = self.matching(event, &payload).cloned().collect::<Vec<_>>();
         for hook in &hooks {
             let started = std::time::Instant::now();
-            match invoke(hook, event, &payload, &self.project_root) {
-                Ok(result) if result.get("decision").and_then(Value::as_str) == Some("deny") => {
+            let result = invoke(hook, event, &payload, &self.project_root);
+            match (hook.kind, result) {
+                (HookKind::Gate, Ok(result))
+                    if result.get("decision").and_then(Value::as_str) == Some("deny") =>
+                {
                     self.audit(
                         hook,
                         event,
@@ -65,7 +70,7 @@ impl HookDispatcher {
                             .to_owned(),
                     );
                 }
-                Ok(result) => {
+                (HookKind::Gate, Ok(_)) => {
                     self.audit(
                         hook,
                         event,
@@ -73,12 +78,20 @@ impl HookDispatcher {
                         started.elapsed(),
                         false,
                     );
+                }
+                (HookKind::Transform, Ok(result)) => {
+                    self.audit(
+                        hook,
+                        event,
+                        HookAuditOutcome::Succeeded,
+                        started.elapsed(),
+                        false,
+                    );
                     if let Some(arguments) = result.get("arguments") {
                         payload["arguments"] = arguments.clone();
                     }
                 }
-                // Gates fail closed: hooks used to enforce a rule must be available.
-                Err(error) => {
+                (HookKind::Gate, Err(error)) => {
                     self.audit(
                         hook,
                         event,
@@ -92,13 +105,31 @@ impl HookDispatcher {
                     );
                     return HookDecision::Deny(format!("hook {} failed: {error}", hook.id));
                 }
+                (HookKind::Transform, Err(error)) => {
+                    self.audit(
+                        hook,
+                        event,
+                        if error == "timed out" {
+                            HookAuditOutcome::TimedOut
+                        } else {
+                            HookAuditOutcome::Failed
+                        },
+                        started.elapsed(),
+                        error == "output exceeds limit",
+                    );
+                }
+                (HookKind::Observe, _) => {}
             }
         }
         HookDecision::Continue(payload)
     }
 
     pub(crate) fn observe(&self, event: HookEvent, payload: Value) {
-        let hooks = self.matching(event, &payload).cloned().collect::<Vec<_>>();
+        let hooks = self
+            .matching(event, &payload)
+            .filter(|hook| matches!(hook.kind, HookKind::Observe))
+            .cloned()
+            .collect::<Vec<_>>();
         let project_root = self.project_root.clone();
         let dispatcher = self.clone();
         for hook in &hooks {
@@ -262,6 +293,7 @@ mod tests {
                 hooks: vec![HookDefinition {
                     id: "only-bash".into(),
                     event: HookEvent::ToolDispatching,
+                    kind: HookKind::Gate,
                     command: vec!["false".into()],
                     timeout_ms: None,
                     matcher: HookMatcher {
@@ -292,6 +324,7 @@ mod tests {
                 hooks: vec![HookDefinition {
                     id: "deny".into(),
                     event: HookEvent::ToolDispatching,
+                    kind: HookKind::Gate,
                     command: vec![
                         "/bin/echo".into(),
                         r#"{"decision":"deny","message":"policy"}"#.into(),
@@ -313,5 +346,38 @@ mod tests {
         let audit = audit_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(audit.outcome, HookAuditOutcome::Denied);
         assert_eq!(audit.revision, "sha256:test");
+    }
+
+    #[test]
+    fn failed_transform_preserves_the_original_arguments() {
+        let (audit_sender, audit_receiver) = mpsc::channel();
+        let dispatcher = HookDispatcher::new(
+            HookConfig {
+                version: 1,
+                revision: "sha256:test".into(),
+                hooks: vec![HookDefinition {
+                    id: "transform".into(),
+                    event: HookEvent::ToolDispatching,
+                    kind: HookKind::Transform,
+                    command: vec!["/missing/hook".into()],
+                    timeout_ms: None,
+                    matcher: HookMatcher::default(),
+                }],
+            },
+            PathBuf::from("/tmp"),
+            audit_sender,
+        );
+        let payload = json!({"tool":"bash", "arguments":{"command":"pwd"}});
+        assert_eq!(
+            dispatcher.gate(HookEvent::ToolDispatching, payload.clone()),
+            HookDecision::Continue(payload)
+        );
+        assert_eq!(
+            audit_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .outcome,
+            HookAuditOutcome::Failed
+        );
     }
 }

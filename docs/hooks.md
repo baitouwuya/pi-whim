@@ -16,6 +16,7 @@ the application and no hooks from that manifest run.
     {
       "id": "protect-main",
       "event": "tool_dispatching",
+      "kind": "gate",
       "command": ["/absolute/path/to/protect-main"],
       "timeout_ms": 3000,
       "matcher": { "tools": ["bash"], "agent_levels": [0, 1] }
@@ -42,13 +43,14 @@ The command receives one JSON document on stdin:
 {"version":1,"event":"tool_dispatching","payload":{"tool":"bash","agent_id":"...","agent_level":0,"arguments":{}}}
 ```
 
-A gate hook returns an empty response or one JSON document. `{"decision":"deny",
+A `gate` hook returns an empty response or one JSON document. `{"decision":"deny",
 "message":"reason"}` rejects the operation. `{"arguments":{...}}` replaces the event's
-arguments; the normal typed handler validates the replacement before use. Observe hooks'
-output is ignored.
+arguments when returned by a `transform` hook; the normal typed handler validates the
+replacement before use. `observe` hook output is ignored.
 
-Gate events fail closed on launch, timeout, oversized output, or invalid JSON. Observe
-events are best effort. Hook output is limited to 64 KiB.
+Gate events fail closed on launch, timeout, oversized output, or invalid JSON. Transform
+failures preserve the prior arguments. Observe events are best effort. Hook output is
+limited to 64 KiB.
 
 Each invocation writes bounded audit metadata to SQLite: hook ID, event, outcome,
 duration, output-truncation flag, configuration revision, and timestamp. Arguments,

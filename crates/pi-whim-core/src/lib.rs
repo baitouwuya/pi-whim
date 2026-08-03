@@ -350,6 +350,22 @@ impl HookConfig {
                     hook.id
                 ));
             }
+            let observe_event = matches!(
+                hook.event,
+                HookEvent::ToolCompleted
+                    | HookEvent::AgentStarted
+                    | HookEvent::AgentFinished
+                    | HookEvent::MessageDelivered
+                    | HookEvent::InteractionCreated
+                    | HookEvent::InteractionResolved
+                    | HookEvent::TeamReset
+            );
+            if observe_event != matches!(hook.kind, HookKind::Observe) {
+                return Err(format!(
+                    "hook {} kind does not match its event phase",
+                    hook.id
+                ));
+            }
         }
         Ok(())
     }
@@ -363,11 +379,22 @@ const fn hook_manifest_version() -> u32 {
 pub struct HookDefinition {
     pub id: String,
     pub event: HookEvent,
+    #[serde(default)]
+    pub kind: HookKind,
     pub command: Vec<String>,
     #[serde(default)]
     pub timeout_ms: Option<u64>,
     #[serde(default)]
     pub matcher: HookMatcher,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookKind {
+    #[default]
+    Gate,
+    Transform,
+    Observe,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
