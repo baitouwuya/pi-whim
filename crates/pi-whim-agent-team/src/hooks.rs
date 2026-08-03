@@ -389,7 +389,7 @@ fn invoke(
         std::env::temp_dir().join(format!("pi-whim-hook-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&temporary_directory).map_err(|error| error.to_string())?;
     let profile = sandbox_profile(project_root, &temporary_directory, program);
-    let mut child = Command::new("/usr/bin/sandbox-exec")
+    let mut child = match Command::new("/usr/bin/sandbox-exec")
         .args(["-p", &profile])
         .arg(program)
         .args(arguments)
@@ -400,7 +400,13 @@ fn invoke(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|error| error.to_string())?;
+    {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&temporary_directory);
+            return Err(error.to_string());
+        }
+    };
     let request = json!({"version": 1, "event": event, "payload": payload});
     let result = (|| {
         child
@@ -429,12 +435,38 @@ fn invoke(
             .recv_timeout(timeout)
             .map_err(|_| "timed out".to_owned())
     })();
-    let _ = child.kill();
-    let _ = child.wait();
+    let mut status = None;
+    if result.is_ok() {
+        for _ in 0..10 {
+            match child.try_wait() {
+                Ok(Some(exit)) => {
+                    status = Some(exit);
+                    break;
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(1)),
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = std::fs::remove_dir_all(&temporary_directory);
+                    return Err(error.to_string());
+                }
+            }
+        }
+    }
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
     let _ = std::fs::remove_dir_all(&temporary_directory);
     let line = result?;
     if line.len() > MAX_HOOK_OUTPUT {
         return Err("output exceeds limit".into());
+    }
+    let Some(status) = status else {
+        return Err("hook did not exit after closing stdout".into());
+    };
+    if !status.success() {
+        return Err(format!("hook exited with status {status}"));
     }
     if line.trim().is_empty() {
         return Ok(Value::Null);
@@ -595,5 +627,31 @@ mod tests {
             ),
             HookDecision::Deny(message) if message.contains("entrypoint changed")
         ));
+    }
+
+    #[test]
+    fn nonzero_hook_exit_is_a_failure() {
+        if !Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+        let hook = HookDefinition {
+            id: "failure".into(),
+            event: HookEvent::ToolDispatching,
+            kind: HookKind::Gate,
+            command: vec!["/usr/bin/false".into()],
+            timeout_ms: Some(1_000),
+            matcher: HookMatcher::default(),
+            entrypoint_fingerprint: None,
+        };
+        assert!(
+            invoke(
+                &hook,
+                HookEvent::ToolDispatching,
+                &json!({"arguments":{}}),
+                Path::new("/tmp")
+            )
+            .unwrap_err()
+            .contains("exited with status")
+        );
     }
 }

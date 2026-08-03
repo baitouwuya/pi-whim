@@ -1720,6 +1720,7 @@ fn resolve_interaction_for_owner(
         })
         .is_some_and(|kind| matches!(kind, InteractionKind::Approval));
     if resolving_permission
+        && decision == "approve"
         && matches!(
             host.hooks.gate(
                 HookEvent::PermissionResolving,
