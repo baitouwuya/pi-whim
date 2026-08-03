@@ -22,6 +22,7 @@ use pi_whim_core::{
     provider_name_key,
 };
 use rusqlite::{Connection, OptionalExtension, params};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -99,6 +100,44 @@ pub trait SearchEngineRepository {
         &self,
         profiles: &[SearchEngineProfile],
     ) -> Result<(), PersistenceError>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HookAuditEntry {
+    pub project_path: String,
+    pub hook_id: String,
+    pub event: String,
+    pub outcome: String,
+    pub duration_ms: u64,
+    pub revision: String,
+    pub created_at_ms: i64,
+}
+
+pub trait HookRepository {
+    fn trusted_hook_fingerprint(
+        &self,
+        project_path: &str,
+    ) -> Result<Option<String>, PersistenceError>;
+    fn approve_project_hooks(
+        &self,
+        project_path: &str,
+        fingerprint: &str,
+        approved_at_ms: i64,
+    ) -> Result<(), PersistenceError>;
+    fn revoke_project_hooks(&self, project_path: &str) -> Result<(), PersistenceError>;
+    fn append_hook_audit(&self, entry: &HookAuditEntry) -> Result<(), PersistenceError>;
+    fn recent_hook_audit(
+        &self,
+        project_path: &str,
+        limit: usize,
+    ) -> Result<Vec<HookAuditEntry>, PersistenceError>;
+}
+
+pub fn hook_manifest_fingerprint(source: &[u8]) -> String {
+    Sha256::digest(source)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 pub struct SqliteStore {
@@ -190,6 +229,23 @@ impl SqliteStore {
             );
             CREATE INDEX IF NOT EXISTS search_engine_profiles_position_idx
                 ON search_engine_profiles (position ASC, id ASC);
+            CREATE TABLE IF NOT EXISTS hook_project_trust (
+                project_path TEXT PRIMARY KEY NOT NULL,
+                fingerprint TEXT NOT NULL,
+                approved_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS hook_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_path TEXT NOT NULL,
+                hook_id TEXT NOT NULL,
+                event TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                duration_ms INTEGER NOT NULL,
+                revision TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS hook_audit_project_created_idx
+                ON hook_audit (project_path, created_at_ms DESC);
             ",
         )?;
         self.migrate_provider_names()?;
@@ -636,6 +692,88 @@ impl CredentialRepository for SqliteStore {
             [environment_name],
         )?;
         Ok(())
+    }
+}
+
+impl HookRepository for SqliteStore {
+    fn trusted_hook_fingerprint(
+        &self,
+        project_path: &str,
+    ) -> Result<Option<String>, PersistenceError> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT fingerprint FROM hook_project_trust WHERE project_path = ?1",
+                [project_path],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    fn approve_project_hooks(
+        &self,
+        project_path: &str,
+        fingerprint: &str,
+        approved_at_ms: i64,
+    ) -> Result<(), PersistenceError> {
+        self.connection.execute(
+            "INSERT INTO hook_project_trust (project_path, fingerprint, approved_at_ms)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(project_path) DO UPDATE SET fingerprint = excluded.fingerprint,
+             approved_at_ms = excluded.approved_at_ms",
+            params![project_path, fingerprint, approved_at_ms],
+        )?;
+        Ok(())
+    }
+
+    fn revoke_project_hooks(&self, project_path: &str) -> Result<(), PersistenceError> {
+        self.connection.execute(
+            "DELETE FROM hook_project_trust WHERE project_path = ?1",
+            [project_path],
+        )?;
+        Ok(())
+    }
+
+    fn append_hook_audit(&self, entry: &HookAuditEntry) -> Result<(), PersistenceError> {
+        self.connection.execute(
+            "INSERT INTO hook_audit
+             (project_path, hook_id, event, outcome, duration_ms, revision, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                entry.project_path,
+                entry.hook_id,
+                entry.event,
+                entry.outcome,
+                entry.duration_ms,
+                entry.revision,
+                entry.created_at_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn recent_hook_audit(
+        &self,
+        project_path: &str,
+        limit: usize,
+    ) -> Result<Vec<HookAuditEntry>, PersistenceError> {
+        let mut statement = self.connection.prepare(
+            "SELECT project_path, hook_id, event, outcome, duration_ms, revision, created_at_ms
+             FROM hook_audit WHERE project_path = ?1 ORDER BY created_at_ms DESC, id DESC LIMIT ?2",
+        )?;
+        Ok(statement
+            .query_map(params![project_path, limit.min(500) as i64], |row| {
+                Ok(HookAuditEntry {
+                    project_path: row.get(0)?,
+                    hook_id: row.get(1)?,
+                    event: row.get(2)?,
+                    outcome: row.get(3)?,
+                    duration_ms: row.get(4)?,
+                    revision: row.get(5)?,
+                    created_at_ms: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
     }
 }
 
@@ -1242,5 +1380,55 @@ mod tests {
             .find(|profile| profile.id == newest)
             .map(|profile| profile.name.as_str());
         assert_eq!(newest_name, Some("GATEWAY"));
+    }
+
+    #[test]
+    fn project_hook_trust_is_bound_to_the_manifest_fingerprint() {
+        let directory = tempdir().unwrap();
+        let store = SqliteStore::open(directory.path().join("test.sqlite")).unwrap();
+        let fingerprint = hook_manifest_fingerprint(br#"{"version":1,"hooks":[]}"#);
+        assert_eq!(fingerprint.len(), 64);
+        assert_eq!(store.trusted_hook_fingerprint("/project").unwrap(), None);
+
+        store
+            .approve_project_hooks("/project", &fingerprint, 42)
+            .unwrap();
+        assert_eq!(
+            store.trusted_hook_fingerprint("/project").unwrap(),
+            Some(fingerprint)
+        );
+        store.revoke_project_hooks("/project").unwrap();
+        assert_eq!(store.trusted_hook_fingerprint("/project").unwrap(), None);
+    }
+
+    #[test]
+    fn hook_audit_is_bounded_and_contains_no_payload_column() {
+        let directory = tempdir().unwrap();
+        let store = SqliteStore::open(directory.path().join("test.sqlite")).unwrap();
+        for created_at_ms in 1..=3 {
+            store
+                .append_hook_audit(&HookAuditEntry {
+                    project_path: "/project".into(),
+                    hook_id: "policy".into(),
+                    event: "tool_dispatching".into(),
+                    outcome: "allowed".into(),
+                    duration_ms: 2,
+                    revision: "sha256:test".into(),
+                    created_at_ms,
+                })
+                .unwrap();
+        }
+        let entries = store.recent_hook_audit("/project", 2).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].created_at_ms, 3);
+        let columns = store
+            .connection
+            .prepare("PRAGMA table_info(hook_audit)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(!columns.iter().any(|column| column == "payload"));
     }
 }
