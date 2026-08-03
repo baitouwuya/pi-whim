@@ -1180,6 +1180,83 @@ pub fn normalize_bash_patterns(patterns: Vec<String>) -> Vec<String> {
 mod tests {
     use super::*;
 
+    fn valid_hook(id: impl Into<String>, event: HookEvent, kind: HookKind) -> HookDefinition {
+        HookDefinition {
+            id: id.into(),
+            event,
+            kind,
+            command: vec!["/usr/bin/true".into()],
+            timeout_ms: None,
+            matcher: HookMatcher::default(),
+            entrypoint_fingerprint: None,
+        }
+    }
+
+    #[test]
+    fn hook_manifest_defaults_gate_kind_for_gate_events() {
+        let config: HookConfig = serde_json::from_value(serde_json::json!({
+            "hooks": [{
+                "id": "default-gate",
+                "event": "tool_dispatching",
+                "command": ["/usr/bin/true"]
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(config.hooks[0].kind, HookKind::Gate);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn hook_manifest_rejects_event_phase_mismatches() {
+        let mut config = HookConfig {
+            hooks: vec![valid_hook(
+                "observe-as-gate",
+                HookEvent::SupervisorStarted,
+                HookKind::Gate,
+            )],
+            ..HookConfig::default()
+        };
+        assert!(config.validate().is_err());
+
+        config.hooks = vec![valid_hook(
+            "permission-transform",
+            HookEvent::PermissionResolving,
+            HookKind::Transform,
+        )];
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn hook_manifest_enforces_collection_and_command_limits() {
+        let mut config = HookConfig {
+            hooks: (0..65)
+                .map(|index| {
+                    valid_hook(
+                        format!("hook-{index}"),
+                        HookEvent::ToolDispatching,
+                        HookKind::Gate,
+                    )
+                })
+                .collect(),
+            ..HookConfig::default()
+        };
+        assert!(config.validate().is_err());
+
+        config.hooks =
+            vec![valid_hook("duplicate", HookEvent::ToolDispatching, HookKind::Gate,); 2];
+        assert!(config.validate().is_err());
+
+        let mut oversized = valid_hook(
+            "oversized-command",
+            HookEvent::ToolDispatching,
+            HookKind::Gate,
+        );
+        oversized.command.push("x".repeat(4 * 1024 + 1));
+        config.hooks = vec![oversized];
+        assert!(config.validate().is_err());
+    }
+
     #[test]
     fn prefix_never_splits_a_grapheme() {
         assert_eq!(grapheme_prefix("A👨‍👩‍👧‍👦B", 2), "A👨‍👩‍👧‍👦");

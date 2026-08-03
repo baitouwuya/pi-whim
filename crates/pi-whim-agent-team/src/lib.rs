@@ -3361,6 +3361,7 @@ impl HostError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pi_whim_core::{HookAuditOutcome, HookDefinition, HookKind, HookMatcher};
     use std::sync::{Barrier, mpsc};
 
     #[test]
@@ -3527,6 +3528,86 @@ mod tests {
         assert!(response.is_error);
         assert_eq!(response.error_code.as_deref(), Some("unauthorized"));
         supervisor.stop().unwrap();
+    }
+
+    #[test]
+    fn supervisor_lifecycle_hooks_are_audited_and_cannot_block_stop() {
+        if !std::path::Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let hook = |id: &str, event: HookEvent, command: &str| HookDefinition {
+            id: id.into(),
+            event,
+            kind: HookKind::Observe,
+            command: vec![command.into(), "{}".into()],
+            timeout_ms: Some(1_000),
+            matcher: HookMatcher::default(),
+            entrypoint_fingerprint: None,
+        };
+        let hooks = HookConfig {
+            version: 1,
+            revision: "sha256:lifecycle".into(),
+            hooks: vec![
+                hook(
+                    "supervisor-started",
+                    HookEvent::SupervisorStarted,
+                    "/bin/echo",
+                ),
+                hook(
+                    "session-published",
+                    HookEvent::SessionPublished,
+                    "/bin/echo",
+                ),
+                hook(
+                    "supervisor-stopping",
+                    HookEvent::SupervisorStopping,
+                    "/bin/echo",
+                ),
+                hook(
+                    "failing-finalize",
+                    HookEvent::SupervisorStopping,
+                    "/usr/bin/false",
+                ),
+                hook("session-expired", HookEvent::SessionExpired, "/bin/echo"),
+            ],
+        };
+        let mut supervisor = AgentSupervisor::start(AgentLaunchConfig {
+            executable: PathBuf::from("/missing/pi"),
+            project_path: directory.path().to_path_buf(),
+            sessions_path: directory.path().to_path_buf(),
+            extension_paths: Vec::new(),
+            environment: HashMap::new(),
+            team_config: AgentTeamConfig::default(),
+            search_engines: Vec::new(),
+            search_engine_api_keys: SearchEngineApiKeys::default(),
+            hooks,
+        })
+        .unwrap();
+        let audits = supervisor.take_hook_audit_events().unwrap();
+
+        let started = audits.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(started.hook_id, "supervisor-started");
+        assert_eq!(started.event, HookEvent::SupervisorStarted);
+        assert_eq!(started.outcome, HookAuditOutcome::Succeeded);
+        let published = audits.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(published.hook_id, "session-published");
+        assert_eq!(published.event, HookEvent::SessionPublished);
+        assert_eq!(published.outcome, HookAuditOutcome::Succeeded);
+
+        supervisor.stop().unwrap();
+        let stopping = audits.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(stopping.hook_id, "supervisor-stopping");
+        assert_eq!(stopping.event, HookEvent::SupervisorStopping);
+        assert_eq!(stopping.outcome, HookAuditOutcome::Succeeded);
+        let failed = audits.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(failed.hook_id, "failing-finalize");
+        assert_eq!(failed.event, HookEvent::SupervisorStopping);
+        assert_eq!(failed.outcome, HookAuditOutcome::Failed);
+        let expired = audits.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(expired.hook_id, "session-expired");
+        assert_eq!(expired.event, HookEvent::SessionExpired);
+        assert_eq!(expired.outcome, HookAuditOutcome::Succeeded);
     }
 
     #[test]

@@ -612,6 +612,7 @@ fn sandbox_profile(project_root: &Path, temporary_directory: &Path, program: &Pa
 mod tests {
     use super::*;
     use pi_whim_core::HookMatcher;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn non_matching_hooks_are_skipped() {
@@ -768,6 +769,51 @@ mod tests {
             .unwrap_err()
             .contains("exited with status")
         );
+    }
+
+    #[test]
+    fn sandbox_allows_project_reads_but_denies_project_writes() {
+        if !Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let blocked = directory.path().join("blocked");
+        let script = directory.path().join("hook.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho denied > \"{}\"\nprintf '{{}}\\n'\n",
+                blocked.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let hook = HookDefinition {
+            id: "sandbox-write".into(),
+            event: HookEvent::ToolDispatching,
+            kind: HookKind::Gate,
+            command: vec![script.to_string_lossy().into_owned()],
+            timeout_ms: Some(1_000),
+            matcher: HookMatcher::default(),
+            entrypoint_fingerprint: None,
+        };
+        assert_eq!(
+            invoke(
+                &hook,
+                HookEvent::ToolDispatching,
+                &json!({"arguments":{}}),
+                directory.path()
+            )
+            .unwrap(),
+            json!({})
+        );
+        assert!(!blocked.exists());
+
+        let profile = sandbox_profile(directory.path(), directory.path(), &script);
+        assert!(!profile.contains("network"));
     }
 
     #[test]
