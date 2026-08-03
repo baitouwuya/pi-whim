@@ -109,6 +109,7 @@ pub struct HookAuditEntry {
     pub event: String,
     pub outcome: String,
     pub duration_ms: u64,
+    pub output_truncated: bool,
     pub revision: String,
     pub created_at_ms: i64,
 }
@@ -241,6 +242,7 @@ impl SqliteStore {
                 event TEXT NOT NULL,
                 outcome TEXT NOT NULL,
                 duration_ms INTEGER NOT NULL,
+                output_truncated INTEGER NOT NULL DEFAULT 0,
                 revision TEXT NOT NULL,
                 created_at_ms INTEGER NOT NULL
             );
@@ -252,6 +254,7 @@ impl SqliteStore {
         self.migrate_bash_preferences()?;
         self.migrate_agent_team_preferences()?;
         self.migrate_session_title_sources()?;
+        self.migrate_hook_audit()?;
         Ok(())
     }
 
@@ -301,6 +304,21 @@ impl SqliteStore {
         if !columns.iter().any(|column| column == "ai_title") {
             self.connection
                 .execute("ALTER TABLE sessions ADD COLUMN ai_title TEXT", [])?;
+        }
+        Ok(())
+    }
+
+    fn migrate_hook_audit(&self) -> Result<(), PersistenceError> {
+        let columns = self
+            .connection
+            .prepare("PRAGMA table_info(hook_audit)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !columns.iter().any(|column| column == "output_truncated") {
+            self.connection.execute(
+                "ALTER TABLE hook_audit ADD COLUMN output_truncated INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
         }
         Ok(())
     }
@@ -737,14 +755,15 @@ impl HookRepository for SqliteStore {
     fn append_hook_audit(&self, entry: &HookAuditEntry) -> Result<(), PersistenceError> {
         self.connection.execute(
             "INSERT INTO hook_audit
-             (project_path, hook_id, event, outcome, duration_ms, revision, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             (project_path, hook_id, event, outcome, duration_ms, output_truncated, revision, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 entry.project_path,
                 entry.hook_id,
                 entry.event,
                 entry.outcome,
                 entry.duration_ms,
+                entry.output_truncated,
                 entry.revision,
                 entry.created_at_ms,
             ],
@@ -758,7 +777,7 @@ impl HookRepository for SqliteStore {
         limit: usize,
     ) -> Result<Vec<HookAuditEntry>, PersistenceError> {
         let mut statement = self.connection.prepare(
-            "SELECT project_path, hook_id, event, outcome, duration_ms, revision, created_at_ms
+            "SELECT project_path, hook_id, event, outcome, duration_ms, output_truncated, revision, created_at_ms
              FROM hook_audit WHERE project_path = ?1 ORDER BY created_at_ms DESC, id DESC LIMIT ?2",
         )?;
         Ok(statement
@@ -769,8 +788,9 @@ impl HookRepository for SqliteStore {
                     event: row.get(2)?,
                     outcome: row.get(3)?,
                     duration_ms: row.get(4)?,
-                    revision: row.get(5)?,
-                    created_at_ms: row.get(6)?,
+                    output_truncated: row.get(5)?,
+                    revision: row.get(6)?,
+                    created_at_ms: row.get(7)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?)
@@ -1413,6 +1433,7 @@ mod tests {
                     event: "tool_dispatching".into(),
                     outcome: "allowed".into(),
                     duration_ms: 2,
+                    output_truncated: false,
                     revision: "sha256:test".into(),
                     created_at_ms,
                 })

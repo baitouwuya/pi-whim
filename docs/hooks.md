@@ -49,6 +49,10 @@ output is ignored.
 Gate events fail closed on launch, timeout, oversized output, or invalid JSON. Observe
 events are best effort. Hook output is limited to 64 KiB.
 
+Each invocation writes bounded audit metadata to SQLite: hook ID, event, outcome,
+duration, output-truncation flag, configuration revision, and timestamp. Arguments,
+message bodies, credentials, capabilities, and raw command output are never persisted.
+
 ## Events
 
 - Gates: `tool_dispatching`, `agent_spawning`, `message_sending`,

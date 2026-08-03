@@ -282,6 +282,8 @@ pub struct HookConfig {
     pub version: u32,
     #[serde(default)]
     pub hooks: Vec<HookDefinition>,
+    #[serde(skip)]
+    pub revision: String,
 }
 
 impl Default for HookConfig {
@@ -289,8 +291,29 @@ impl Default for HookConfig {
         Self {
             version: hook_manifest_version(),
             hooks: Vec::new(),
+            revision: String::new(),
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookAuditRecord {
+    pub hook_id: String,
+    pub event: HookEvent,
+    pub outcome: HookAuditOutcome,
+    pub duration_ms: u64,
+    pub output_truncated: bool,
+    pub revision: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookAuditOutcome {
+    Allowed,
+    Denied,
+    Succeeded,
+    Failed,
+    TimedOut,
 }
 
 impl HookConfig {

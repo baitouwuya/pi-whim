@@ -38,8 +38,9 @@ use model::{
     SessionSnapshot, SpawnAgentArguments, TargetArguments, TeamState, WaitAgentArguments,
 };
 use pi_whim_core::{
-    AgentModelSelection, AgentPermissionLevel, AgentPermissionPolicy, AgentTeamConfig, HookConfig,
-    HookEvent, SearchEngineId, SearchEngineProfile, normalize_agent_policy, stable_session_id,
+    AgentModelSelection, AgentPermissionLevel, AgentPermissionPolicy, AgentTeamConfig,
+    HookAuditRecord, HookConfig, HookEvent, SearchEngineId, SearchEngineProfile,
+    normalize_agent_policy, stable_session_id,
 };
 use pi_whim_tool_protocol::{
     ASK_USER_TOOL, BASH_TOOL, EDIT_FILE_TOOL, FETCH_TOOL, INTERRUPT_AGENT_TOOL, LIST_AGENTS_TOOL,
@@ -181,6 +182,7 @@ pub struct AgentSupervisor {
     root_id: AgentId,
     root_capability: String,
     interaction_receiver: Option<std::sync::mpsc::Receiver<Value>>,
+    hook_audit_receiver: Option<std::sync::mpsc::Receiver<HookAuditRecord>>,
     stopping: Arc<AtomicBool>,
     server_thread: Option<JoinHandle<()>>,
 }
@@ -246,9 +248,11 @@ impl AgentSupervisor {
         }
         let files = file_dispatch::FileCoordinator::for_project(launch.project_path.clone());
         let (interaction_sender, interaction_receiver) = std::sync::mpsc::channel();
+        let (hook_audit_sender, hook_audit_receiver) = std::sync::mpsc::channel();
         let hooks = Arc::new(hooks::HookDispatcher::new(
             launch.hooks.clone(),
             launch.project_path.clone(),
+            hook_audit_sender,
         ));
         let host = HostContext {
             shared,
@@ -267,6 +271,7 @@ impl AgentSupervisor {
             root_id,
             root_capability,
             interaction_receiver: Some(interaction_receiver),
+            hook_audit_receiver: Some(hook_audit_receiver),
             stopping,
             server_thread,
         })
@@ -300,6 +305,10 @@ impl AgentSupervisor {
     /// root model. There is only one UI consumer for a supervisor.
     pub fn take_interaction_events(&mut self) -> Option<std::sync::mpsc::Receiver<Value>> {
         self.interaction_receiver.take()
+    }
+
+    pub fn take_hook_audit_events(&mut self) -> Option<std::sync::mpsc::Receiver<HookAuditRecord>> {
+        self.hook_audit_receiver.take()
     }
 
     /// Resolve an interaction from the native L0 UI. This intentionally does

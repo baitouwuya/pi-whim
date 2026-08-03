@@ -13,21 +13,21 @@ use std::{
 
 use pi_whim_core::{
     Action, AgentPermissionLevel, AppState, Attachment, ConversationItem, ConversationRole,
-    HookConfig, Language, ModelOption, Project, ProjectHookStatus, ProjectId, ProviderId,
-    ProviderProfile, ProviderProtocol, QueueMode, SESSION_TITLE_TASK_KIND, SearchEngineId,
-    SearchEngineProfile, SessionMetrics, SessionStatus, SessionSummary, SubmitMode, ThinkingLevel,
-    normalize_bash_patterns, normalize_provider_display_name, provider_name_key, stable_session_id,
-    strings,
+    HookAuditRecord, HookConfig, Language, ModelOption, Project, ProjectHookStatus, ProjectId,
+    ProviderId, ProviderProfile, ProviderProtocol, QueueMode, SESSION_TITLE_TASK_KIND,
+    SearchEngineId, SearchEngineProfile, SessionMetrics, SessionStatus, SessionSummary, SubmitMode,
+    ThinkingLevel, normalize_bash_patterns, normalize_provider_display_name, provider_name_key,
+    stable_session_id, strings,
 };
 use pi_whim_one_shot_ai::{
     OneShotAiService, OneShotCompletion, OneShotErrorKind, OneShotRequestId,
     ResolvedOneShotAiConfig, SessionHistoryTitleTask, SessionTitleTask, fallback_session_title,
 };
 use pi_whim_persistence::{
-    AppPreferences, AttachmentStore, HookRepository, MacosKeychainStore, PreferencesRepository,
-    ProjectRepository, ProviderRepository, SearchEngineRepository, SecretStore, SessionRepository,
-    SqliteStore, hook_manifest_fingerprint, persist_session_title_to_jsonl,
-    session_summary_from_jsonl,
+    AppPreferences, AttachmentStore, HookAuditEntry, HookRepository, MacosKeychainStore,
+    PreferencesRepository, ProjectRepository, ProviderRepository, SearchEngineRepository,
+    SecretStore, SessionRepository, SqliteStore, hook_manifest_fingerprint,
+    persist_session_title_to_jsonl, session_summary_from_jsonl,
 };
 use pi_whim_runtime::{AgentRuntime, PiRpcRuntime, RuntimeEvent, RuntimeStart};
 use serde_json::{Value, json};
@@ -1315,10 +1315,8 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         let mut runtime = (self.runtime_factory)();
         let project_path = project.path.clone();
         let hooks = self.load_hooks(&project_path);
-        self.hook_revisions.insert(
-            project_id,
-            hook_manifest_fingerprint(&serde_json::to_vec(&hooks).unwrap_or_default()),
-        );
+        self.hook_revisions
+            .insert(project_id, hooks.revision.clone());
         if let Err(error) = runtime.start(RuntimeStart {
             project_path,
             sessions_path: sessions_path.to_string_lossy().into_owned(),
@@ -1417,6 +1415,10 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             self.notices.error(error);
             return HookConfig::default();
         }
+        config.revision = format!(
+            "sha256:{}",
+            hook_manifest_fingerprint(&serde_json::to_vec(&config).unwrap_or_default())
+        );
         self.apply(Action::SetProjectHookStatus(ProjectHookStatus::Approved {
             fingerprint,
             hook_count,
@@ -1436,7 +1438,12 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         match fs::read_to_string(&path) {
             Ok(source) => match serde_json::from_str::<HookConfig>(&source) {
                 Ok(config) => match config.validate() {
-                    Ok(()) => config,
+                    Ok(()) => {
+                        let mut config = config;
+                        config.revision =
+                            format!("sha256:{}", hook_manifest_fingerprint(source.as_bytes()));
+                        config
+                    }
                     Err(error) => {
                         self.notices
                             .error(format!("invalid hook manifest {}: {error}", path.display()));
@@ -2687,6 +2694,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 self.prompts
                     .extend(dialogs::Prompt::from_interaction(key, &value));
             }
+            RuntimeEvent::HookAudit(record) => self.persist_hook_audit(key, record),
             RuntimeEvent::Stderr(message) => {
                 if is_active && !message.trim().is_empty() {
                     self.notices.error(message);
@@ -2723,6 +2731,39 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 }
             }
             RuntimeEvent::RpcResponse(_) => {}
+        }
+    }
+
+    fn persist_hook_audit(&mut self, session_key: &str, record: HookAuditRecord) {
+        let Some(project) = self
+            .sessions
+            .get(session_key)
+            .and_then(|session| self.find_project(session.project_id))
+        else {
+            return;
+        };
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        let event = serde_json::to_value(record.event)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "unknown".into());
+        let outcome = serde_json::to_value(record.outcome)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "failed".into());
+        if let Err(error) = store.append_hook_audit(&HookAuditEntry {
+            project_path: project.path,
+            hook_id: record.hook_id,
+            event,
+            outcome,
+            duration_ms: record.duration_ms,
+            output_truncated: record.output_truncated,
+            revision: record.revision,
+            created_at_ms: now_ms(),
+        }) {
+            self.notices.error(error.to_string());
         }
     }
 
@@ -2867,7 +2908,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             return false;
         };
         let config = self.load_hooks(&project.path);
-        let revision = hook_manifest_fingerprint(&serde_json::to_vec(&config).unwrap_or_default());
+        let revision = config.revision;
         if self.hook_revisions.get(&project.id) == Some(&revision) {
             return false;
         }

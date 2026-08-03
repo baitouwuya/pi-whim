@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use pi_whim_core::{HookConfig, HookDefinition, HookEvent};
+use pi_whim_core::{HookAuditOutcome, HookAuditRecord, HookConfig, HookDefinition, HookEvent};
 use serde_json::{Value, json};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -19,6 +19,8 @@ const MAX_HOOK_OUTPUT: usize = 64 * 1024;
 pub(crate) struct HookDispatcher {
     hooks: Vec<HookDefinition>,
     project_root: PathBuf,
+    audit_sender: mpsc::Sender<HookAuditRecord>,
+    revision: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -28,10 +30,16 @@ pub(crate) enum HookDecision {
 }
 
 impl HookDispatcher {
-    pub(crate) fn new(config: HookConfig, project_root: PathBuf) -> Self {
+    pub(crate) fn new(
+        config: HookConfig,
+        project_root: PathBuf,
+        audit_sender: mpsc::Sender<HookAuditRecord>,
+    ) -> Self {
         Self {
+            revision: config.revision.clone(),
             hooks: config.hooks,
             project_root,
+            audit_sender,
         }
     }
 
@@ -39,8 +47,16 @@ impl HookDispatcher {
         let mut payload = payload;
         let hooks = self.matching(event, &payload).cloned().collect::<Vec<_>>();
         for hook in &hooks {
+            let started = std::time::Instant::now();
             match invoke(hook, event, &payload, &self.project_root) {
                 Ok(result) if result.get("decision").and_then(Value::as_str) == Some("deny") => {
+                    self.audit(
+                        hook,
+                        event,
+                        HookAuditOutcome::Denied,
+                        started.elapsed(),
+                        false,
+                    );
                     return HookDecision::Deny(
                         result
                             .get("message")
@@ -50,12 +66,30 @@ impl HookDispatcher {
                     );
                 }
                 Ok(result) => {
+                    self.audit(
+                        hook,
+                        event,
+                        HookAuditOutcome::Allowed,
+                        started.elapsed(),
+                        false,
+                    );
                     if let Some(arguments) = result.get("arguments") {
                         payload["arguments"] = arguments.clone();
                     }
                 }
                 // Gates fail closed: hooks used to enforce a rule must be available.
                 Err(error) => {
+                    self.audit(
+                        hook,
+                        event,
+                        if error == "timed out" {
+                            HookAuditOutcome::TimedOut
+                        } else {
+                            HookAuditOutcome::Failed
+                        },
+                        started.elapsed(),
+                        error == "output exceeds limit",
+                    );
                     return HookDecision::Deny(format!("hook {} failed: {error}", hook.id));
                 }
             }
@@ -66,14 +100,40 @@ impl HookDispatcher {
     pub(crate) fn observe(&self, event: HookEvent, payload: Value) {
         let hooks = self.matching(event, &payload).cloned().collect::<Vec<_>>();
         let project_root = self.project_root.clone();
+        let dispatcher = self.clone();
         for hook in &hooks {
             let hook = hook.clone();
             let payload = payload.clone();
             let project_root = project_root.clone();
+            let dispatcher = dispatcher.clone();
             thread::spawn(move || {
-                let _ = invoke(&hook, event, &payload, &project_root);
+                let started = std::time::Instant::now();
+                let (outcome, truncated) = match invoke(&hook, event, &payload, &project_root) {
+                    Ok(_) => (HookAuditOutcome::Succeeded, false),
+                    Err(error) if error == "timed out" => (HookAuditOutcome::TimedOut, false),
+                    Err(error) => (HookAuditOutcome::Failed, error == "output exceeds limit"),
+                };
+                dispatcher.audit(&hook, event, outcome, started.elapsed(), truncated);
             });
         }
+    }
+
+    fn audit(
+        &self,
+        hook: &HookDefinition,
+        event: HookEvent,
+        outcome: HookAuditOutcome,
+        duration: Duration,
+        output_truncated: bool,
+    ) {
+        let _ = self.audit_sender.send(HookAuditRecord {
+            hook_id: hook.id.clone(),
+            event,
+            outcome,
+            duration_ms: duration.as_millis().min(u128::from(u64::MAX)) as u64,
+            output_truncated,
+            revision: self.revision.clone(),
+        });
     }
 
     fn matching(&self, event: HookEvent, payload: &Value) -> impl Iterator<Item = &HookDefinition> {
@@ -198,6 +258,7 @@ mod tests {
         let dispatcher = HookDispatcher::new(
             HookConfig {
                 version: 1,
+                revision: String::new(),
                 hooks: vec![HookDefinition {
                     id: "only-bash".into(),
                     event: HookEvent::ToolDispatching,
@@ -210,6 +271,7 @@ mod tests {
                 }],
             },
             PathBuf::from("/tmp"),
+            mpsc::channel().0,
         );
         assert_eq!(
             dispatcher.gate(HookEvent::ToolDispatching, json!({"tool":"read"})),
@@ -222,9 +284,11 @@ mod tests {
         if !Path::new("/usr/bin/sandbox-exec").is_file() {
             return;
         }
+        let (audit_sender, audit_receiver) = mpsc::channel();
         let dispatcher = HookDispatcher::new(
             HookConfig {
                 version: 1,
+                revision: "sha256:test".into(),
                 hooks: vec![HookDefinition {
                     id: "deny".into(),
                     event: HookEvent::ToolDispatching,
@@ -237,6 +301,7 @@ mod tests {
                 }],
             },
             PathBuf::from("/tmp"),
+            audit_sender,
         );
         assert_eq!(
             dispatcher.gate(
@@ -245,5 +310,8 @@ mod tests {
             ),
             HookDecision::Deny("policy".into())
         );
+        let audit = audit_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(audit.outcome, HookAuditOutcome::Denied);
+        assert_eq!(audit.revision, "sha256:test");
     }
 }

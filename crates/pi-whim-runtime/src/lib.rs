@@ -12,7 +12,9 @@ use std::{
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use pi_whim_agent_team::{AgentLaunchConfig, AgentSupervisor};
 pub use pi_whim_agent_team::{SearchEngineApiKeys, test_search_engine};
-use pi_whim_core::{AgentPermissionLevel, AgentTeamConfig, HookConfig, SearchEngineProfile};
+use pi_whim_core::{
+    AgentPermissionLevel, AgentTeamConfig, HookAuditRecord, HookConfig, SearchEngineProfile,
+};
 use pi_whim_pi_rpc::{PiLaunch, PiRpcClient, PiRpcEvent, RpcError};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -51,6 +53,7 @@ pub enum RuntimeEvent {
     RpcResponse(Value),
     ExtensionUi(Value),
     Interaction(Value),
+    HookAudit(HookAuditRecord),
     Stderr(String),
     Exited { generation: u64, code: Option<i32> },
     Error(String),
@@ -217,6 +220,17 @@ impl PiRpcRuntime {
         });
     }
 
+    fn forward_hook_audit(&self, receiver: std::sync::mpsc::Receiver<HookAuditRecord>) {
+        let sender = self.event_sender.clone();
+        thread::spawn(move || {
+            for record in receiver {
+                if sender.send(RuntimeEvent::HookAudit(record)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
     fn advance_generation(&mut self) {
         self.generation = self.generation.wrapping_add(1);
     }
@@ -245,6 +259,9 @@ impl AgentRuntime for PiRpcRuntime {
         .map_err(|error| RuntimeError::AgentSupervisor(error.to_string()))?;
         if let Some(interactions) = supervisor.take_interaction_events() {
             self.forward_interactions(interactions);
+        }
+        if let Some(audit) = supervisor.take_hook_audit_events() {
+            self.forward_hook_audit(audit);
         }
         let mut launch = PiLaunch::new(executable.to_string_lossy(), &config.project_path);
         launch
