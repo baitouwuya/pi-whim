@@ -479,6 +479,8 @@ fn invoke(
     payload: &Value,
     project_root: &Path,
 ) -> Result<Value, String> {
+    let project_root =
+        std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
     let (program, arguments) = hook
         .command
         .split_first()
@@ -487,30 +489,49 @@ fn invoke(
     if !program.is_file() {
         return Err("command is not an existing file".into());
     }
-    if let Some(expected) = hook.entrypoint_fingerprint.as_deref() {
+    let approved_entrypoint = if let Some(expected) = hook.entrypoint_fingerprint.as_deref() {
         let content = std::fs::read(program).map_err(|error| error.to_string())?;
-        let actual = Sha256::digest(content)
+        let actual = Sha256::digest(&content)
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
         if actual != expected {
             return Err("approved command entrypoint changed".into());
         }
-    }
+        let permissions = std::fs::metadata(program)
+            .map_err(|error| error.to_string())?
+            .permissions();
+        Some((content, permissions))
+    } else {
+        None
+    };
     if !Path::new("/usr/bin/sandbox-exec").is_file() {
         return Err("sandbox-exec is unavailable".into());
     }
     let temporary_directory =
         std::env::temp_dir().join(format!("pi-whim-hook-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&temporary_directory).map_err(|error| error.to_string())?;
-    let profile = sandbox_profile(project_root, &temporary_directory, program);
+    let execution_program = if let Some((content, permissions)) = approved_entrypoint {
+        let staged = temporary_directory.join("approved-entrypoint");
+        if let Err(error) = std::fs::write(&staged, content)
+            .and_then(|()| std::fs::set_permissions(&staged, permissions))
+        {
+            let _ = std::fs::remove_dir_all(&temporary_directory);
+            return Err(error.to_string());
+        }
+        staged
+    } else {
+        program.to_path_buf()
+    };
+    let profile = sandbox_profile(&project_root, &temporary_directory, program);
     let mut child = match Command::new("/usr/bin/sandbox-exec")
         .args(["-p", &profile])
-        .arg(program)
+        .arg(&execution_program)
         .args(arguments)
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("TMPDIR", &temporary_directory)
+        .current_dir(&project_root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -522,7 +543,14 @@ fn invoke(
             return Err(error.to_string());
         }
     };
-    let request = json!({"version": 1, "event": event, "payload": payload});
+    let request = json!({
+        "version": 1,
+        "hook_id": hook.id,
+        "event": event,
+        "entrypoint": program,
+        "project_root": project_root,
+        "payload": payload
+    });
     let result = (|| {
         child
             .stdin
@@ -629,10 +657,11 @@ fn sandbox_profile(project_root: &Path, temporary_directory: &Path, program: &Pa
     let program = std::fs::canonicalize(program).unwrap_or_else(|_| program.to_path_buf());
     let program_dir = program.parent().unwrap_or(&program);
     format!(
-        "(version 1) (deny default) (import \"system.sb\") (allow process*) (allow file-read* (subpath \"{}\") (subpath \"{}\") (subpath \"{}\") (subpath \"/usr\") (subpath \"/bin\") (subpath \"/sbin\") (subpath \"/System\") (subpath \"/dev\")) (allow file-write* (subpath \"{}\"))",
+        "(version 1) (deny default) (import \"system.sb\") (allow process*) (allow file-read* (subpath \"{}\") (subpath \"{}\") (subpath \"{}\") (subpath \"{}\") (subpath \"/usr\") (subpath \"/bin\") (subpath \"/sbin\") (subpath \"/System\") (subpath \"/dev\")) (allow file-write* (subpath \"{}\"))",
         quoted(&project_root),
         quoted(program_dir),
         quoted(&program),
+        quoted(&temporary_directory),
         quoted(&temporary_directory)
     )
 }
@@ -642,6 +671,13 @@ mod tests {
     use super::*;
     use pi_whim_core::HookMatcher;
     use std::os::unix::fs::PermissionsExt;
+
+    fn write_executable(path: &Path, content: &str) {
+        std::fs::write(path, content).unwrap();
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
 
     #[test]
     fn non_matching_hooks_are_skipped() {
@@ -876,17 +912,13 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let blocked = directory.path().join("blocked");
         let script = directory.path().join("hook.sh");
-        std::fs::write(
+        write_executable(
             &script,
-            format!(
+            &format!(
                 "#!/bin/sh\necho denied > \"{}\"\nprintf '{{}}\\n'\n",
                 blocked.display()
             ),
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&script, permissions).unwrap();
+        );
 
         let hook = HookDefinition {
             id: "sandbox-write".into(),
@@ -911,6 +943,90 @@ mod tests {
 
         let profile = sandbox_profile(directory.path(), directory.path(), &script);
         assert!(!profile.contains("network"));
+    }
+
+    #[test]
+    fn hook_envelope_identifies_hook_entrypoint_and_project() {
+        if !Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let project_root = std::fs::canonicalize(directory.path()).unwrap();
+        let script = directory.path().join("envelope.sh");
+        write_executable(
+            &script,
+            r#"#!/bin/sh
+read request
+[ "$PWD" = "$1" ] || exit 10
+printf '%s' "$request" | /usr/bin/grep -F '"hook_id":"envelope"' >/dev/null || exit 11
+printf '%s' "$request" | /usr/bin/grep -F '"entrypoint":' >/dev/null || exit 12
+printf '%s' "$request" | /usr/bin/grep -F '"project_root":' >/dev/null || exit 13
+printf '{}\n'
+"#,
+        );
+        let hook = HookDefinition {
+            id: "envelope".into(),
+            event: HookEvent::ToolDispatching,
+            kind: HookKind::Gate,
+            command: vec![
+                script.to_string_lossy().into_owned(),
+                project_root.to_string_lossy().into_owned(),
+            ],
+            timeout_ms: Some(1_000),
+            matcher: HookMatcher::default(),
+            entrypoint_fingerprint: None,
+        };
+
+        assert_eq!(
+            invoke(
+                &hook,
+                HookEvent::ToolDispatching,
+                &json!({"arguments":{}}),
+                &project_root
+            )
+            .unwrap(),
+            json!({})
+        );
+    }
+
+    #[test]
+    fn approved_entrypoints_execute_from_the_verified_snapshot() {
+        if !Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("approved.sh");
+        let content = r#"#!/bin/sh
+case "$0" in
+  */pi-whim-hook-*/approved-entrypoint) printf '{"decision":"allow"}\n' ;;
+  *) exit 12 ;;
+esac
+"#;
+        write_executable(&script, content);
+        let fingerprint = Sha256::digest(content.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let hook = HookDefinition {
+            id: "approved".into(),
+            event: HookEvent::ToolDispatching,
+            kind: HookKind::Gate,
+            command: vec![script.to_string_lossy().into_owned()],
+            timeout_ms: Some(1_000),
+            matcher: HookMatcher::default(),
+            entrypoint_fingerprint: Some(fingerprint),
+        };
+
+        assert_eq!(
+            invoke(
+                &hook,
+                HookEvent::ToolDispatching,
+                &json!({"arguments":{}}),
+                directory.path()
+            )
+            .unwrap(),
+            json!({"decision":"allow"})
+        );
     }
 
     #[test]

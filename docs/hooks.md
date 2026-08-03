@@ -43,15 +43,18 @@ by approved project hooks, in their respective Manifest order. Duplicate IDs acr
 merged configuration invalidate the merged set.
 
 Approved project entrypoints are hashed again immediately before every invocation. A
-post-launch replacement therefore follows the Hook kind's failure policy and cannot run
-under a stale approval.
+post-launch replacement therefore follows the Hook kind's failure policy. The verified
+bytes are copied into the invocation's private temporary directory and that snapshot is
+executed, closing the replacement window between verification and process launch.
 
 ## Protocol
 
-The command receives one JSON document on stdin:
+The command runs with the project root as its working directory and receives one JSON
+document on stdin. `entrypoint` is the configured path even when an approved project
+entrypoint is executed from a verified per-invocation snapshot:
 
 ```json
-{"version":1,"event":"tool_dispatching","payload":{"tool":"bash","agent_id":"...","agent_level":0,"arguments":{}}}
+{"version":1,"hook_id":"protect-main","event":"tool_dispatching","entrypoint":"/absolute/path/to/protect-main","project_root":"/absolute/project","payload":{"tool":"bash","agent_id":"...","agent_level":0,"arguments":{}}}
 ```
 
 A `gate` hook returns an empty response or one JSON document. `{"decision":"deny",
@@ -78,11 +81,29 @@ At most 10000 entries are retained per project.
 
 ## Events
 
-- Gates: `tool_dispatching`, `agent_spawning`, `message_sending`,
-  `permission_resolving`.
-- Observe: `supervisor_started`, `supervisor_stopping`, `session_published`,
-  `session_expired`, `tool_completed`, `agent_started`, `agent_finished`,
-  `message_delivered`, `interaction_created`, `interaction_resolved`, `team_reset`.
+All UUID fields are JSON strings. Event payloads are versioned with the outer protocol:
+
+| Event | Kind | Payload fields |
+| --- | --- | --- |
+| `supervisor_started` | observe | `root_agent_id` |
+| `supervisor_stopping` | observe | `root_agent_id` |
+| `session_published` | observe | `agent_id`, `session_id`, `agent_level` |
+| `session_expired` | observe | `agent_id`, nullable `session_id`, `agent_level` |
+| `tool_dispatching` | gate/transform | `tool`, `agent_id`, `agent_level`, `arguments` |
+| `agent_spawning` | gate/transform | `tool`, `agent_id`, `agent_level`, `arguments` |
+| `message_sending` | gate/transform | `tool`, `agent_id`, `agent_level`, `arguments` |
+| `permission_resolving` | gate | `request_id`, `requester_id`, `owner_id`, `title`, nullable `operation_hash`, `decision` |
+| `tool_completed` | observe | `tool`, `agent_id`, `success` |
+| `agent_started` | observe | `agent_id`, `agent_level` |
+| `agent_finished` | observe | `agent_id`, `interrupted`, nullable `exit_code` |
+| `message_delivered` | observe | `sender_id`, `delivery` object |
+| `interaction_created` | observe | `request_id`, `requester_id`, `owner_id` |
+| `interaction_resolved` | observe | `request_id`, `requester_id`, `decision` |
+| `team_reset` | observe | `team_id`, `session_id` |
+
+`matcher.tools` and `matcher.agent_levels` compare exact top-level payload values. An
+empty matcher list means no restriction for that dimension. Events without the relevant
+top-level field do not match a non-empty matcher for that dimension.
 
 `supervisor_stopping` and the final `session_expired` run synchronously within a five-second
 phase budget. Individual timeouts are capped by the remaining budget; failure never
