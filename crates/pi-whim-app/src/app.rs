@@ -106,6 +106,7 @@ pub struct PiWhimApplication<R: AgentRuntime = PiRpcRuntime> {
     agent_directory_override: Option<PathBuf>,
     hook_config_root_override: Option<PathBuf>,
     hook_revisions: HashMap<ProjectId, String>,
+    pending_hook_reloads: HashSet<ProjectId>,
     pending_hook_inputs: HashMap<ProjectId, VecDeque<PendingPrompt>>,
     attachment_store: AttachmentStore,
     /// Messages bound for the user, oldest first.
@@ -247,6 +248,7 @@ impl Default for PiWhimApplication<PiRpcRuntime> {
             agent_directory_override: None,
             hook_config_root_override: None,
             hook_revisions: HashMap::new(),
+            pending_hook_reloads: HashSet::new(),
             pending_hook_inputs: HashMap::new(),
             attachment_store: AttachmentStore::open_default(),
             notices: notice::Outbox::new(),
@@ -551,7 +553,8 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             self.notices.error(error.to_string());
             return;
         }
-        self.restart_selected_project();
+        let _ = self.load_hooks(&project.path);
+        self.request_hook_reload(project.id);
     }
 
     fn revoke_project_hooks(&mut self) {
@@ -568,7 +571,8 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             self.notices.error(error.to_string());
             return;
         }
-        self.restart_selected_project();
+        let _ = self.load_hooks(&project.path);
+        self.request_hook_reload(project.id);
     }
 
     /// Carry out one slash command.
@@ -2196,22 +2200,11 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             .expect("active session is present")
             .project_id;
         if self.hooks_changed() {
-            if matches!(self.state().session_status, SessionStatus::Ready) {
-                self.restart_selected_project();
-                if self.can_submit_prompt() {
-                    self.submit_prompt(content, attachments, mode);
-                } else {
-                    self.pending_hook_inputs
-                        .entry(project_id)
-                        .or_default()
-                        .push_back((content, attachments, mode));
-                }
-            } else {
-                self.pending_hook_inputs
-                    .entry(project_id)
-                    .or_default()
-                    .push_back((content, attachments, mode));
-            }
+            self.pending_hook_inputs
+                .entry(project_id)
+                .or_default()
+                .push_back((content, attachments, mode));
+            self.request_hook_reload(project_id);
             return;
         }
         let first_plain_prompt = matches!(mode, SubmitMode::Prompt)
@@ -2871,8 +2864,8 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         for effect in outcome.effects {
             self.perform_effect(key, effect);
         }
-        if settled {
-            self.restart_for_pending_hook_inputs(key);
+        if settled || ready {
+            self.restart_hooks_if_project_settled(key);
         }
         if ready {
             self.flush_pending_hook_inputs(key);
@@ -2991,12 +2984,39 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         self.hook_revisions.get(&project.id) != Some(&revision)
     }
 
-    fn restart_for_pending_hook_inputs(&mut self, key: &str) {
+    fn request_hook_reload(&mut self, project_id: ProjectId) {
+        self.pending_hook_reloads.insert(project_id);
+        self.restart_hooks_for_settled_project(project_id);
+    }
+
+    fn restart_hooks_if_project_settled(&mut self, key: &str) {
         let Some(project_id) = self.sessions.get(key).map(|session| session.project_id) else {
             return;
         };
-        if self.pending_hook_inputs.contains_key(&project_id) {
-            self.restart_selected_project();
+        self.restart_hooks_for_settled_project(project_id);
+    }
+
+    fn restart_hooks_for_settled_project(&mut self, project_id: ProjectId) {
+        if !self.pending_hook_reloads.contains(&project_id) {
+            return;
+        }
+        let visible_turn_is_busy = self.state().selected_project == Some(project_id)
+            && matches!(
+                self.state().session_status,
+                SessionStatus::Streaming | SessionStatus::Compacting
+            );
+        let project_has_busy_turn = self
+            .sessions
+            .iter()
+            .any(|(_, session)| session.project_id == project_id && session.is_running());
+        if visible_turn_is_busy || project_has_busy_turn {
+            return;
+        }
+        self.pending_hook_reloads.remove(&project_id);
+        let remains_selected = self.state().selected_project == Some(project_id);
+        self.stop_project_runtimes(project_id);
+        if remains_selected {
+            self.start_project(project_id);
         }
     }
 
@@ -3175,6 +3195,7 @@ mod tests {
             agent_directory_override: Some(directory.path().join("agent")),
             hook_config_root_override: Some(directory.path().join("config")),
             hook_revisions: HashMap::new(),
+            pending_hook_reloads: HashSet::new(),
             pending_hook_inputs: HashMap::new(),
             attachment_store: AttachmentStore::open(directory.path().join("attachments")).unwrap(),
             notices: notice::Outbox::new(),
@@ -3278,6 +3299,88 @@ mod tests {
                 .iter()
                 .any(|item| item.full_text == "held input")
         );
+    }
+
+    #[test]
+    fn hook_trust_changes_wait_for_the_active_turn_to_settle() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir_all(directory.path().join(".pi-whim")).unwrap();
+        let entrypoint = directory.path().join("policy-hook");
+        fs::write(&entrypoint, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::write(
+            directory.path().join(".pi-whim/hooks.json"),
+            serde_json::to_vec(&json!({
+                "version": 1,
+                "hooks": [{
+                    "id": "policy",
+                    "event": "tool_dispatching",
+                    "command": [entrypoint]
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let runtime = FakeRuntime::default();
+        let observer = runtime.clone();
+        let mut app = test_application(&directory, runtime);
+        start_test_session(&mut app, &directory);
+        let project_id = app.state().selected_project.unwrap();
+        let fingerprint = match &app.state().project_hook_status {
+            ProjectHookStatus::ApprovalRequired { fingerprint, .. } => fingerprint.clone(),
+            status => panic!("unexpected status: {status:?}"),
+        };
+        app.apply(Action::SetSessionStatus(SessionStatus::Streaming));
+
+        app.approve_project_hooks(&fingerprint);
+        assert_eq!(observer.starts().len(), 1);
+        assert!(app.pending_hook_reloads.contains(&project_id));
+        assert!(matches!(
+            app.state().project_hook_status,
+            ProjectHookStatus::Approved { .. }
+        ));
+
+        let old_key = app.sessions.active_key().unwrap().to_owned();
+        app.apply_agent_event(&old_key, json!({"type":"agent_settled"}));
+        assert_eq!(observer.starts().len(), 2);
+        assert!(!app.pending_hook_reloads.contains(&project_id));
+
+        app.apply(Action::SetSessionStatus(SessionStatus::Streaming));
+        app.revoke_project_hooks();
+        assert_eq!(observer.starts().len(), 2);
+        assert!(app.pending_hook_reloads.contains(&project_id));
+        assert!(matches!(
+            app.state().project_hook_status,
+            ProjectHookStatus::ApprovalRequired { .. }
+        ));
+
+        let approved_key = app.sessions.active_key().unwrap().to_owned();
+        app.apply_agent_event(&approved_key, json!({"type":"agent_settled"}));
+        assert_eq!(observer.starts().len(), 3);
+        assert!(!app.pending_hook_reloads.contains(&project_id));
+    }
+
+    #[test]
+    fn hook_reload_waits_for_background_sessions_in_the_project() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = FakeRuntime::default();
+        let observer = runtime.clone();
+        let mut app = test_application(&directory, runtime);
+        start_test_session(&mut app, &directory);
+        let project_id = app.state().selected_project.unwrap();
+        let background_path = directory.path().join("background.jsonl");
+        let background = app
+            .launch_session(project_id, Some(&background_path.to_string_lossy()))
+            .unwrap();
+        app.sessions.get_mut(&background).unwrap().turn.running = true;
+        assert_eq!(observer.starts().len(), 2);
+
+        app.request_hook_reload(project_id);
+        assert_eq!(observer.starts().len(), 2);
+        assert!(app.pending_hook_reloads.contains(&project_id));
+
+        app.apply_agent_event(&background, json!({"type":"agent_settled"}));
+        assert_eq!(observer.starts().len(), 3);
+        assert!(!app.pending_hook_reloads.contains(&project_id));
     }
 
     #[test]
