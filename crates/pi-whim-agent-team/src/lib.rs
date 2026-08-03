@@ -788,7 +788,12 @@ fn send_message_handler(
     request: &ToolRequest,
     _cancelled: Option<&AtomicBool>,
 ) -> HostResult {
-    send_message(host, actor_id, &request.arguments)
+    let result = send_message(host, actor_id, &request.arguments)?;
+    host.hooks.observe(
+        HookEvent::MessageDelivered,
+        json!({"sender_id": actor_id, "delivery": result}),
+    );
+    Ok(result)
 }
 
 fn list_agents_handler(
@@ -1703,13 +1708,25 @@ fn resolve_interaction_for_owner(
     from_l0_user: bool,
 ) -> HostResult {
     let decision = decision.trim();
-    if matches!(
-        host.hooks.gate(
-            HookEvent::PermissionResolving,
-            json!({"request_id": request_id, "owner_id": owner_id, "decision": decision}),
-        ),
-        hooks::HookDecision::Deny(_)
-    ) {
+    let resolving_permission = host
+        .interactions
+        .lock()
+        .ok()
+        .and_then(|interactions| {
+            interactions
+                .get(&request_id)
+                .map(|request| request.kind.clone())
+        })
+        .is_some_and(|kind| matches!(kind, InteractionKind::Approval));
+    if resolving_permission
+        && matches!(
+            host.hooks.gate(
+                HookEvent::PermissionResolving,
+                json!({"request_id": request_id, "owner_id": owner_id, "decision": decision}),
+            ),
+            hooks::HookDecision::Deny(_)
+        )
+    {
         return Err(HostError::new(
             "hook_denied",
             "permission resolution was denied by a hook",
@@ -2319,10 +2336,6 @@ fn send_message(host: &HostContext, sender_id: AgentId, value: &Value) -> HostRe
         "count": kinds.len()
     });
     drop(state);
-    host.hooks.observe(
-        HookEvent::MessageDelivered,
-        json!({"sender_id": sender_id, "count": kinds.len()}),
-    );
     Ok(response)
 }
 

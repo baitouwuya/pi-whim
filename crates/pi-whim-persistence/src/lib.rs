@@ -26,6 +26,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
+const MAX_HOOK_AUDIT_PER_PROJECT: usize = 10_000;
+
 #[derive(Debug, Error)]
 pub enum PersistenceError {
     #[error("database error: {0}")]
@@ -803,6 +805,13 @@ impl HookRepository for SqliteStore {
                 entry.revision,
                 entry.created_at_ms,
             ],
+        )?;
+        self.connection.execute(
+            "DELETE FROM hook_audit WHERE project_path = ?1 AND id NOT IN (
+                 SELECT id FROM hook_audit WHERE project_path = ?1
+                 ORDER BY created_at_ms DESC, id DESC LIMIT ?2
+             )",
+            params![entry.project_path, MAX_HOOK_AUDIT_PER_PROJECT as i64],
         )?;
         Ok(())
     }

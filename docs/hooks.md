@@ -28,6 +28,11 @@ the application and no hooks from that manifest run.
 Hook IDs must be unique, command entrypoints must be absolute files, and timeouts must
 be between 1 and 30000 ms. Hooks run in manifest order.
 
+Compile-time Rust hooks run before command hooks and cannot be disabled by a Manifest.
+The initial `builtin.safety_floor` rejects malformed spawn, message, tool, and permission
+events before external code runs; typed Supervisor handlers validate transformed values
+again before carrying out an operation.
+
 A project may add `.pi-whim/hooks.json`. Project hooks remain disabled until the user
 approves the displayed SHA-256 fingerprint under Settings > Execution > Project hooks.
 The fingerprint covers the Manifest plus every command entrypoint path and file content;
@@ -59,6 +64,7 @@ limited to 64 KiB.
 Each invocation writes bounded audit metadata to SQLite: hook ID, event, outcome,
 duration, output-truncation flag, configuration revision, and timestamp. Arguments,
 message bodies, credentials, capabilities, and raw command output are never persisted.
+At most 10000 entries are retained per project.
 
 ## Events
 

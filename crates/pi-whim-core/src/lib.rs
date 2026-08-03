@@ -324,10 +324,16 @@ impl HookConfig {
                 self.version
             ));
         }
+        if self.hooks.len() > 64 {
+            return Err("hook manifest cannot contain more than 64 hooks".into());
+        }
         let mut ids = std::collections::HashSet::new();
         for hook in &self.hooks {
             if hook.id.trim().is_empty() {
                 return Err("hook id cannot be empty".into());
+            }
+            if hook.id.len() > 128 {
+                return Err(format!("hook {} id exceeds 128 bytes", hook.id));
             }
             if !ids.insert(hook.id.as_str()) {
                 return Err(format!("duplicate hook id {}", hook.id));
@@ -340,6 +346,18 @@ impl HookConfig {
                     "hook {} command must use an absolute path",
                     hook.id
                 ));
+            }
+            if hook.command.len() > 32
+                || hook
+                    .command
+                    .iter()
+                    .any(|argument| argument.len() > 4 * 1024)
+                || hook.command.iter().map(String::len).sum::<usize>() > 16 * 1024
+            {
+                return Err(format!("hook {} command exceeds manifest limits", hook.id));
+            }
+            if hook.matcher.tools.len() > 64 || hook.matcher.agent_levels.len() > 16 {
+                return Err(format!("hook {} matcher exceeds manifest limits", hook.id));
             }
             if hook
                 .timeout_ms

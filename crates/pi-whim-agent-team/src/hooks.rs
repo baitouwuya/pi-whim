@@ -4,7 +4,7 @@ use std::{
     io::{BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::mpsc,
+    sync::{Arc, mpsc},
     thread,
     time::Duration,
 };
@@ -25,13 +25,75 @@ struct ObserveTask {
     payload: Value,
 }
 
-#[derive(Clone, Debug)]
+pub(crate) trait RustHook: Send + Sync {
+    fn id(&self) -> &'static str;
+    fn gate(&self, event: HookEvent, payload: &Value) -> Result<(), String>;
+}
+
+struct SafetyFloorHook;
+
+impl RustHook for SafetyFloorHook {
+    fn id(&self) -> &'static str {
+        "builtin.safety_floor"
+    }
+
+    fn gate(&self, event: HookEvent, payload: &Value) -> Result<(), String> {
+        let arguments = || {
+            payload
+                .get("arguments")
+                .and_then(Value::as_object)
+                .ok_or_else(|| "hook event arguments must be an object".to_owned())
+        };
+        match event {
+            HookEvent::MessageSending => {
+                let arguments = arguments()?;
+                let message = arguments
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "message must be a string".to_owned())?;
+                if message.trim().is_empty() || message.len() > crate::MAX_MESSAGE_BYTES {
+                    return Err("message violates supervisor size constraints".into());
+                }
+            }
+            HookEvent::AgentSpawning => {
+                let arguments = arguments()?;
+                for field in ["name", "task"] {
+                    if arguments
+                        .get(field)
+                        .and_then(Value::as_str)
+                        .is_none_or(|value| value.trim().is_empty())
+                    {
+                        return Err(format!("agent {field} cannot be empty"));
+                    }
+                }
+            }
+            HookEvent::PermissionResolving | HookEvent::ToolDispatching => {}
+            _ => return Ok(()),
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct HookDispatcher {
+    rust_hooks: Vec<Arc<dyn RustHook>>,
     hooks: Vec<HookDefinition>,
     project_root: PathBuf,
     audit_sender: mpsc::Sender<HookAuditRecord>,
     revision: String,
     observe_sender: mpsc::SyncSender<ObserveTask>,
+}
+
+impl std::fmt::Debug for HookDispatcher {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HookDispatcher")
+            .field("rust_hooks", &self.rust_hooks.len())
+            .field("command_hooks", &self.hooks.len())
+            .field("project_root", &self.project_root)
+            .field("revision", &self.revision)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -64,6 +126,7 @@ impl HookDispatcher {
             }
         });
         Self {
+            rust_hooks: vec![Arc::new(SafetyFloorHook)],
             revision: config.revision.clone(),
             hooks: config.hooks,
             project_root,
@@ -74,6 +137,25 @@ impl HookDispatcher {
 
     pub(crate) fn gate(&self, event: HookEvent, payload: Value) -> HookDecision {
         let mut payload = payload;
+        for hook in &self.rust_hooks {
+            let started = std::time::Instant::now();
+            let result = hook.gate(event, &payload);
+            let _ = self.audit_sender.send(HookAuditRecord {
+                hook_id: hook.id().into(),
+                event,
+                outcome: if result.is_ok() {
+                    HookAuditOutcome::Allowed
+                } else {
+                    HookAuditOutcome::Denied
+                },
+                duration_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                output_truncated: false,
+                revision: "builtin".into(),
+            });
+            if let Err(message) = result {
+                return HookDecision::Deny(message);
+            }
+        }
         let hooks = self.matching(event, &payload).cloned().collect::<Vec<_>>();
         for hook in &hooks {
             let started = std::time::Instant::now();
@@ -388,9 +470,10 @@ mod tests {
             PathBuf::from("/tmp"),
             mpsc::channel().0,
         );
+        let payload = json!({"tool":"read", "arguments":{}});
         assert_eq!(
-            dispatcher.gate(HookEvent::ToolDispatching, json!({"tool":"read"})),
-            HookDecision::Continue(json!({"tool":"read"}))
+            dispatcher.gate(HookEvent::ToolDispatching, payload.clone()),
+            HookDecision::Continue(payload)
         );
     }
 
@@ -423,10 +506,11 @@ mod tests {
         assert_eq!(
             dispatcher.gate(
                 HookEvent::ToolDispatching,
-                json!({"tool":"bash", "agent_level": 0})
+                json!({"tool":"bash", "agent_level": 0, "arguments":{}})
             ),
             HookDecision::Deny("policy".into())
         );
+        let _builtin = audit_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
         let audit = audit_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(audit.outcome, HookAuditOutcome::Denied);
         assert_eq!(audit.revision, "sha256:test");
@@ -457,6 +541,7 @@ mod tests {
             dispatcher.gate(HookEvent::ToolDispatching, payload.clone()),
             HookDecision::Continue(payload)
         );
+        let _builtin = audit_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(
             audit_receiver
                 .recv_timeout(Duration::from_secs(1))
@@ -486,7 +571,10 @@ mod tests {
             mpsc::channel().0,
         );
         assert!(matches!(
-            dispatcher.gate(HookEvent::ToolDispatching, json!({"tool":"bash"})),
+            dispatcher.gate(
+                HookEvent::ToolDispatching,
+                json!({"tool":"bash", "arguments":{}})
+            ),
             HookDecision::Deny(message) if message.contains("entrypoint changed")
         ));
     }
