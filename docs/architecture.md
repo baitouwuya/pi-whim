@@ -14,8 +14,8 @@ model-facing tool names and forwards authenticated requests to the Rust supervis
 loopback JSONL. The supervisor owns caller identity, topology, quotas, message routing,
 and child process lifetimes; tool arguments are never trusted for team or level identity.
 
-Supervisor hooks extend that control plane with sandboxed external gate and observe
-commands. They execute outside agent capability and provider-key contexts; see
+Supervisor hooks extend that control plane with sandboxed external gate, transform, and
+observe commands. They execute outside agent capability and provider-key contexts; see
 [Supervisor hooks](hooks.md).
 
 Only level-0 Pi processes use JSONL sessions. Subagents run with `--no-session`, so the
