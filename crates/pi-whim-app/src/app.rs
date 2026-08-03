@@ -13,9 +13,9 @@ use std::{
 
 use pi_whim_core::{
     Action, AgentPermissionLevel, AppState, Attachment, ConversationItem, ConversationRole,
-    HookConfig, Language, ModelOption, Project, ProjectId, ProviderId, ProviderProfile,
-    ProviderProtocol, QueueMode, SESSION_TITLE_TASK_KIND, SearchEngineId, SearchEngineProfile,
-    SessionMetrics, SessionStatus, SessionSummary, SubmitMode, ThinkingLevel,
+    HookConfig, Language, ModelOption, Project, ProjectHookStatus, ProjectId, ProviderId,
+    ProviderProfile, ProviderProtocol, QueueMode, SESSION_TITLE_TASK_KIND, SearchEngineId,
+    SearchEngineProfile, SessionMetrics, SessionStatus, SessionSummary, SubmitMode, ThinkingLevel,
     normalize_bash_patterns, normalize_provider_display_name, provider_name_key, stable_session_id,
     strings,
 };
@@ -24,9 +24,10 @@ use pi_whim_one_shot_ai::{
     ResolvedOneShotAiConfig, SessionHistoryTitleTask, SessionTitleTask, fallback_session_title,
 };
 use pi_whim_persistence::{
-    AppPreferences, AttachmentStore, MacosKeychainStore, PreferencesRepository, ProjectRepository,
-    ProviderRepository, SearchEngineRepository, SecretStore, SessionRepository, SqliteStore,
-    persist_session_title_to_jsonl, session_summary_from_jsonl,
+    AppPreferences, AttachmentStore, HookRepository, MacosKeychainStore, PreferencesRepository,
+    ProjectRepository, ProviderRepository, SearchEngineRepository, SecretStore, SessionRepository,
+    SqliteStore, hook_manifest_fingerprint, persist_session_title_to_jsonl,
+    session_summary_from_jsonl,
 };
 use pi_whim_runtime::{AgentRuntime, PiRpcRuntime, RuntimeEvent, RuntimeStart};
 use serde_json::{Value, json};
@@ -103,6 +104,8 @@ pub struct PiWhimApplication<R: AgentRuntime = PiRpcRuntime> {
     capability_resolver: ModelCapabilityResolver,
     sessions_root_override: Option<PathBuf>,
     agent_directory_override: Option<PathBuf>,
+    hook_config_root_override: Option<PathBuf>,
+    hook_revisions: HashMap<ProjectId, String>,
     attachment_store: AttachmentStore,
     /// Messages bound for the user, oldest first.
     ///
@@ -241,6 +244,8 @@ impl Default for PiWhimApplication<PiRpcRuntime> {
             capability_resolver,
             sessions_root_override: None,
             agent_directory_override: None,
+            hook_config_root_override: None,
+            hook_revisions: HashMap::new(),
             attachment_store: AttachmentStore::open_default(),
             notices: notice::Outbox::new(),
             control_updates: crossbeam_channel::unbounded(),
@@ -462,6 +467,10 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 }
             }
             Request::SetPermissionLevel(level) => self.set_permission_level(level),
+            Request::ApproveProjectHooks { fingerprint } => {
+                self.approve_project_hooks(&fingerprint)
+            }
+            Request::RevokeProjectHooks => self.revoke_project_hooks(),
             Request::SetAgentTeamConfig(config) => {
                 let config = config.normalized();
                 if self.state().agent_team_config != config {
@@ -502,6 +511,55 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 unreachable!("handled by the host")
             }
         }
+    }
+
+    fn approve_project_hooks(&mut self, expected_fingerprint: &str) {
+        let Some(project) = self
+            .state()
+            .selected_project
+            .and_then(|id| self.find_project(id))
+        else {
+            return;
+        };
+        let path = Path::new(&project.path).join(".pi-whim/hooks.json");
+        let fingerprint = match fs::read(&path) {
+            Ok(source) => hook_manifest_fingerprint(&source),
+            Err(error) => {
+                self.notices.error(error.to_string());
+                return;
+            }
+        };
+        if fingerprint != expected_fingerprint {
+            self.notices
+                .error("project hook manifest changed before approval");
+            self.restart_selected_project();
+            return;
+        }
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        if let Err(error) = store.approve_project_hooks(&project.path, &fingerprint, now_ms()) {
+            self.notices.error(error.to_string());
+            return;
+        }
+        self.restart_selected_project();
+    }
+
+    fn revoke_project_hooks(&mut self) {
+        let Some(project) = self
+            .state()
+            .selected_project
+            .and_then(|id| self.find_project(id))
+        else {
+            return;
+        };
+        if let Some(store) = self.store.as_ref()
+            && let Err(error) = store.revoke_project_hooks(&project.path)
+        {
+            self.notices.error(error.to_string());
+            return;
+        }
+        self.restart_selected_project();
     }
 
     /// Carry out one slash command.
@@ -1255,8 +1313,14 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 }
             };
         let mut runtime = (self.runtime_factory)();
+        let project_path = project.path.clone();
+        let hooks = self.load_hooks(&project_path);
+        self.hook_revisions.insert(
+            project_id,
+            hook_manifest_fingerprint(&serde_json::to_vec(&hooks).unwrap_or_default()),
+        );
         if let Err(error) = runtime.start(RuntimeStart {
-            project_path: project.path,
+            project_path,
             sessions_path: sessions_path.to_string_lossy().into_owned(),
             session_path: session_path.map(str::to_owned),
             extension_paths,
@@ -1264,7 +1328,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             agent_team_config: self.state().agent_team_config.clone(),
             search_engines: self.state().search_engine_profiles.clone(),
             search_engine_api_keys,
-            hooks: self.load_global_hooks(),
+            hooks,
         }) {
             if self.sessions.active_key().is_none() {
                 self.apply(Action::SetSessionStatus(SessionStatus::Failed(
@@ -1295,10 +1359,77 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         Some(key)
     }
 
-    /// Global manifests are user-owned; project manifests are deliberately not
-    /// loaded until their fingerprint has been approved and persisted.
+    fn load_hooks(&mut self, project_path: &str) -> HookConfig {
+        let mut config = self.load_global_hooks();
+        let path = Path::new(project_path).join(".pi-whim/hooks.json");
+        let source = match fs::read(&path) {
+            Ok(source) => source,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.apply(Action::SetProjectHookStatus(ProjectHookStatus::NotPresent));
+                return config;
+            }
+            Err(error) => {
+                let message = format!("failed to read project hook manifest: {error}");
+                self.apply(Action::SetProjectHookStatus(ProjectHookStatus::Invalid(
+                    message.clone(),
+                )));
+                self.notices.error(message);
+                return config;
+            }
+        };
+        let fingerprint = hook_manifest_fingerprint(&source);
+        let project_config = match serde_json::from_slice::<HookConfig>(&source)
+            .map_err(|error| error.to_string())
+            .and_then(|config| config.validate().map(|()| config))
+        {
+            Ok(config) => config,
+            Err(error) => {
+                self.apply(Action::SetProjectHookStatus(ProjectHookStatus::Invalid(
+                    error.clone(),
+                )));
+                self.notices.error(format!(
+                    "invalid project hook manifest {}: {error}",
+                    path.display()
+                ));
+                return config;
+            }
+        };
+        let hook_count = project_config.hooks.len();
+        let trusted = self
+            .store
+            .as_ref()
+            .and_then(|store| store.trusted_hook_fingerprint(project_path).ok().flatten())
+            .is_some_and(|trusted| trusted == fingerprint);
+        if !trusted {
+            self.apply(Action::SetProjectHookStatus(
+                ProjectHookStatus::ApprovalRequired {
+                    fingerprint,
+                    hook_count,
+                },
+            ));
+            return config;
+        }
+        config.hooks.extend(project_config.hooks);
+        if let Err(error) = config.validate() {
+            self.apply(Action::SetProjectHookStatus(ProjectHookStatus::Invalid(
+                error.clone(),
+            )));
+            self.notices.error(error);
+            return HookConfig::default();
+        }
+        self.apply(Action::SetProjectHookStatus(ProjectHookStatus::Approved {
+            fingerprint,
+            hook_count,
+        }));
+        config
+    }
+
     fn load_global_hooks(&mut self) -> HookConfig {
-        let Some(root) = dirs::config_dir().map(|path| path.join("pi-whim")) else {
+        let Some(root) = self
+            .hook_config_root_override
+            .clone()
+            .or_else(|| dirs::config_dir().map(|path| path.join("pi-whim")))
+        else {
             return HookConfig::default();
         };
         let path = root.join("hooks.json");
@@ -1992,6 +2123,12 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     fn submit_prompt(&mut self, content: String, attachments: Vec<Attachment>, mode: SubmitMode) {
         if !self.can_submit_prompt() {
             self.report_submission_unavailable();
+            return;
+        }
+        if matches!(self.state().session_status, SessionStatus::Ready)
+            && self.restart_for_changed_hooks()
+        {
+            self.submit_prompt(content, attachments, mode);
             return;
         }
         // Capture this before adding the optimistic user entry: failure to find
@@ -2721,6 +2858,23 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         }
     }
 
+    fn restart_for_changed_hooks(&mut self) -> bool {
+        let Some(project) = self
+            .state()
+            .selected_project
+            .and_then(|id| self.find_project(id))
+        else {
+            return false;
+        };
+        let config = self.load_hooks(&project.path);
+        let revision = hook_manifest_fingerprint(&serde_json::to_vec(&config).unwrap_or_default());
+        if self.hook_revisions.get(&project.id) == Some(&revision) {
+            return false;
+        }
+        self.restart_selected_project();
+        true
+    }
+
     /// Carry a decision back over whichever channel asked.
     fn send_answer(&mut self, answer: dialogs::Answer) {
         let Some(session) = self.sessions.get(answer.session_key()) else {
@@ -2878,6 +3032,8 @@ mod tests {
             ),
             sessions_root_override: Some(directory.path().join("sessions")),
             agent_directory_override: Some(directory.path().join("agent")),
+            hook_config_root_override: Some(directory.path().join("config")),
+            hook_revisions: HashMap::new(),
             attachment_store: AttachmentStore::open(directory.path().join("attachments")).unwrap(),
             notices: notice::Outbox::new(),
             control_updates: crossbeam_channel::unbounded(),
@@ -2891,6 +3047,43 @@ mod tests {
             title_eligible: HashSet::new(),
             title_attempted: HashSet::new(),
         }
+    }
+
+    #[test]
+    fn project_hooks_require_an_exact_manifest_fingerprint() {
+        let directory = tempfile::tempdir().unwrap();
+        let project_path = directory.path().join("project");
+        fs::create_dir_all(project_path.join(".pi-whim")).unwrap();
+        let manifest_path = project_path.join(".pi-whim/hooks.json");
+        let manifest = br#"{"version":1,"hooks":[{"id":"policy","event":"tool_dispatching","command":["/bin/true"]}]}"#;
+        fs::write(&manifest_path, manifest).unwrap();
+        let mut app = test_application(&directory, FakeRuntime::default());
+        let project = project("hooks", &project_path);
+        app.apply(Action::ProjectsLoaded(vec![project.clone()]));
+        app.apply(Action::SelectProject(project.id));
+
+        assert!(app.load_hooks(&project.path).hooks.is_empty());
+        let fingerprint = match &app.state().project_hook_status {
+            ProjectHookStatus::ApprovalRequired { fingerprint, .. } => fingerprint.clone(),
+            status => panic!("unexpected status: {status:?}"),
+        };
+        app.store
+            .as_ref()
+            .unwrap()
+            .approve_project_hooks(&project.path, &fingerprint, 1)
+            .unwrap();
+        assert_eq!(app.load_hooks(&project.path).hooks.len(), 1);
+        assert!(matches!(
+            app.state().project_hook_status,
+            ProjectHookStatus::Approved { .. }
+        ));
+
+        fs::write(&manifest_path, br#"{"version":1,"hooks":[]}"#).unwrap();
+        assert!(app.load_hooks(&project.path).hooks.is_empty());
+        assert!(matches!(
+            app.state().project_hook_status,
+            ProjectHookStatus::ApprovalRequired { .. }
+        ));
     }
 
     fn project(name: &str, path: &Path) -> Project {

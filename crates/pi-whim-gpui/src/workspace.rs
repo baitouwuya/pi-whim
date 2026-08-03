@@ -189,6 +189,10 @@ pub enum Request {
     /// running supervisors without restarting Pi or disturbing a turn.
     SetPermissionLevel(AgentPermissionLevel),
     SetAgentTeamConfig(AgentTeamConfig),
+    ApproveProjectHooks {
+        fingerprint: String,
+    },
+    RevokeProjectHooks,
     SetOneShotAiConfig(OneShotAiConfig),
     SetAutoCompaction(bool),
     /// Store a provider, and its key if one was typed.
@@ -992,6 +996,8 @@ impl Workspace {
             | SettingsEvent::SetBashPolicy(_)
             | SettingsEvent::SetBlockedPatterns(_)
             | SettingsEvent::SetAgentTeamConfig(_)
+            | SettingsEvent::ApproveProjectHooks { .. }
+            | SettingsEvent::RevokeProjectHooks
             | SettingsEvent::SetOneShotAiConfig(_)
             | SettingsEvent::SetQueueModes { .. } => unreachable!("taken by preference_change"),
         }
@@ -1347,6 +1353,10 @@ fn preference_change(event: &SettingsEvent) -> Option<Request> {
         SettingsEvent::SetAgentTeamConfig(config) => {
             Some(Request::SetAgentTeamConfig(config.clone()))
         }
+        SettingsEvent::ApproveProjectHooks { fingerprint } => Some(Request::ApproveProjectHooks {
+            fingerprint: fingerprint.clone(),
+        }),
+        SettingsEvent::RevokeProjectHooks => Some(Request::RevokeProjectHooks),
         SettingsEvent::SetOneShotAiConfig(config) => {
             Some(Request::SetOneShotAiConfig(config.clone()))
         }

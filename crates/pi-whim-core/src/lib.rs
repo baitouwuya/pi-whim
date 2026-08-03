@@ -363,6 +363,21 @@ pub enum HookEvent {
     TeamReset,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ProjectHookStatus {
+    #[default]
+    NotPresent,
+    ApprovalRequired {
+        fingerprint: String,
+        hook_count: usize,
+    },
+    Approved {
+        fingerprint: String,
+        hook_count: usize,
+    },
+    Invalid(String),
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HookMatcher {
     #[serde(default)]
@@ -799,6 +814,7 @@ pub struct AppState {
     pub session_metrics: Option<SessionMetrics>,
     pub provider_profiles: Vec<ProviderProfile>,
     pub search_engine_profiles: Vec<SearchEngineProfile>,
+    pub project_hook_status: ProjectHookStatus,
 }
 
 /// Where the visible session's Pi process stands.
@@ -841,6 +857,7 @@ pub enum Action {
     SetBashBlockedPatterns(Vec<String>),
     SetAgentTeamConfig(AgentTeamConfig),
     SetOneShotAiConfig(OneShotAiConfig),
+    SetProjectHookStatus(ProjectHookStatus),
     ProviderProfilesLoaded(Vec<ProviderProfile>),
     /// Which providers have a key in the OS keychain.
     ///
@@ -917,6 +934,7 @@ impl AppState {
             Action::SetAgentTeamConfig(config) => {
                 self.agent_team_config = config.normalized();
             }
+            Action::SetProjectHookStatus(status) => self.project_hook_status = status,
             Action::SetOneShotAiConfig(config) => {
                 self.one_shot_ai_config = config.normalized();
             }

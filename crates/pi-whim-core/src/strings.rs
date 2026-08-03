@@ -467,6 +467,17 @@ const STRINGS: &[(&str, &str, &str)] = &[
         "每行一个 Bash 命令阻止模式。",
     ),
     ("agent-team", "Agent team", "代理团队"),
+    ("project-hooks", "Project hooks", "项目 Hook"),
+    (
+        "project-hooks-none",
+        "No project manifest",
+        "未发现项目 Manifest",
+    ),
+    ("project-hooks-invalid", "Invalid manifest", "Manifest 无效"),
+    ("project-hooks-approval", "Approval required", "需要批准"),
+    ("project-hooks-approved", "Approved", "已批准"),
+    ("approve", "Approve", "批准"),
+    ("revoke", "Revoke", "撤销"),
     (
         "agent-team-help",
         "Limit delegated agent depth and count.",

@@ -10,7 +10,7 @@ use gpui_component::{
     input::{Input, InputState, NumberInput},
 };
 use pi_whim_core::{
-    AgentTeamConfig, AppState, BashPolicy, Language, QueueMode,
+    AgentTeamConfig, AppState, BashPolicy, Language, ProjectHookStatus, QueueMode,
     strings::{text as translate, tr},
 };
 use pi_whim_theme::Tokens;
@@ -114,11 +114,80 @@ pub fn render_execution(
                         tokens,
                         numeric(&fields.max_agents_per_level),
                     ),
-                    agent_team_apply(fields, state, emit),
+                    agent_team_apply(fields, state, emit.clone()),
                 ],
+            ),
+            form::group(
+                tr(state, "project-hooks"),
+                None,
+                tokens,
+                vec![project_hooks_row(state, tokens, emit)],
             ),
         ]))
         .into_any_element()
+}
+
+fn project_hooks_row(state: &AppState, tokens: Tokens, emit: Emit) -> AnyElement {
+    let (status, action) = match &state.project_hook_status {
+        ProjectHookStatus::NotPresent => (tr(state, "project-hooks-none").to_owned(), None),
+        ProjectHookStatus::Invalid(error) => (
+            format!("{}: {error}", tr(state, "project-hooks-invalid")),
+            None,
+        ),
+        ProjectHookStatus::ApprovalRequired {
+            fingerprint,
+            hook_count,
+        } => {
+            let fingerprint_for_click = fingerprint.clone();
+            let emit_for_click = emit.clone();
+            let button = Button::new("approve-project-hooks")
+                .primary()
+                .small()
+                .label(tr(state, "approve"))
+                .on_click(move |_, window, cx| {
+                    emit_for_click(
+                        SettingsEvent::ApproveProjectHooks {
+                            fingerprint: fingerprint_for_click.clone(),
+                        },
+                        window,
+                        cx,
+                    );
+                });
+            (
+                format!(
+                    "{}: {hook_count} ({})",
+                    tr(state, "project-hooks-approval"),
+                    fingerprint.get(..12).unwrap_or(fingerprint)
+                ),
+                Some(button.into_any_element()),
+            )
+        }
+        ProjectHookStatus::Approved {
+            fingerprint,
+            hook_count,
+        } => {
+            let button = Button::new("revoke-project-hooks")
+                .small()
+                .label(tr(state, "revoke"))
+                .on_click(move |_, window, cx| {
+                    emit(SettingsEvent::RevokeProjectHooks, window, cx);
+                });
+            (
+                format!(
+                    "{}: {hook_count} ({})",
+                    tr(state, "project-hooks-approved"),
+                    fingerprint.get(..12).unwrap_or(fingerprint)
+                ),
+                Some(button.into_any_element()),
+            )
+        }
+    };
+    form::row(
+        tr(state, "project-hooks"),
+        Some(&status),
+        tokens,
+        action.unwrap_or_else(|| div().into_any_element()),
+    )
 }
 
 /// Keep destructive launch settings as a draft until the reader applies them.

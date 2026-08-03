@@ -27,6 +27,12 @@ the application and no hooks from that manifest run.
 Hook IDs must be unique, command entrypoints must be absolute files, and timeouts must
 be between 1 and 30000 ms. Hooks run in manifest order.
 
+A project may add `.pi-whim/hooks.json`. Project hooks remain disabled until the user
+approves the displayed SHA-256 fingerprint under Settings > Execution > Project hooks.
+Changing any byte of the Manifest invalidates approval. Global hooks run first, followed
+by approved project hooks, in their respective Manifest order. Duplicate IDs across the
+merged configuration invalidate the merged set.
+
 ## Protocol
 
 The command receives one JSON document on stdin:

@@ -543,12 +543,18 @@ fn dispatch_request_cancellable(
             );
             ToolResponse::success(request.request_id, content)
         }
-        Err(error) => ToolResponse::error_with_details(
-            request.request_id,
-            error.code,
-            error.message,
-            error.details,
-        ),
+        Err(error) => {
+            host.hooks.observe(
+                HookEvent::ToolCompleted,
+                json!({"tool": spec.name, "agent_id": actor_id, "success": false}),
+            );
+            ToolResponse::error_with_details(
+                request.request_id,
+                error.code,
+                error.message,
+                error.details,
+            )
+        }
     }
 }
 

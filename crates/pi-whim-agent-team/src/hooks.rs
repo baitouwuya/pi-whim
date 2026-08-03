@@ -216,4 +216,34 @@ mod tests {
             HookDecision::Continue(json!({"tool":"read"}))
         );
     }
+
+    #[test]
+    fn gate_hooks_can_deny_an_operation() {
+        if !Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+        let dispatcher = HookDispatcher::new(
+            HookConfig {
+                version: 1,
+                hooks: vec![HookDefinition {
+                    id: "deny".into(),
+                    event: HookEvent::ToolDispatching,
+                    command: vec![
+                        "/bin/echo".into(),
+                        r#"{"decision":"deny","message":"policy"}"#.into(),
+                    ],
+                    timeout_ms: Some(1_000),
+                    matcher: HookMatcher::default(),
+                }],
+            },
+            PathBuf::from("/tmp"),
+        );
+        assert_eq!(
+            dispatcher.gate(
+                HookEvent::ToolDispatching,
+                json!({"tool":"bash", "agent_level": 0})
+            ),
+            HookDecision::Deny("policy".into())
+        );
+    }
 }

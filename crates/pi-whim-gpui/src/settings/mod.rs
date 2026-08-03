@@ -93,6 +93,10 @@ pub enum SettingsEvent {
     SetBashPolicy(BashPolicy),
     SetBlockedPatterns(Vec<String>),
     SetAgentTeamConfig(AgentTeamConfig),
+    ApproveProjectHooks {
+        fingerprint: String,
+    },
+    RevokeProjectHooks,
     SetOneShotAiConfig(OneShotAiConfig),
     SetQueueModes {
         steering: QueueMode,
