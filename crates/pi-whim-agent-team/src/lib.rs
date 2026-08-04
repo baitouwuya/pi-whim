@@ -277,11 +277,21 @@ impl AgentSupervisor {
         };
         supervisor.host.hooks.observe(
             HookEvent::SupervisorStarted,
-            json!({"root_agent_id": root_id}),
+            hook_payload_for_agent(
+                &supervisor.host,
+                root_id,
+                None,
+                json!({"root_agent_id": root_id}),
+            ),
         );
         supervisor.host.hooks.observe(
             HookEvent::SessionPublished,
-            json!({"agent_id": root_id, "session_id": root_session_id, "agent_level": 0}),
+            hook_payload_for_agent(
+                &supervisor.host,
+                root_id,
+                None,
+                json!({"agent_id": root_id, "session_id": root_session_id, "agent_level": 0}),
+            ),
         );
         Ok(supervisor)
     }
@@ -347,7 +357,12 @@ impl AgentSupervisor {
         self.host.hooks.stop_observers();
         self.host.hooks.finalize(
             HookEvent::SupervisorStopping,
-            json!({"root_agent_id": self.root_id}),
+            hook_payload_for_agent(
+                &self.host,
+                self.root_id,
+                None,
+                json!({"root_agent_id": self.root_id}),
+            ),
         );
         {
             bash_dispatch::terminate_all(&self.host.shared);
@@ -383,7 +398,12 @@ impl AgentSupervisor {
         }
         self.host.hooks.finalize(
             HookEvent::SessionExpired,
-            json!({"agent_id": self.root_id, "session_id": root_session_id, "agent_level": 0}),
+            hook_payload_for_agent(
+                &self.host,
+                self.root_id,
+                None,
+                json!({"agent_id": self.root_id, "session_id": root_session_id, "agent_level": 0}),
+            ),
         );
         Ok(())
     }
@@ -516,17 +536,16 @@ fn dispatch_request_cancellable(
         );
     }
     if !spec.internal {
-        let agent_level = {
-            let (lock, _) = &*host.shared;
-            lock.lock()
-                .ok()
-                .and_then(|state| {
-                    state
-                        .actors
-                        .get(&actor_id)
-                        .map(|actor| actor.descriptor.level)
-                })
-                .unwrap_or(0)
+        let actor = match file_actor(host, actor_id) {
+            Ok(actor) => actor,
+            Err(error) => {
+                return ToolResponse::error_with_details(
+                    request.request_id,
+                    error.code,
+                    error.message,
+                    error.details,
+                );
+            }
         };
         let event = match spec.name {
             SPAWN_AGENT_TOOL => Some(HookEvent::AgentSpawning),
@@ -536,12 +555,16 @@ fn dispatch_request_cancellable(
         if let Some(event) = event {
             match host.hooks.gate(
                 event,
-                json!({
-                    "tool": spec.name,
-                    "agent_id": actor_id,
-                    "agent_level": agent_level,
-                    "arguments": request.arguments,
-                }),
+                add_agent_hook_context(
+                    json!({
+                        "tool": spec.name,
+                        "agent_id": actor_id,
+                        "agent_level": actor.level,
+                        "arguments": request.arguments,
+                    }),
+                    &actor,
+                    Some(&request.request_id),
+                ),
             ) {
                 hooks::HookDecision::Continue(payload) => {
                     if let Some(arguments) = payload.get("arguments") {
@@ -568,18 +591,28 @@ fn dispatch_request_cancellable(
         Ok(content) => {
             host.hooks.observe(
                 HookEvent::ToolCompleted,
-                json!({
-                    "tool": spec.name,
-                    "agent_id": actor_id,
-                    "success": true,
-                }),
+                hook_payload_for_agent(
+                    host,
+                    actor_id,
+                    Some(&request.request_id),
+                    json!({
+                        "tool": spec.name,
+                        "agent_id": actor_id,
+                        "success": true,
+                    }),
+                ),
             );
             ToolResponse::success(request.request_id, content)
         }
         Err(error) => {
             host.hooks.observe(
                 HookEvent::ToolCompleted,
-                json!({"tool": spec.name, "agent_id": actor_id, "success": false}),
+                hook_payload_for_agent(
+                    host,
+                    actor_id,
+                    Some(&request.request_id),
+                    json!({"tool": spec.name, "agent_id": actor_id, "success": false}),
+                ),
             );
             ToolResponse::error_with_details(
                 request.request_id,
@@ -780,7 +813,7 @@ fn spawn_agent_handler(
     request: &ToolRequest,
     _cancelled: Option<&AtomicBool>,
 ) -> HostResult {
-    spawn_agent(host, actor_id, &request.arguments)
+    spawn_agent(host, actor_id, &request.arguments, &request.request_id)
 }
 
 fn send_message_handler(
@@ -792,7 +825,12 @@ fn send_message_handler(
     let result = send_message(host, actor_id, &request.arguments)?;
     host.hooks.observe(
         HookEvent::MessageDelivered,
-        json!({"sender_id": actor_id, "delivery": result}),
+        hook_payload_for_agent(
+            host,
+            actor_id,
+            Some(&request.request_id),
+            json!({"sender_id": actor_id, "delivery": result}),
+        ),
     );
     Ok(result)
 }
@@ -1084,6 +1122,60 @@ fn prompt_context(host: &HostContext, actor_id: AgentId, value: &Value) -> HostR
     Ok(json!({ "text": bash_dispatch::append_prompt_context(host, actor_id, &arguments.text)? }))
 }
 
+/// Attach authenticated identity metadata while preserving event-specific fields.
+fn add_agent_hook_context(
+    mut payload: Value,
+    descriptor: &AgentDescriptor,
+    request_id: Option<&str>,
+) -> Value {
+    let Some(object) = payload.as_object_mut() else {
+        return payload;
+    };
+    object
+        .entry("agent_id")
+        .or_insert_with(|| json!(descriptor.id));
+    object
+        .entry("agent_level")
+        .or_insert_with(|| json!(descriptor.level));
+    object
+        .entry("team_id")
+        .or_insert_with(|| json!(descriptor.team_id));
+    object
+        .entry("session_id")
+        .or_insert_with(|| json!(descriptor.session_id));
+    object
+        .entry("parent_session_id")
+        .or_insert_with(|| json!(descriptor.parent_session_id));
+    object
+        .entry("parent_agent_id")
+        .or_insert_with(|| json!(descriptor.parent_id));
+    object
+        .entry("request_id")
+        .or_insert_with(|| match request_id {
+            Some(request_id) => json!(request_id),
+            None => Value::Null,
+        });
+    object
+        .entry("agent_name")
+        .or_insert_with(|| json!(descriptor.name));
+    object
+        .entry("agent_role")
+        .or_insert_with(|| json!(descriptor.role));
+    payload
+}
+
+fn hook_payload_for_agent(
+    host: &HostContext,
+    actor_id: AgentId,
+    request_id: Option<&str>,
+    payload: Value,
+) -> Value {
+    match file_actor(host, actor_id) {
+        Ok(descriptor) => add_agent_hook_context(payload, &descriptor, request_id),
+        Err(_) => payload,
+    }
+}
+
 fn file_actor(host: &HostContext, actor_id: AgentId) -> Result<AgentDescriptor, HostError> {
     let (lock, _) = &*host.shared;
     let state = lock
@@ -1269,7 +1361,12 @@ fn file_error(error: file_dispatch::FileError) -> HostError {
     HostError::with_details(error.code, error.message, error.details)
 }
 
-fn spawn_agent(host: &HostContext, parent_id: AgentId, value: &Value) -> HostResult {
+fn spawn_agent(
+    host: &HostContext,
+    parent_id: AgentId,
+    value: &Value,
+    request_id: &str,
+) -> HostResult {
     let mut arguments: SpawnAgentArguments = parse_arguments(value)?;
     arguments.name = arguments.name.trim().to_owned();
     arguments.role = arguments.role.trim().to_owned();
@@ -1307,7 +1404,12 @@ fn spawn_agent(host: &HostContext, parent_id: AgentId, value: &Value) -> HostRes
     }
     host.hooks.observe(
         HookEvent::AgentStarted,
-        json!({"agent_id": agent_id, "agent_level": level}),
+        hook_payload_for_agent(
+            host,
+            agent_id,
+            Some(request_id),
+            json!({"agent_id": agent_id, "agent_level": level}),
+        ),
     );
     Ok(json!({
         "agent_id": agent_id,
@@ -1725,14 +1827,19 @@ fn resolve_interaction_for_owner(
         && matches!(
             host.hooks.gate(
                 HookEvent::PermissionResolving,
-                json!({
-                    "request_id": request_id,
-                    "requester_id": requester_id,
-                    "owner_id": owner_id,
-                    "title": title,
-                    "operation_hash": operation_hash,
-                    "decision": decision
-                }),
+                hook_payload_for_agent(
+                    host,
+                    owner_id,
+                    Some(&request_id.to_string()),
+                    json!({
+                        "request_id": request_id,
+                        "requester_id": requester_id,
+                        "owner_id": owner_id,
+                        "title": title,
+                        "operation_hash": operation_hash,
+                        "decision": decision
+                    }),
+                ),
             ),
             hooks::HookDecision::Deny(_)
         )
@@ -1843,7 +1950,12 @@ fn resolve_interaction_for_owner(
     );
     host.hooks.observe(
         HookEvent::InteractionResolved,
-        json!({"request_id": id, "requester_id": requester, "decision": decision}),
+        hook_payload_for_agent(
+            host,
+            owner_id,
+            Some(&id.to_string()),
+            json!({"request_id": id, "requester_id": requester, "decision": decision}),
+        ),
     );
     Ok(json!({
         "request_id": id,
@@ -2046,7 +2158,12 @@ fn create_interaction(
     );
     host.hooks.observe(
         HookEvent::InteractionCreated,
-        json!({"request_id": request.id, "requester_id": requester_id, "owner_id": owner_id}),
+        hook_payload_for_agent(
+            host,
+            requester_id,
+            Some(&request.id.to_string()),
+            json!({"request_id": request.id, "requester_id": requester_id, "owner_id": owner_id}),
+        ),
     );
     Ok(request)
 }
@@ -3156,13 +3273,26 @@ fn reset_team(host: &HostContext, actor_id: AgentId, value: &Value) -> HostResul
     drop(state);
     host.hooks.observe(
         HookEvent::SessionExpired,
-        json!({"agent_id": root_id, "session_id": old_session_id, "agent_level": 0}),
+        hook_payload_for_agent(
+            host,
+            root_id,
+            None,
+            json!({"agent_id": root_id, "session_id": old_session_id, "agent_level": 0}),
+        ),
     );
     host.hooks.observe(
         HookEvent::SessionPublished,
-        json!({"agent_id": root_id, "session_id": new_session_id, "agent_level": 0}),
+        hook_payload_for_agent(
+            host,
+            root_id,
+            None,
+            json!({"agent_id": root_id, "session_id": new_session_id, "agent_level": 0}),
+        ),
     );
-    host.hooks.observe(HookEvent::TeamReset, response.clone());
+    host.hooks.observe(
+        HookEvent::TeamReset,
+        hook_payload_for_agent(host, root_id, None, response.clone()),
+    );
     Ok(response)
 }
 
@@ -3482,6 +3612,126 @@ mod tests {
         .unwrap();
         let capability = supervisor.root_capability.clone();
         (supervisor, capability)
+    }
+
+    #[test]
+    fn hook_payload_adds_stable_authenticated_agent_context() {
+        let descriptor = AgentDescriptor {
+            id: Uuid::from_u128(1),
+            session_id: Uuid::from_u128(2),
+            team_id: Uuid::from_u128(3),
+            parent_id: Some(Uuid::from_u128(4)),
+            parent_session_id: Some(Uuid::from_u128(5)),
+            level: 2,
+            name: "reviewer".into(),
+            role: "code review".into(),
+            status: AgentStatus::Running,
+            permission_level: AgentPermissionLevel::Controlled,
+        };
+
+        let payload = add_agent_hook_context(
+            json!({"tool": LIST_AGENTS_TOOL, "agent_id": descriptor.id}),
+            &descriptor,
+            Some("request-42"),
+        );
+
+        assert_eq!(payload["team_id"], descriptor.team_id.to_string());
+        assert_eq!(payload["agent_id"], descriptor.id.to_string());
+        assert_eq!(payload["agent_level"], descriptor.level);
+        assert_eq!(payload["session_id"], descriptor.session_id.to_string());
+        assert_eq!(payload["parent_agent_id"], Uuid::from_u128(4).to_string());
+        assert_eq!(
+            payload["parent_session_id"],
+            descriptor.parent_session_id.unwrap().to_string()
+        );
+        assert_eq!(payload["request_id"], "request-42");
+        assert_eq!(payload["agent_name"], "reviewer");
+        assert_eq!(payload["agent_role"], "code review");
+        assert_eq!(payload["tool"], LIST_AGENTS_TOOL);
+    }
+
+    #[test]
+    fn hook_commands_receive_authenticated_agent_context() {
+        if !std::path::Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("verify-hook-context.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 1\n").unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        let hooks = HookConfig {
+            version: 1,
+            revision: "sha256:context".into(),
+            hooks: vec![HookDefinition {
+                id: "verify-context".into(),
+                event: HookEvent::ToolDispatching,
+                kind: HookKind::Gate,
+                command: vec![script.to_string_lossy().into_owned()],
+                timeout_ms: Some(10_000),
+                matcher: HookMatcher {
+                    tools: vec![LIST_AGENTS_TOOL.into()],
+                    agent_levels: vec![],
+                },
+                entrypoint_fingerprint: None,
+            }],
+        };
+        let mut supervisor = AgentSupervisor::start(AgentLaunchConfig {
+            executable: PathBuf::from("/missing/pi"),
+            project_path: directory.path().to_path_buf(),
+            sessions_path: directory.path().to_path_buf(),
+            extension_paths: Vec::new(),
+            environment: HashMap::new(),
+            team_config: AgentTeamConfig::default(),
+            search_engines: Vec::new(),
+            search_engine_api_keys: SearchEngineApiKeys::default(),
+            hooks,
+        })
+        .unwrap();
+        let capability = supervisor.root_capability.clone();
+        let descriptor = file_actor(&supervisor.host, supervisor.root_id).unwrap();
+        let checks = [
+            "\"request_id\":\"hook-request\"".to_owned(),
+            format!("\"team_id\":\"{}\"", descriptor.team_id),
+            format!("\"session_id\":\"{}\"", descriptor.session_id),
+            format!("\"agent_id\":\"{}\"", descriptor.id),
+            "\"agent_level\":0".to_owned(),
+            "\"parent_agent_id\":null".to_owned(),
+            "\"parent_session_id\":null".to_owned(),
+            "\"agent_name\":\"root\"".to_owned(),
+            "\"agent_role\":\"team owner\"".to_owned(),
+        ];
+        let checks = checks
+            .iter()
+            .map(|check| {
+                format!(
+                    "printf '%s' \"$payload\" | /usr/bin/grep -F '{}' >/dev/null || exit 1",
+                    check
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nIFS= read -r payload || exit 1\n{checks}\nprintf '{{}}\\n'\n"),
+        )
+        .unwrap();
+
+        let response = dispatch_request(
+            &supervisor.host,
+            ToolRequest {
+                version: PROTOCOL_VERSION,
+                request_id: "hook-request".into(),
+                capability,
+                tool_name: LIST_AGENTS_TOOL.into(),
+                arguments: Value::Null,
+            },
+        );
+        assert!(!response.is_error, "{response:?}");
+        supervisor.stop().unwrap();
     }
 
     #[test]
