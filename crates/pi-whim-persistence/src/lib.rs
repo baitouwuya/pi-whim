@@ -116,6 +116,20 @@ pub struct HookAuditEntry {
     pub created_at_ms: i64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolAuditEntry {
+    pub project_path: String,
+    pub tool: String,
+    pub agent_id: String,
+    pub agent_level: u8,
+    pub outcome: String,
+    pub reason: Option<String>,
+    pub request_id: Option<String>,
+    pub arguments_hash: Option<String>,
+    pub duration_ms: u64,
+    pub created_at_ms: i64,
+}
+
 pub trait HookRepository {
     fn trusted_hook_fingerprint(
         &self,
@@ -134,6 +148,12 @@ pub trait HookRepository {
         project_path: &str,
         limit: usize,
     ) -> Result<Vec<HookAuditEntry>, PersistenceError>;
+    fn append_tool_audit(&self, entry: &ToolAuditEntry) -> Result<(), PersistenceError>;
+    fn recent_tool_audit(
+        &self,
+        project_path: &str,
+        limit: usize,
+    ) -> Result<Vec<ToolAuditEntry>, PersistenceError>;
 }
 
 pub fn hook_manifest_fingerprint(source: &[u8]) -> String {
@@ -286,6 +306,21 @@ impl SqliteStore {
             );
             CREATE INDEX IF NOT EXISTS hook_audit_project_created_idx
                 ON hook_audit (project_path, created_at_ms DESC);
+            CREATE TABLE IF NOT EXISTS tool_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_path TEXT NOT NULL,
+                tool TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                agent_level INTEGER NOT NULL,
+                outcome TEXT NOT NULL,
+                reason TEXT,
+                request_id TEXT,
+                arguments_hash TEXT,
+                duration_ms INTEGER NOT NULL,
+                created_at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS tool_audit_project_created_idx
+                ON tool_audit (project_path, created_at_ms DESC);
             ",
         )?;
         self.migrate_provider_names()?;
@@ -840,6 +875,61 @@ impl HookRepository for SqliteStore {
             })?
             .collect::<Result<Vec<_>, _>>()?)
     }
+
+    fn append_tool_audit(&self, entry: &ToolAuditEntry) -> Result<(), PersistenceError> {
+        self.connection.execute(
+            "INSERT INTO tool_audit
+             (project_path, tool, agent_id, agent_level, outcome, reason, request_id, arguments_hash, duration_ms, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                entry.project_path,
+                entry.tool,
+                entry.agent_id,
+                entry.agent_level,
+                entry.outcome,
+                entry.reason,
+                entry.request_id,
+                entry.arguments_hash,
+                entry.duration_ms,
+                entry.created_at_ms,
+            ],
+        )?;
+        self.connection.execute(
+            "DELETE FROM tool_audit WHERE project_path = ?1 AND id NOT IN (
+                 SELECT id FROM tool_audit WHERE project_path = ?1
+                 ORDER BY created_at_ms DESC, id DESC LIMIT ?2
+             )",
+            params![entry.project_path, MAX_HOOK_AUDIT_PER_PROJECT as i64],
+        )?;
+        Ok(())
+    }
+
+    fn recent_tool_audit(
+        &self,
+        project_path: &str,
+        limit: usize,
+    ) -> Result<Vec<ToolAuditEntry>, PersistenceError> {
+        let mut statement = self.connection.prepare(
+            "SELECT project_path, tool, agent_id, agent_level, outcome, reason, request_id, arguments_hash, duration_ms, created_at_ms
+             FROM tool_audit WHERE project_path = ?1 ORDER BY created_at_ms DESC, id DESC LIMIT ?2",
+        )?;
+        Ok(statement
+            .query_map(params![project_path, limit.min(500) as i64], |row| {
+                Ok(ToolAuditEntry {
+                    project_path: row.get(0)?,
+                    tool: row.get(1)?,
+                    agent_id: row.get(2)?,
+                    agent_level: row.get(3)?,
+                    outcome: row.get(4)?,
+                    reason: row.get(5)?,
+                    request_id: row.get(6)?,
+                    arguments_hash: row.get(7)?,
+                    duration_ms: row.get(8)?,
+                    created_at_ms: row.get(9)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
 }
 
 impl PreferencesRepository for SqliteStore {
@@ -919,6 +1009,11 @@ impl PreferencesRepository for SqliteStore {
                                 .unwrap_or_default(),
                             presets: policy
                                 .get("presets")
+                                .cloned()
+                                .and_then(|value| serde_json::from_value(value).ok())
+                                .unwrap_or_default(),
+                            sandbox_config: policy
+                                .get("sandbox_config")
                                 .cloned()
                                 .and_then(|value| serde_json::from_value(value).ok())
                                 .unwrap_or_default(),

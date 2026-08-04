@@ -60,6 +60,13 @@ pub struct Turn {
     /// because a slash command can reach the transcript expanded beyond what
     /// was typed.
     pub optimistic_prompts: std::collections::VecDeque<String>,
+    /// The session's steering and follow-up queues as Pi last reported them.
+    ///
+    /// Pi has no pull for these — `queue_update` only pushes on change — so
+    /// the last push is kept here for when the session becomes visible again:
+    /// the conversation state holds only the visible session's queue.
+    pub queued_steering: Vec<String>,
+    pub queued_follow_up: Vec<String>,
 }
 
 /// One Pi process and the state its current turn accumulates.

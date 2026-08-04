@@ -85,9 +85,9 @@ pub mod radius {
 pub mod layout {
     /// Maximum width of the conversation column.
     pub const CHAT_CONTENT_WIDTH: f32 = 820.0;
-    /// Maximum width of a user message bubble, narrower so the two roles are
-    /// distinguishable at a glance.
-    pub const USER_MESSAGE_WIDTH: f32 = 620.0;
+    /// Maximum width of a user message bubble, kept just under the column so
+    /// the two roles stay distinguishable without squeezing the prompt.
+    pub const USER_MESSAGE_WIDTH: f32 = 760.0;
     /// Fixed sidebar width.
     pub const SIDEBAR_WIDTH: f32 = 260.0;
     /// Spacing of the graph-paper grid's finest lines — pi.dev's `--grid-gap`.

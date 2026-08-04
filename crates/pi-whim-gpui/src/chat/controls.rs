@@ -4,7 +4,10 @@
 //! These render into the prompt's own box rather than as a bar under the top
 //! chrome. They belong next to the prompt because they describe the turn about to
 //! be sent, and as a full-width row they wrapped onto three lines while leaving
-//! most of each one empty.
+//! most of each one empty. The permission grant is the exception: the shell
+//! places it beside the attach button via [`Controls::permission_indicator`],
+//! apart from the turn controls, because what the agent may reach matters
+//! beyond the next prompt.
 //!
 //! All three controls share one flat trigger and one dense popup surface. Models
 //! add search and scrolling; the two short closed lists stay simpler.
@@ -228,30 +231,40 @@ impl Controls {
 
     /// The permission level: a dot, then a picker over the three levels.
     ///
+    /// Rendered by the shell, not by [`Render`]: the grant sits beside the
+    /// attach button on the prompt's left, while the turn's own controls —
+    /// model, thinking — stay beside send. `None` when there is no agent to
+    /// configure, matching what [`Render`] would show.
+    ///
     /// The dot stays separate from the shared trigger because it carries the
     /// warning: full access lets an agent reach the host without asking.
-    fn permission_indicator(&self) -> impl IntoElement {
+    pub fn permission_indicator(&self) -> Option<impl IntoElement> {
+        if !self.visible {
+            return None;
+        }
         let tokens = self.tokens;
         // The tooltip sits on the group rather than the picker: the dot and the
         // level name say what is granted, not what kind of setting this is, and
         // The whole group owns the tooltip, so both the dot and label explain it.
         let label = translate("permission-level", self.language);
-        div()
-            .id("permission-level")
-            .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap(px(5.0))
-            .child(
-                div()
-                    .w(px(DOT_SIZE))
-                    .h(px(DOT_SIZE))
-                    .flex_none()
-                    .rounded(px(radius::DOT))
-                    .bg(permission_color(self.permission, tokens)),
-            )
-            .child(self.permission_picker.clone())
+        Some(
+            div()
+                .id("permission-level")
+                .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(px(5.0))
+                .child(
+                    div()
+                        .w(px(DOT_SIZE))
+                        .h(px(DOT_SIZE))
+                        .flex_none()
+                        .rounded(px(radius::DOT))
+                        .bg(permission_color(self.permission, tokens)),
+                )
+                .child(self.permission_picker.clone()),
+        )
     }
 }
 
@@ -269,13 +282,13 @@ impl Render for Controls {
         // Giving it a second surface drew a bar inside a bar.
         //
         // One line, never wrapped. Every picker uses the same neutral trigger:
-        // quiet at rest, grey on hover or while open.
+        // quiet at rest, grey on hover or while open. The permission indicator
+        // is the shell's to place — see [`Controls::permission_indicator`].
         div()
             .flex()
             .flex_none()
             .items_center()
             .gap(px(10.0))
-            .child(self.permission_indicator())
             .child(
                 div()
                     .when(!self.models.is_empty(), |this| {

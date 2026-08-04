@@ -30,6 +30,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub(crate) fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
 use model::{
     AgentDescriptor, AgentId, AgentMessage, AgentNode, AgentOutcome, AgentSessionEntry,
     AgentStatus, ApprovalRequestArguments, AskUserArguments, BashArguments, ListAgentsArguments,
@@ -39,8 +46,8 @@ use model::{
 };
 use pi_whim_core::{
     AgentModelSelection, AgentPermissionLevel, AgentPermissionPolicy, AgentTeamConfig,
-    HookAuditRecord, HookConfig, HookEvent, SearchEngineId, SearchEngineProfile,
-    normalize_agent_policy, stable_session_id,
+    HookAuditRecord, HookConfig, HookEvent, SearchEngineId, SearchEngineProfile, ToolAuditOutcome,
+    ToolAuditRecord, normalize_agent_policy, stable_session_id,
 };
 use pi_whim_tool_protocol::{
     ASK_USER_TOOL, BASH_TOOL, EDIT_FILE_TOOL, FETCH_TOOL, INTERRUPT_AGENT_TOOL, LIST_AGENTS_TOOL,
@@ -177,6 +184,7 @@ pub(crate) struct HostContext {
     interactions: Arc<Mutex<HashMap<Uuid, PendingInteraction>>>,
     interaction_sender: std::sync::mpsc::Sender<Value>,
     hooks: Arc<hooks::HookDispatcher>,
+    tool_audit_sender: std::sync::mpsc::SyncSender<ToolAuditRecord>,
 }
 
 pub struct AgentSupervisor {
@@ -185,6 +193,7 @@ pub struct AgentSupervisor {
     root_capability: String,
     interaction_receiver: Option<std::sync::mpsc::Receiver<Value>>,
     hook_audit_receiver: Option<std::sync::mpsc::Receiver<HookAuditRecord>>,
+    tool_audit_receiver: Option<std::sync::mpsc::Receiver<ToolAuditRecord>>,
     stopping: Arc<AtomicBool>,
     server_thread: Option<JoinHandle<()>>,
 }
@@ -255,6 +264,7 @@ impl AgentSupervisor {
         let files = file_dispatch::FileCoordinator::for_project(launch.project_path.clone());
         let (interaction_sender, interaction_receiver) = std::sync::mpsc::channel();
         let (hook_audit_sender, hook_audit_receiver) = std::sync::mpsc::sync_channel(512);
+        let (tool_audit_sender, tool_audit_receiver) = std::sync::mpsc::sync_channel(512);
         let hooks = Arc::new(hooks::HookDispatcher::new(
             launch.hooks.clone(),
             launch.project_path.clone(),
@@ -269,6 +279,7 @@ impl AgentSupervisor {
             interactions: Arc::new(Mutex::new(HashMap::new())),
             interaction_sender,
             hooks,
+            tool_audit_sender,
         };
         let stopping = Arc::new(AtomicBool::new(false));
         let server_thread = Some(start_server(listener, host.clone(), stopping.clone()));
@@ -278,6 +289,7 @@ impl AgentSupervisor {
             root_capability,
             interaction_receiver: Some(interaction_receiver),
             hook_audit_receiver: Some(hook_audit_receiver),
+            tool_audit_receiver: Some(tool_audit_receiver),
             stopping,
             server_thread,
         };
@@ -334,6 +346,10 @@ impl AgentSupervisor {
 
     pub fn take_hook_audit_events(&mut self) -> Option<std::sync::mpsc::Receiver<HookAuditRecord>> {
         self.hook_audit_receiver.take()
+    }
+
+    pub fn take_tool_audit_events(&mut self) -> Option<std::sync::mpsc::Receiver<ToolAuditRecord>> {
+        self.tool_audit_receiver.take()
     }
 
     /// Resolve an interaction from the native L0 UI. This intentionally does
@@ -534,6 +550,31 @@ fn dispatch_request_cancellable(
     if !spec.internal
         && let Err(error) = ensure_actor_active(host, actor_id)
     {
+        host.hooks.observe(
+            HookEvent::ToolDenied,
+            hook_payload_for_agent(
+                host,
+                actor_id,
+                Some(&request.request_id),
+                json!({
+                    "tool": request.tool_name,
+                    "agent_id": actor_id,
+                    "reason": error.code,
+                    "message": error.message,
+                }),
+            ),
+        );
+        record_tool_audit(
+            host,
+            &request.tool_name,
+            actor_id,
+            get_agent_level(host, actor_id),
+            ToolAuditOutcome::DeniedByInactive,
+            Some(format!("{}: {}", error.code, error.message)),
+            Some(request.request_id.clone()),
+            None,
+            0,
+        );
         return ToolResponse::error_with_details(
             request.request_id,
             error.code,
@@ -578,6 +619,31 @@ fn dispatch_request_cancellable(
                     }
                 }
                 hooks::HookDecision::Deny(message) => {
+                    host.hooks.observe(
+                        HookEvent::ToolDenied,
+                        hook_payload_for_agent(
+                            host,
+                            actor_id,
+                            Some(&request.request_id),
+                            json!({
+                                "tool": spec.name,
+                                "agent_id": actor_id,
+                                "reason": "hook_denied",
+                                "message": message,
+                            }),
+                        ),
+                    );
+                    record_tool_audit(
+                        host,
+                        spec.name,
+                        actor_id,
+                        actor.level,
+                        ToolAuditOutcome::DeniedByHook,
+                        Some(format!("hook_denied: {message}")),
+                        Some(request.request_id.clone()),
+                        None,
+                        0,
+                    );
                     return ToolResponse::error(request.request_id, "hook_denied", message);
                 }
             }
@@ -586,6 +652,31 @@ fn dispatch_request_cancellable(
     if matches!(spec.permission, ToolPermission::NeedsApproval)
         && let Err(error) = ensure_tool_enabled(host, actor_id, spec.name)
     {
+        host.hooks.observe(
+            HookEvent::ToolDenied,
+            hook_payload_for_agent(
+                host,
+                actor_id,
+                Some(&request.request_id),
+                json!({
+                    "tool": spec.name,
+                    "agent_id": actor_id,
+                    "reason": error.code,
+                    "message": error.message,
+                }),
+            ),
+        );
+        record_tool_audit(
+            host,
+            spec.name,
+            actor_id,
+            get_agent_level(host, actor_id),
+            ToolAuditOutcome::DeniedByPolicy,
+            Some(format!("{}: {}", error.code, error.message)),
+            Some(request.request_id.clone()),
+            None,
+            0,
+        );
         return ToolResponse::error_with_details(
             request.request_id,
             error.code,
@@ -608,6 +699,17 @@ fn dispatch_request_cancellable(
                     }),
                 ),
             );
+            record_tool_audit(
+                host,
+                spec.name,
+                actor_id,
+                get_agent_level(host, actor_id),
+                ToolAuditOutcome::Completed,
+                None,
+                Some(request.request_id.clone()),
+                Some(tool_arguments_hash(&request.arguments)),
+                0,
+            );
             ToolResponse::success(request.request_id, content)
         }
         Err(error) => {
@@ -619,6 +721,17 @@ fn dispatch_request_cancellable(
                     Some(&request.request_id),
                     json!({"tool": spec.name, "agent_id": actor_id, "success": false}),
                 ),
+            );
+            record_tool_audit(
+                host,
+                spec.name,
+                actor_id,
+                get_agent_level(host, actor_id),
+                ToolAuditOutcome::Failed,
+                Some(format!("{}: {}", error.code, error.message)),
+                Some(request.request_id.clone()),
+                Some(tool_arguments_hash(&request.arguments)),
+                0,
             );
             ToolResponse::error_with_details(
                 request.request_id,
@@ -1170,6 +1283,56 @@ fn add_agent_hook_context(
     payload
 }
 
+/// Record a tool audit event for compliance. This is a best-effort send;
+/// if the channel is full, the record is dropped (the supervisor never blocks
+/// on compliance logging).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_tool_audit(
+    host: &HostContext,
+    tool: &str,
+    agent_id: AgentId,
+    agent_level: u8,
+    outcome: ToolAuditOutcome,
+    reason: Option<String>,
+    request_id: Option<String>,
+    arguments_hash: Option<String>,
+    duration_ms: u64,
+) {
+    let _ = host.tool_audit_sender.try_send(ToolAuditRecord {
+        tool: tool.to_owned(),
+        agent_id: agent_id.to_string(),
+        agent_level,
+        outcome,
+        reason,
+        request_id,
+        arguments_hash,
+        duration_ms,
+        created_at_ms: now_ms(),
+    });
+}
+
+/// Compute a SHA-256 hash of the tool arguments for audit logging.
+/// This avoids storing plaintext arguments in the audit log.
+pub(crate) fn tool_arguments_hash(arguments: &Value) -> String {
+    use sha2::Digest;
+    let encoded = serde_json::to_string(arguments).unwrap_or_default();
+    format!("{:x}", sha2::Sha256::digest(encoded.as_bytes()))
+}
+
+/// Read the agent level from shared state. Returns 0 if unavailable.
+pub(crate) fn get_agent_level(host: &HostContext, agent_id: AgentId) -> u8 {
+    let (lock, _) = &*host.shared;
+    lock.lock()
+        .ok()
+        .and_then(|state| {
+            state
+                .actors
+                .get(&agent_id)
+                .map(|node| node.descriptor.level)
+        })
+        .unwrap_or(0)
+}
+
 pub(crate) fn hook_payload_for_agent(
     host: &HostContext,
     actor_id: AgentId,
@@ -1386,6 +1549,66 @@ fn spawn_agent(
     let (agent_id, capability, level, policy, delegated_models) =
         reserve_child(host, parent_id, &arguments)?;
     let name = arguments.name.clone();
+
+    // AgentLaunching Gate: deny by final model/policy before process launch.
+    // This is an Observe-only event in the HookConfig, but we treat it as a
+    // Gate here — the supervisor calls gate() which rejects through HookDecision::Deny.
+    let _agent = file_actor(host, agent_id)
+        .map_err(|_| HostError::new("internal", "reserved agent is unavailable"))?;
+    match host.hooks.gate(
+        HookEvent::AgentLaunching,
+        hook_payload_for_agent(
+            host,
+            agent_id,
+            Some(request_id),
+            json!({
+                "agent_id": agent_id,
+                "agent_level": level,
+                "arguments": {
+                    "name": arguments.name,
+                    "task": arguments.task,
+                    "role": arguments.role,
+                    "provider": arguments.provider,
+                    "model": arguments.model,
+                    "permission_level": policy.level,
+                },
+                "effective_policy": policy,
+                "delegated_models": delegated_models,
+            }),
+        ),
+    ) {
+        hooks::HookDecision::Deny(message) => {
+            host.hooks.observe(
+                HookEvent::ToolDenied,
+                hook_payload_for_agent(
+                    host,
+                    parent_id,
+                    Some(request_id),
+                    json!({
+                        "tool": "spawn_agent",
+                        "agent_id": parent_id,
+                        "reason": "hook_denied",
+                        "message": message,
+                    }),
+                ),
+            );
+            // Clean up the reserved agent
+            let (lock, condition) = &*host.shared;
+            if let Ok(mut state) = lock.lock()
+                && let Some(node) = state.actors.get_mut(&agent_id)
+            {
+                node.descriptor.status = AgentStatus::Failed;
+                node.outcome.error = message.clone();
+                record_session_entry(node, "error", None, &message);
+                catalog::unregister_active(node.descriptor.session_id);
+                catalog::publish(node);
+            }
+            condition.notify_all();
+            return Err(HostError::new("hook_denied", message));
+        }
+        hooks::HookDecision::Continue(_) => {}
+    }
+
     if let Err(error) = process::launch_child(
         host,
         agent_id,
@@ -1850,6 +2073,20 @@ fn resolve_interaction_for_owner(
             hooks::HookDecision::Deny(_)
         )
     {
+        host.hooks.observe(
+            HookEvent::ToolDenied,
+            hook_payload_for_agent(
+                host,
+                owner_id,
+                Some(&request_id.to_string()),
+                json!({
+                    "tool": "resolve_interaction",
+                    "agent_id": owner_id,
+                    "reason": "hook_denied",
+                    "message": "permission resolution was denied by a hook",
+                }),
+            ),
+        );
         return Err(HostError::new(
             "hook_denied",
             "permission resolution was denied by a hook",

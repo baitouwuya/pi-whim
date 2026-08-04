@@ -1261,15 +1261,19 @@ impl Workspace {
             (composer.attach_button(cx), composer.send_button(cx))
         });
 
-        // One line, never wrapped. Attach sits alone on the left; everything that
-        // describes the turn — permission, model, thinking — gathers at the right
-        // beside send, so the settings read as one group next to the action they
-        // apply to rather than trailing off from the attach button.
+        // One line, never wrapped. Attach and the permission grant sit on the
+        // left — both about what goes into the turn, not how it runs; model and
+        // thinking gather at the right beside send, so the turn's own settings
+        // read as one group next to the action they apply to.
         let footer = div()
             .flex()
             .items_center()
             .gap(px(8.0))
             .child(attach)
+            .when_some(
+                self.controls.read(cx).permission_indicator(),
+                |this, grant| this.child(grant),
+            )
             // Takes the slack, so the group stays at the right edge however wide
             // the window gets.
             .child(div().flex_1().min_w(px(0.0)))
@@ -1308,6 +1312,19 @@ impl Workspace {
                     .w_full()
                     .child(self.palette.clone()),
             )
+            // The queue floats over the prompt's top-right corner, anchored
+            // like the palette: inside the box it stole a row from the field,
+            // and the box grew and shrank as messages queued and drained.
+            .when_some(queue_status, |this, status| {
+                this.child(
+                    div()
+                        .absolute()
+                        .bottom_full()
+                        .right_0()
+                        .mb(px(6.0))
+                        .child(status),
+                )
+            })
             .child(
                 div()
                     .flex()
@@ -1322,7 +1339,6 @@ impl Workspace {
                     .border_1()
                     .border_color(tokens.line.hsla())
                     .child(self.composer.clone())
-                    .when_some(queue_status, |this, status| this.child(status))
                     .child(footer),
             )
     }

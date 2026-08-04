@@ -260,6 +260,53 @@ pub struct AgentPermissionPreset {
     pub policy: AgentPermissionPolicy,
 }
 
+/// Monotonic-tightening sandbox restrictions for child agents and controlled bash.
+///
+/// Every field can only reduce permissions; none can expand them. The default
+/// (all `false` / empty vectors) matches the current hardcoded behavior.
+/// Paths are canonicalized before injection into the sandbox-exec DSL.
+/// Environment variables are dropped from the already-minimal filtered
+/// environment; they cannot be injected or restored.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxConfig {
+    /// When true, deny all network access for child agent processes.
+    /// Child agents normally allow outbound TCP for model inference.
+    /// Setting this to true will break model inference for subagents.
+    #[serde(default)]
+    pub deny_child_network: bool,
+    /// When true, deny all network access for controlled bash.
+    /// Bash already denies network by default, so this is a no-op unless
+    /// the default network policy changes in the future.
+    #[serde(default)]
+    pub deny_bash_network: bool,
+    /// Additional paths to deny read access for child agents.
+    /// These are denied after the allow rules, so they can restrict paths
+    /// that would otherwise be allowed (e.g., subpaths of the project root).
+    #[serde(default)]
+    pub child_deny_read_paths: Vec<std::path::PathBuf>,
+    /// Additional paths to deny write access for child agents.
+    #[serde(default)]
+    pub child_deny_write_paths: Vec<std::path::PathBuf>,
+    /// Environment variable names to drop from the child agent environment.
+    /// These are removed from the already-minimal filtered environment.
+    /// Cannot be used to inject or restore variables.
+    #[serde(default)]
+    pub drop_environment_vars: Vec<String>,
+}
+
+impl SandboxConfig {
+    pub fn normalized(mut self) -> Self {
+        self.child_deny_read_paths.sort();
+        self.child_deny_read_paths.dedup();
+        self.child_deny_write_paths.sort();
+        self.child_deny_write_paths.dedup();
+        self.drop_environment_vars.sort();
+        self.drop_environment_vars.dedup();
+        self.drop_environment_vars.retain(|v| !v.trim().is_empty());
+        self
+    }
+}
+
 /// Limits a level-0 agent team. Level counts are global within one team, not per parent.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentTeamConfig {
@@ -270,6 +317,8 @@ pub struct AgentTeamConfig {
     pub default_policy: AgentPermissionPolicy,
     #[serde(default)]
     pub presets: Vec<AgentPermissionPreset>,
+    #[serde(default)]
+    pub sandbox_config: SandboxConfig,
 }
 
 /// Declarative hook configuration loaded from the user or project hook manifest.
@@ -315,6 +364,35 @@ pub enum HookAuditOutcome {
     Succeeded,
     Failed,
     TimedOut,
+}
+
+/// Structured record of a tool dispatch outcome for compliance audit.
+/// This is separate from HookAuditRecord — it captures the tool's lifecycle
+/// (allowed, denied, completed, failed) with agent context and a reason.
+/// The `arguments_hash` field contains a SHA-256 of the tool arguments,
+/// not the arguments themselves, so sensitive parameters are never stored.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolAuditRecord {
+    pub tool: String,
+    pub agent_id: String,
+    pub agent_level: u8,
+    pub outcome: ToolAuditOutcome,
+    pub reason: Option<String>,
+    pub request_id: Option<String>,
+    pub arguments_hash: Option<String>,
+    pub duration_ms: u64,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolAuditOutcome {
+    Allowed,
+    DeniedByHook,
+    DeniedByPolicy,
+    DeniedByInactive,
+    Completed,
+    Failed,
 }
 
 impl HookConfig {
@@ -386,6 +464,7 @@ impl HookConfig {
                     | HookEvent::SessionPublished
                     | HookEvent::SessionExpired
                     | HookEvent::ToolCompleted
+                    | HookEvent::ToolDenied
                     | HookEvent::AgentStarted
                     | HookEvent::AgentFinished
                     | HookEvent::MessageDelivered
@@ -393,11 +472,18 @@ impl HookConfig {
                     | HookEvent::InteractionResolved
                     | HookEvent::TeamReset
             );
+            let gate_only_event = matches!(
+                hook.event,
+                HookEvent::PermissionResolving | HookEvent::AgentLaunching
+            );
             if observe_event != matches!(hook.kind, HookKind::Observe) {
                 return Err(format!(
                     "hook {} kind does not match its event phase",
                     hook.id
                 ));
+            }
+            if gate_only_event && !matches!(hook.kind, HookKind::Gate) {
+                return Err(format!("hook {} must be a Gate for this event", hook.id));
             }
             if matches!(hook.kind, HookKind::Transform)
                 && !matches!(
@@ -454,7 +540,15 @@ pub enum HookEvent {
     AgentSpawning,
     MessageSending,
     PermissionResolving,
+    /// Read-only Gate: fires after final model/policy is resolved but before
+    /// the subagent process is launched. Payload is deny-only; Transform is
+    /// not allowed. Hooks can deny by final model, effective policy, or
+    /// delegated model selection.
+    AgentLaunching,
     ToolCompleted,
+    /// Observe: fires when a tool dispatch is denied by a Gate hook or by
+    /// `ensure_tool_enabled`. Provides structured denial reason for audit.
+    ToolDenied,
     AgentStarted,
     AgentFinished,
     MessageDelivered,
@@ -505,6 +599,7 @@ impl Default for AgentTeamConfig {
             max_agents_per_level: 4,
             default_policy: AgentPermissionPolicy::default(),
             presets: Vec::new(),
+            sandbox_config: SandboxConfig::default(),
         }
     }
 }
@@ -525,6 +620,7 @@ impl AgentTeamConfig {
                 })
             })
             .collect();
+        self.sandbox_config = self.sandbox_config.normalized();
         self
     }
 

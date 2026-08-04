@@ -72,7 +72,9 @@ impl RustHook for SafetyFloorHook {
                     }
                 }
             }
-            HookEvent::PermissionResolving | HookEvent::ToolDispatching => {}
+            HookEvent::PermissionResolving
+            | HookEvent::ToolDispatching
+            | HookEvent::AgentLaunching => {}
             _ => return Ok(()),
         }
         Ok(())

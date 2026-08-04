@@ -12,7 +12,7 @@ use crate::{
     hook_payload_for_agent,
     model::{AgentId, AgentStatus, ProcessCommand, SpawnAgentArguments},
 };
-use pi_whim_core::{AgentModelSelection, AgentPermissionPolicy, HookEvent};
+use pi_whim_core::{AgentModelSelection, AgentPermissionPolicy, HookEvent, SandboxConfig};
 use serde_json::json;
 
 const MAX_JSONL_RECORD_BYTES: usize = 1024 * 1024;
@@ -49,9 +49,16 @@ pub fn launch_child(
     if delegated_models.len() != 1 {
         return Err("a subagent launch requires exactly one delegated provider and model".into());
     }
-    let environment = filtered_environment(host, &delegated_models)?;
+    let sandbox = &host.launch.team_config.sandbox_config;
+    let environment = filtered_environment(host, &delegated_models, sandbox)?;
     let extensions = trusted_extension_paths(host, &policy)?;
-    let mut command = child_command(host, &policy, &environment.temporary_directory, &extensions);
+    let mut command = child_command(
+        host,
+        &policy,
+        &environment.temporary_directory,
+        &extensions,
+        sandbox,
+    );
     command.current_dir(&host.launch.project_path).args([
         "--mode",
         "json",
@@ -236,6 +243,7 @@ fn child_command(
     policy: &AgentPermissionPolicy,
     child_directory: &std::path::Path,
     extensions: &[std::path::PathBuf],
+    sandbox: &SandboxConfig,
 ) -> Command {
     if policy.level == pi_whim_core::AgentPermissionLevel::Full {
         return Command::new(&host.launch.executable);
@@ -245,7 +253,8 @@ fn child_command(
         child_directory,
         &host.launch.executable,
         extensions,
-        child_network_policy(host),
+        child_network_policy(sandbox),
+        sandbox,
     );
     let mut command = Command::new("/usr/bin/sandbox-exec");
     command.args(["-p", &profile]).arg(&host.launch.executable);
@@ -258,6 +267,7 @@ fn child_sandbox_profile(
     executable: &std::path::Path,
     extensions: &[std::path::PathBuf],
     network_policy: &str,
+    sandbox: &SandboxConfig,
 ) -> String {
     fn quoted(path: &std::path::Path) -> String {
         path.to_string_lossy().replace('"', "\\\"")
@@ -291,8 +301,26 @@ fn child_sandbox_profile(
         let dir = canonical(dir);
         read_paths.push(format!("(subpath \"{}\")", quoted(&dir)));
     }
+
+    // Monotonic deny paths: placed before allow rules so first-match-wins
+    // narrows the allowed set. These are deny rules that override any allow.
+    let mut deny_rules = Vec::new();
+    for path in &sandbox.child_deny_read_paths {
+        deny_rules.push(format!(
+            "(deny file-read* (subpath \"{}\"))",
+            quoted(&canonical(path))
+        ));
+    }
+    for path in &sandbox.child_deny_write_paths {
+        deny_rules.push(format!(
+            "(deny file-write* (subpath \"{}\"))",
+            quoted(&canonical(path))
+        ));
+    }
+    let deny_rules = deny_rules.join(" ");
+
     format!(
-        "(version 1) (deny default) (import \"system.sb\") (allow process*) (allow file-read* {}) (allow file-write* (subpath \"{}\")) {network_policy}",
+        "(version 1) (deny default) (import \"system.sb\") (allow process*) {deny_rules} (allow file-read* {}) (allow file-write* (subpath \"{}\")) {network_policy}",
         read_paths.join(" "),
         quoted(&project_root),
     )
@@ -301,13 +329,19 @@ fn child_sandbox_profile(
 // sandbox-exec cannot safely express an arbitrary HTTPS hostname allowlist.
 // The child receives only one provider credential; network is limited to outbound
 // TCP so model inference works without granting listener or local-socket access.
-fn child_network_policy(_host: &HostContext) -> &'static str {
-    "(allow network-outbound (remote tcp))"
+// When sandbox.deny_child_network is true, all network access is denied.
+fn child_network_policy(sandbox: &SandboxConfig) -> &'static str {
+    if sandbox.deny_child_network {
+        "(deny network*)"
+    } else {
+        "(allow network-outbound (remote tcp))"
+    }
 }
 
 fn filtered_environment(
     host: &HostContext,
     delegated_models: &[AgentModelSelection],
+    sandbox: &SandboxConfig,
 ) -> Result<ChildEnvironment, String> {
     let model = delegated_models
         .first()
@@ -376,6 +410,13 @@ fn filtered_environment(
     {
         environment.insert(api_key.to_owned(), value.clone());
     }
+
+    // Apply monotonic environment restrictions: drop named variables.
+    // This can only remove variables, never inject or restore them.
+    for var in &sandbox.drop_environment_vars {
+        environment.remove(var);
+    }
+
     Ok(ChildEnvironment {
         values: environment,
         temporary_directory: directory,
@@ -632,12 +673,14 @@ mod tests {
 
     #[test]
     fn child_sandbox_profile_limits_filesystem_and_network() {
+        let sandbox = SandboxConfig::default();
         let profile = child_sandbox_profile(
             std::path::Path::new("/project"),
             std::path::Path::new("/temporary-child"),
             std::path::Path::new("/usr/local/bin/pi"),
             &[std::path::PathBuf::from("/extensions/team.ts")],
             "(allow network-outbound (remote tcp))",
+            &sandbox,
         );
         assert!(profile.contains("(import \"system.sb\")"));
         // Non-existent paths fall back to the literal path when canonicalize fails.

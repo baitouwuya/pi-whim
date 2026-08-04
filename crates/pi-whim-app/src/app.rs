@@ -16,7 +16,7 @@ use pi_whim_core::{
     HookAuditRecord, HookAuditSummary, HookConfig, Language, ModelOption, Project,
     ProjectHookStatus, ProjectId, ProviderId, ProviderProfile, ProviderProtocol, QueueMode,
     SESSION_TITLE_TASK_KIND, SearchEngineId, SearchEngineProfile, SessionMetrics, SessionStatus,
-    SessionSummary, SubmitMode, ThinkingLevel, normalize_bash_patterns,
+    SessionSummary, SubmitMode, ThinkingLevel, ToolAuditRecord, normalize_bash_patterns,
     normalize_provider_display_name, provider_name_key, stable_session_id, strings,
 };
 use pi_whim_one_shot_ai::{
@@ -26,7 +26,7 @@ use pi_whim_one_shot_ai::{
 use pi_whim_persistence::{
     AppPreferences, AttachmentStore, HookAuditEntry, HookRepository, MacosKeychainStore,
     PreferencesRepository, ProjectRepository, ProviderRepository, SearchEngineRepository,
-    SecretStore, SessionRepository, SqliteStore, hook_configuration_fingerprints,
+    SecretStore, SessionRepository, SqliteStore, ToolAuditEntry, hook_configuration_fingerprints,
     hook_manifest_fingerprint, persist_session_title_to_jsonl, session_summary_from_jsonl,
 };
 use pi_whim_runtime::{AgentRuntime, PiRpcRuntime, RuntimeEvent, RuntimeStart};
@@ -1527,6 +1527,10 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         };
         let project_id = session.project_id;
         let running = session.is_running();
+        // The visible state carries one session's queue; restore the incoming
+        // session's rather than leaving the previous one's behind.
+        let queued_steering = session.turn.queued_steering.clone();
+        let queued_follow_up = session.turn.queued_follow_up.clone();
         self.apply(Action::SelectProject(project_id));
         if let Some(project) = self.find_project(project_id) {
             let _ = self.load_hooks(&project.path);
@@ -1540,6 +1544,10 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         } else {
             SessionStatus::Ready
         }));
+        self.apply(Action::QueueUpdated {
+            steering: queued_steering,
+            follow_up: queued_follow_up,
+        });
         let _ = self.load_current_entries();
         self.refresh_runtime_controls();
     }
@@ -1576,6 +1584,10 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         if was_visible {
             self.apply(Action::ClearConversation);
             self.apply(Action::SetSessionStatus(SessionStatus::Offline));
+            self.apply(Action::QueueUpdated {
+                steering: Vec::new(),
+                follow_up: Vec::new(),
+            });
         }
     }
 
@@ -2049,6 +2061,10 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             if was_visible {
                 self.apply(Action::ClearConversation);
                 self.apply(Action::SetSessionStatus(SessionStatus::Offline));
+                self.apply(Action::QueueUpdated {
+                    steering: Vec::new(),
+                    follow_up: Vec::new(),
+                });
             }
         }
         let target = PathBuf::from(&path);
@@ -2757,6 +2773,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                     .extend(dialogs::Prompt::from_interaction(key, &value));
             }
             RuntimeEvent::HookAudit(record) => self.persist_hook_audit(key, record),
+            RuntimeEvent::ToolAudit(record) => self.persist_tool_audit(key, record),
             RuntimeEvent::Stderr(message) => {
                 if is_active && !message.trim().is_empty() {
                     self.notices.error(message);
@@ -2828,6 +2845,37 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             self.notices.error(error.to_string());
         } else if self.state().selected_project == Some(project.id) {
             self.refresh_hook_audit(&project.path);
+        }
+    }
+
+    fn persist_tool_audit(&mut self, session_key: &str, record: ToolAuditRecord) {
+        let Some(project) = self
+            .sessions
+            .get(session_key)
+            .and_then(|session| self.find_project(session.project_id))
+        else {
+            return;
+        };
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        let outcome = serde_json::to_value(record.outcome)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "failed".into());
+        if let Err(error) = store.append_tool_audit(&ToolAuditEntry {
+            project_path: project.path.clone(),
+            tool: record.tool,
+            agent_id: record.agent_id,
+            agent_level: record.agent_level,
+            outcome,
+            reason: record.reason,
+            request_id: record.request_id,
+            arguments_hash: record.arguments_hash,
+            duration_ms: record.duration_ms,
+            created_at_ms: now_ms(),
+        }) {
+            self.notices.error(error.to_string());
         }
     }
 
@@ -3516,6 +3564,44 @@ mod tests {
         assert_eq!(app.sessions.active_key(), Some(running_key.as_str()));
         assert_eq!(app.sessions.iter().count(), 2);
         assert_eq!(observer.starts().len(), 2);
+    }
+
+    #[test]
+    fn the_queue_follows_the_session_it_belongs_to() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = test_application(&directory, FakeRuntime::default());
+        start_test_session(&mut app, &directory);
+        let project_id = app.state().selected_project.unwrap();
+        let first_key = app.sessions.active_key().unwrap().to_owned();
+
+        // Queue something in session A while it is visible.
+        app.apply_agent_event(
+            &first_key,
+            json!({"type": "queue_update", "steering": ["keep going"], "followUp": ["then this"]}),
+        );
+        assert_eq!(app.state().pending_steering, vec!["keep going".to_owned()]);
+        assert_eq!(app.state().pending_follow_up, vec!["then this".to_owned()]);
+
+        // Switching away shows B's queue — empty — not A's leftovers.
+        app.switch_session(project_id, "/sessions/b.jsonl".into());
+        assert!(app.state().pending_steering.is_empty());
+        assert!(app.state().pending_follow_up.is_empty());
+
+        // A queue change while A is in the background is cached for it without
+        // touching the visible session's state.
+        app.apply_agent_event(
+            &first_key,
+            json!({"type": "queue_update", "steering": ["keep going", "and faster"], "followUp": []}),
+        );
+        assert!(app.state().pending_steering.is_empty());
+
+        // Switching back restores A's queue as Pi last reported it.
+        app.switch_session(project_id, first_key.clone());
+        assert_eq!(
+            app.state().pending_steering,
+            vec!["keep going".to_owned(), "and faster".to_owned()]
+        );
+        assert!(app.state().pending_follow_up.is_empty());
     }
 
     #[test]

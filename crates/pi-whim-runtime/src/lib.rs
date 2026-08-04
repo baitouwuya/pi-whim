@@ -14,6 +14,7 @@ use pi_whim_agent_team::{AgentLaunchConfig, AgentSupervisor};
 pub use pi_whim_agent_team::{SearchEngineApiKeys, test_search_engine};
 use pi_whim_core::{
     AgentPermissionLevel, AgentTeamConfig, HookAuditRecord, HookConfig, SearchEngineProfile,
+    ToolAuditRecord,
 };
 use pi_whim_pi_rpc::{PiLaunch, PiRpcClient, PiRpcEvent, RpcError};
 use serde_json::{Value, json};
@@ -54,6 +55,7 @@ pub enum RuntimeEvent {
     ExtensionUi(Value),
     Interaction(Value),
     HookAudit(HookAuditRecord),
+    ToolAudit(ToolAuditRecord),
     Stderr(String),
     Exited { generation: u64, code: Option<i32> },
     Error(String),
@@ -231,6 +233,17 @@ impl PiRpcRuntime {
         });
     }
 
+    fn forward_tool_audit(&self, receiver: std::sync::mpsc::Receiver<ToolAuditRecord>) {
+        let sender = self.event_sender.clone();
+        thread::spawn(move || {
+            for record in receiver {
+                if sender.send(RuntimeEvent::ToolAudit(record)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
     fn advance_generation(&mut self) {
         self.generation = self.generation.wrapping_add(1);
     }
@@ -262,6 +275,9 @@ impl AgentRuntime for PiRpcRuntime {
         }
         if let Some(audit) = supervisor.take_hook_audit_events() {
             self.forward_hook_audit(audit);
+        }
+        if let Some(tool_audit) = supervisor.take_tool_audit_events() {
+            self.forward_tool_audit(tool_audit);
         }
         let mut launch = PiLaunch::new(executable.to_string_lossy(), &config.project_path);
         launch

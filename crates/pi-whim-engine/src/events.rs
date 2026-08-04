@@ -24,6 +24,7 @@ use crate::{
         assistant_text, tool_call_report, tool_event_details, tool_result_report,
         tool_result_summary,
     },
+    session::split_attachment_paths,
 };
 
 const EMPTY_PROVIDER_RESPONSE: &str =
@@ -260,11 +261,16 @@ pub fn translate(event: &Value, context: Context<'_>, turn: &mut Turn) -> Outcom
         }
 
         Some("queue_update") => {
+            // Cached per session even when it is in the background: the event
+            // is the only way Pi reports its queues, so the last one is all a
+            // later activation has to restore from.
+            turn.queued_steering = string_list(event.get("steering"));
+            turn.queued_follow_up = string_list(event.get("followUp"));
             outcome.act_if_active(
                 &context,
                 Action::QueueUpdated {
-                    steering: string_list(event.get("steering")),
-                    follow_up: string_list(event.get("followUp")),
+                    steering: turn.queued_steering.clone(),
+                    follow_up: turn.queued_follow_up.clone(),
                 },
             );
         }
@@ -483,6 +489,7 @@ pub fn session_entry_action(entry: &Value) -> Option<Action> {
         .get("isError")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let mut attachments = Vec::new();
     let text = match role {
         ConversationRole::Assistant if empty_successful_assistant(message) => {
             is_error = true;
@@ -491,6 +498,15 @@ pub fn session_entry_action(entry: &Value) -> Option<Action> {
         ConversationRole::Assistant => assistant_text(message),
         ConversationRole::Tool => {
             tool_result_summary(tool_name.as_deref(), message.get("content"), is_error)
+        }
+        ConversationRole::User => {
+            // Pi stores the prompt as it was sent, attachment paths appended;
+            // split them back off so the bubble shows chips rather than the
+            // wire format.
+            let raw = content_text(message.get("content")).unwrap_or_else(|| message.to_string());
+            let (text, found) = split_attachment_paths(&raw);
+            attachments = found;
+            text
         }
         // Falling back to the raw JSON is deliberate: an entry shape this does
         // not know is better shown verbatim than silently dropped.
@@ -521,7 +537,7 @@ pub fn session_entry_action(entry: &Value) -> Option<Action> {
             .get("model")
             .and_then(Value::as_str)
             .map(str::to_owned),
-        attachments: Vec::new(),
+        attachments,
     }))
 }
 
@@ -1143,6 +1159,22 @@ mod tests {
     }
 
     #[test]
+    fn a_background_queue_update_is_cached_for_activation_not_shown() {
+        // The view holds one session's queue, so a background session's report
+        // goes to its turn: the only copy an activation later restores from.
+        let mut turn = Turn::default();
+        let outcome = translate(
+            &json!({"type": "queue_update", "steering": ["hold"], "followUp": []}),
+            background(),
+            &mut turn,
+        );
+
+        assert_eq!(outcome, Outcome::default());
+        assert_eq!(turn.queued_steering, vec!["hold".to_owned()]);
+        assert!(turn.queued_follow_up.is_empty());
+    }
+
+    #[test]
     fn a_settled_agent_stops_reads_back_its_transcript_and_refreshes_controls() {
         let mut turn = Turn {
             running: true,
@@ -1585,6 +1617,27 @@ mod tests {
         assert_eq!(item.full_text, "hello");
         assert_eq!(item.tool_report, None);
         assert_eq!(item.tool_details, None);
+    }
+
+    #[test]
+    fn a_reloaded_prompt_rebuilds_its_attachments() {
+        // The wire format appends attachment paths to the prompt; a reload
+        // turns them back into chips instead of showing the paths as text.
+        let temporary = tempfile::tempdir().unwrap();
+        let file = temporary.path().join("pasted-image.png");
+        std::fs::write(&file, "png").unwrap();
+        let path = file.canonicalize().unwrap().to_string_lossy().into_owned();
+
+        let Some(Action::UpsertConversation(item)) = session_entry_action(&json!({
+            "id": "e1",
+            "message": {"role": "user", "content": format!("what is this\n{path}")},
+        })) else {
+            panic!("expected an entry");
+        };
+
+        assert_eq!(item.full_text, "what is this");
+        assert_eq!(item.attachments.len(), 1);
+        assert_eq!(item.attachments[0].name, "pasted-image.png");
     }
 
     #[test]

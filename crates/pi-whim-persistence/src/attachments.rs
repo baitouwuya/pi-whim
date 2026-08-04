@@ -34,11 +34,18 @@ pub struct AttachmentStore {
 }
 
 impl AttachmentStore {
-    pub fn open_default() -> Self {
-        let root = dirs::data_dir()
+    /// Where generated files live when nothing overrides it. Shared with
+    /// readers that rebuild attachments from a transcript, so a path under
+    /// this root is recognised as app-owned there too.
+    pub fn default_root() -> PathBuf {
+        dirs::data_dir()
             .unwrap_or_else(std::env::temp_dir)
             .join("pi-whim")
-            .join("attachments");
+            .join("attachments")
+    }
+
+    pub fn open_default() -> Self {
+        let root = Self::default_root();
         Self::open(root.clone()).unwrap_or_else(|error| Self {
             manifest_path: root.join(MANIFEST_NAME),
             root,

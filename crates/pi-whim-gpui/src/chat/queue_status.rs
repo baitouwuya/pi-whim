@@ -7,7 +7,7 @@ use gpui::{
 use pi_whim_core::{AppState, Language, strings::text as translate};
 use pi_whim_theme::{Tokens, text};
 
-use crate::theme::IntoHsla;
+use crate::{chat::message_card::opaque_over, theme::IntoHsla};
 
 /// The clear chip's click handler, named so the field stays readable.
 type OnClear = Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>;
@@ -59,7 +59,9 @@ impl RenderOnce for QueueStatus {
                     div()
                         .px(px(6.0))
                         .py(px(2.0))
-                        .bg(tokens.accent_surface_soft().hsla())
+                        // Floating over the graph paper now: composite the fill
+                        // or the grid runs through the chip.
+                        .bg(opaque_over(tokens.accent_surface_soft(), tokens))
                         .border_1()
                         .border_color(tokens.accent_border_muted().hsla())
                         .text_size(px(text::LABEL_SIZE))
@@ -76,7 +78,7 @@ impl RenderOnce for QueueStatus {
                     div()
                         .px(px(6.0))
                         .py(px(2.0))
-                        .bg(tokens.surface_tint().hsla())
+                        .bg(opaque_over(tokens.surface_tint(), tokens))
                         .border_1()
                         .border_color(tokens.line.hsla())
                         .text_size(px(text::LABEL_SIZE))
@@ -94,6 +96,7 @@ impl RenderOnce for QueueStatus {
                         .id("queue-clear")
                         .px(px(6.0))
                         .py(px(2.0))
+                        .bg(opaque_over(tokens.surface_tint(), tokens))
                         .border_1()
                         .border_color(tokens.line.hsla())
                         .text_size(px(text::LABEL_SIZE))

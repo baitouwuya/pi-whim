@@ -72,7 +72,12 @@ pub fn execute(
     if arguments.background {
         ensure_background_capacity(host, actor_id)?;
     }
-    let mut child = spawn_command(&host.launch.project_path, command, actor.permission_level)?;
+    let mut child = spawn_command(
+        &host.launch.project_path,
+        command,
+        actor.permission_level,
+        &host.launch.team_config.sandbox_config,
+    )?;
     if arguments.background {
         let timeout_seconds = arguments.timeout.unwrap_or(DEFAULT_TIMEOUT_SECONDS);
         let stdout = child.stdout.take();
@@ -629,6 +634,7 @@ fn spawn_command(
     cwd: &std::path::Path,
     command: &str,
     permission_level: AgentPermissionLevel,
+    sandbox: &pi_whim_core::SandboxConfig,
 ) -> Result<std::process::Child, HostError> {
     let mut process = Command::new("/bin/bash");
     if permission_level == AgentPermissionLevel::Controlled {
@@ -640,7 +646,7 @@ fn spawn_command(
         }
         let argv = shell_words(command)?;
         let executable = resolve_controlled_executable(&argv[0])?;
-        let profile = sandbox_profile(cwd);
+        let profile = sandbox_profile(cwd, sandbox);
         process = Command::new("/usr/bin/sandbox-exec");
         process
             .args(["-p", &profile])
@@ -677,10 +683,42 @@ fn resolve_controlled_executable(name: &str) -> Result<std::path::PathBuf, HostE
     ))
 }
 
-fn sandbox_profile(project_root: &std::path::Path) -> String {
-    let root = project_root.to_string_lossy().replace('"', "\\\"");
+fn sandbox_profile(
+    project_root: &std::path::Path,
+    sandbox: &pi_whim_core::SandboxConfig,
+) -> String {
+    fn quoted(path: &std::path::Path) -> String {
+        path.to_string_lossy().replace('"', "\\\"")
+    }
+    fn canonical(path: &std::path::Path) -> std::path::PathBuf {
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    }
+
+    let root = quoted(&canonical(project_root));
+
+    // Bash already denies network by default. The sandbox_config.deny_bash_network
+    // field is a future-proofing flag for when the bash default network policy might
+    // change; it has no effect on the current sandbox profile.
+    let network = "(deny network*)";
+
+    // Monotonic deny paths: placed before allow rules to narrow the allowed set.
+    let mut deny_rules = Vec::new();
+    for path in &sandbox.child_deny_read_paths {
+        deny_rules.push(format!(
+            "(deny file-read* (subpath \"{}\"))",
+            quoted(&canonical(path))
+        ));
+    }
+    for path in &sandbox.child_deny_write_paths {
+        deny_rules.push(format!(
+            "(deny file-write* (subpath \"{}\"))",
+            quoted(&canonical(path))
+        ));
+    }
+    let deny_rules = deny_rules.join(" ");
+
     format!(
-        "(version 1) (deny default) (allow process*) (allow file-read* (subpath \"{root}\") (subpath \"/usr\") (subpath \"/bin\") (subpath \"/System\")) (allow file-write* (subpath \"{root}\")) (deny network*)"
+        "(version 1) (deny default) (allow process*) {deny_rules} (allow file-read* (subpath \"{root}\") (subpath \"/usr\") (subpath \"/bin\") (subpath \"/System\")) (allow file-write* (subpath \"{root}\")) {network}"
     )
 }
 
