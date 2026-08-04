@@ -57,6 +57,14 @@ entrypoint is executed from a verified per-invocation snapshot:
 {"version":1,"hook_id":"protect-main","event":"tool_dispatching","entrypoint":"/absolute/path/to/protect-main","project_root":"/absolute/project","payload":{"tool":"bash","agent_id":"...","agent_level":0,"arguments":{}}}
 ```
 
+Agent-scoped events carry a common authenticated context assembled by the Rust
+supervisor, never from tool arguments: `agent_id`, `agent_level`, `team_id`, `session_id`,
+nullable `parent_agent_id`, nullable `parent_session_id`, `agent_name`, `agent_role`, and
+nullable `request_id`. A tool request uses its protocol request ID; lifecycle events that
+do not originate from a request use `null`. Event-specific fields remain at the same
+top level and take precedence when they intentionally describe a historical session,
+such as `session_expired.session_id`.
+
 A `gate` hook returns an empty response or one JSON document. `{"decision":"deny",
 "message":"reason"}` rejects the operation. `{"arguments":{...}}` replaces the event's
 arguments when returned by a `transform` hook; the normal typed handler validates the
@@ -85,21 +93,21 @@ All UUID fields are JSON strings. Event payloads are versioned with the outer pr
 
 | Event | Kind | Payload fields |
 | --- | --- | --- |
-| `supervisor_started` | observe | `root_agent_id` |
-| `supervisor_stopping` | observe | `root_agent_id` |
-| `session_published` | observe | `agent_id`, `session_id`, `agent_level` |
-| `session_expired` | observe | `agent_id`, nullable `session_id`, `agent_level` |
-| `tool_dispatching` | gate/transform | `tool`, `agent_id`, `agent_level`, `arguments` |
-| `agent_spawning` | gate/transform | `tool`, `agent_id`, `agent_level`, `arguments` |
-| `message_sending` | gate/transform | `tool`, `agent_id`, `agent_level`, `arguments` |
-| `permission_resolving` | gate | `request_id`, `requester_id`, `owner_id`, `title`, nullable `operation_hash`, `decision` |
-| `tool_completed` | observe | `tool`, `agent_id`, `success` |
-| `agent_started` | observe | `agent_id`, `agent_level` |
-| `agent_finished` | observe | `agent_id`, `interrupted`, nullable `exit_code` |
-| `message_delivered` | observe | `sender_id`, `delivery` object |
-| `interaction_created` | observe | `request_id`, `requester_id`, `owner_id` |
-| `interaction_resolved` | observe | `request_id`, `requester_id`, `decision` |
-| `team_reset` | observe | `team_id`, `session_id` |
+| `supervisor_started` | observe | common context, `root_agent_id` |
+| `supervisor_stopping` | observe | common context, `root_agent_id` |
+| `session_published` | observe | common context |
+| `session_expired` | observe | common context; `session_id` may identify the expired session |
+| `tool_dispatching` | gate/transform | common context, `tool`, `arguments` |
+| `agent_spawning` | gate/transform | common parent context, `tool`, `arguments` |
+| `message_sending` | gate/transform | common sender context, `tool`, `arguments` |
+| `permission_resolving` | gate | common owner context, `request_id`, `requester_id`, `owner_id`, `title`, nullable `operation_hash`, `decision` |
+| `tool_completed` | observe | common context, `tool`, `success` |
+| `agent_started` | observe | common child context |
+| `agent_finished` | observe | common child context, `interrupted`, nullable `exit_code` |
+| `message_delivered` | observe | common sender context, `sender_id`, `delivery` object |
+| `interaction_created` | observe | common requester context, `requester_id`, `owner_id` |
+| `interaction_resolved` | observe | common owner context, `requester_id`, `decision` |
+| `team_reset` | observe | common root context |
 
 `matcher.tools` and `matcher.agent_levels` compare exact top-level payload values. An
 empty matcher list means no restriction for that dimension. Events without the relevant

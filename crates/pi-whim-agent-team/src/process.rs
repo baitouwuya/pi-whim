@@ -9,6 +9,7 @@ use std::{
 use crate::{
     HostContext, SharedState,
     capture::{MAX_CAPTURE_BYTES, RunCapture, truncate_utf8},
+    hook_payload_for_agent,
     model::{AgentId, AgentStatus, ProcessCommand, SpawnAgentArguments},
 };
 use pi_whim_core::{AgentModelSelection, AgentPermissionPolicy, HookEvent};
@@ -136,6 +137,7 @@ pub fn launch_child(
     let shared = host.shared.clone();
     let interactions = host.interactions.clone();
     let hooks = host.hooks.clone();
+    let hook_host = host.clone();
     let temporary_directory = environment.temporary_directory;
     thread::spawn(move || {
         let mut interrupted = false;
@@ -193,7 +195,12 @@ pub fn launch_child(
         );
         hooks.observe(
             HookEvent::AgentFinished,
-            json!({"agent_id": agent_id, "interrupted": interrupted, "exit_code": exit_code}),
+            hook_payload_for_agent(
+                &hook_host,
+                agent_id,
+                None,
+                json!({"agent_id": agent_id, "interrupted": interrupted, "exit_code": exit_code}),
+            ),
         );
         let _ = std::fs::remove_dir_all(temporary_directory);
     });

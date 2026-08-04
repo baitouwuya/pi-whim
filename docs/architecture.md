@@ -15,8 +15,10 @@ loopback JSONL. The supervisor owns caller identity, topology, quotas, message r
 and child process lifetimes; tool arguments are never trusted for team or level identity.
 
 Supervisor hooks extend that control plane with sandboxed external gate, transform, and
-observe commands. They execute outside agent capability and provider-key contexts; see
-[Supervisor hooks](hooks.md).
+observe commands. Agent-scoped Hook payloads use supervisor-authenticated team, session,
+parent, and request identities, so policy and telemetry extensions do not need to trust
+model-supplied tool arguments. Hooks execute outside agent capability and provider-key
+contexts; see [Supervisor hooks](hooks.md).
 
 Only level-0 Pi processes use JSONL sessions. Subagents run with `--no-session`, so the
 existing non-recursive session index and sidebar continue to contain level-0 conversations

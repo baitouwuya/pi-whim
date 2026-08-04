@@ -1164,7 +1164,7 @@ fn add_agent_hook_context(
     payload
 }
 
-fn hook_payload_for_agent(
+pub(crate) fn hook_payload_for_agent(
     host: &HostContext,
     actor_id: AgentId,
     request_id: Option<&str>,
