@@ -86,16 +86,24 @@ pub(crate) fn pi_models_json(profiles: &[ProviderProfile]) -> Value {
                 .models
                 .iter()
                 .map(|model| {
-                    json!({
+                    // Use per-model protocol if set, otherwise provider-level.
+                    let api = model
+                        .protocol
+                        .map(|protocol| protocol.pi_api())
+                        .unwrap_or_else(|| profile.protocol.pi_api());
+                    let mut record = json!({
                         "id": model.id,
                         "name": model.name,
                         "reasoning": model.reasoning,
+                        "api": api,
                         "thinkingLevelMap": model.thinking_level_map,
                         "input": if model.supports_images { json!(["text", "image"]) } else { json!(["text"]) },
-                        "contextWindow": 128000,
-                        "maxTokens": 16384,
                         "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-                    })
+                    });
+                    if let Some(ctx) = model.context_window {
+                        record["contextWindow"] = json!(ctx);
+                    }
+                    record
                 })
                 .collect::<Vec<_>>();
             (

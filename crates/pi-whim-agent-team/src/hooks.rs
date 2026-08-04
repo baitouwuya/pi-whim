@@ -201,34 +201,27 @@ impl HookDispatcher {
                     );
                 }
                 (HookKind::Transform, Ok(result)) => {
-                    if let Some(arguments) = result.get("arguments") {
-                        match validate_transform(event, &payload["arguments"], arguments) {
-                            Ok(()) => {
-                                payload["arguments"] = arguments.clone();
-                                self.audit(
-                                    hook,
-                                    event,
-                                    HookAuditOutcome::Succeeded,
-                                    started.elapsed(),
-                                    false,
-                                );
-                            }
-                            Err(_) => self.audit(
+                    match result
+                        .get("arguments")
+                        .filter(|arguments| arguments.is_object())
+                    {
+                        Some(arguments) if transform_is_valid(event, &payload, &result) => {
+                            payload["arguments"] = arguments.clone();
+                            self.audit(
                                 hook,
                                 event,
-                                HookAuditOutcome::Failed,
+                                HookAuditOutcome::Succeeded,
                                 started.elapsed(),
                                 false,
-                            ),
+                            );
                         }
-                    } else {
-                        self.audit(
+                        _ => self.audit(
                             hook,
                             event,
-                            HookAuditOutcome::Succeeded,
+                            HookAuditOutcome::Failed,
                             started.elapsed(),
                             false,
-                        );
+                        ),
                     }
                 }
                 (HookKind::Gate, Err(error)) => {
@@ -370,6 +363,16 @@ impl HookDispatcher {
                         .is_some_and(|level| hook.matcher.agent_levels.contains(&(level as u8))))
         })
     }
+}
+
+fn transform_is_valid(event: HookEvent, payload: &Value, result: &Value) -> bool {
+    let response_contains_only_arguments = result
+        .as_object()
+        .is_some_and(|response| response.keys().all(|key| key == "arguments"));
+    result.get("arguments").is_some_and(|arguments| {
+        response_contains_only_arguments
+            && validate_transform(event, &payload["arguments"], arguments).is_ok()
+    })
 }
 
 fn validate_transform(event: HookEvent, original: &Value, transformed: &Value) -> Result<(), ()> {
@@ -1029,24 +1032,287 @@ esac
         );
     }
 
+    fn test_dispatcher(project_root: &Path, hooks: Vec<HookDefinition>) -> HookDispatcher {
+        HookDispatcher::new(
+            HookConfig {
+                version: 1,
+                revision: "sha256:test".into(),
+                hooks,
+            },
+            project_root.to_path_buf(),
+            mpsc::sync_channel(64).0,
+        )
+    }
+
+    fn test_hook(
+        id: &str,
+        event: HookEvent,
+        kind: HookKind,
+        command: Vec<String>,
+    ) -> HookDefinition {
+        HookDefinition {
+            id: id.into(),
+            event,
+            kind,
+            command,
+            timeout_ms: Some(1_000),
+            matcher: HookMatcher::default(),
+            entrypoint_fingerprint: None,
+        }
+    }
+
+    #[test]
+    fn gate_hook_failures_deny_operations_closed() {
+        if !Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let payload = json!({"tool":"bash", "agent_level":0, "arguments":{}});
+        let cases = [
+            test_hook(
+                "nonzero",
+                HookEvent::ToolDispatching,
+                HookKind::Gate,
+                vec!["/usr/bin/false".into()],
+            ),
+            HookDefinition {
+                timeout_ms: Some(1),
+                ..test_hook(
+                    "timeout",
+                    HookEvent::ToolDispatching,
+                    HookKind::Gate,
+                    vec!["/bin/sleep".into(), "1".into()],
+                )
+            },
+            test_hook(
+                "invalid-json",
+                HookEvent::ToolDispatching,
+                HookKind::Gate,
+                vec!["/bin/echo".into(), "not json".into()],
+            ),
+            test_hook(
+                "oversized-output",
+                HookEvent::ToolDispatching,
+                HookKind::Gate,
+                vec!["/usr/bin/printf".into(), "%65537s".into(), "".into()],
+            ),
+        ];
+
+        for hook in cases {
+            assert!(matches!(
+                test_dispatcher(directory.path(), vec![hook])
+                    .gate(HookEvent::ToolDispatching, payload.clone()),
+                HookDecision::Deny(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn transform_responses_preserve_arguments_when_they_violate_the_contract() {
+        if !Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+
+        for response in ["[]", r#"{"arguments":"string"}"#] {
+            let payload = json!({"tool":"bash", "arguments":{"command":"pwd"}});
+            let dispatcher = test_dispatcher(
+                directory.path(),
+                vec![test_hook(
+                    "invalid-tool-transform",
+                    HookEvent::ToolDispatching,
+                    HookKind::Transform,
+                    vec!["/bin/echo".into(), response.into()],
+                )],
+            );
+            assert_eq!(
+                dispatcher.gate(HookEvent::ToolDispatching, payload.clone()),
+                HookDecision::Continue(payload)
+            );
+        }
+
+        let payload = json!({"tool":"bash", "arguments":{"command":"pwd"}});
+        let dispatcher = test_dispatcher(
+            directory.path(),
+            vec![test_hook(
+                "tool-envelope-is-immutable",
+                HookEvent::ToolDispatching,
+                HookKind::Transform,
+                vec!["/bin/echo".into(), r#"{"tool":"write"}"#.into()],
+            )],
+        );
+        assert_eq!(
+            dispatcher.gate(HookEvent::ToolDispatching, payload.clone()),
+            HookDecision::Continue(payload)
+        );
+
+        let payload =
+            json!({"tool":"send_message", "arguments":{"target":"child","message":"old"}});
+        let dispatcher = test_dispatcher(
+            directory.path(),
+            vec![test_hook(
+                "changed-target",
+                HookEvent::MessageSending,
+                HookKind::Transform,
+                vec![
+                    "/bin/echo".into(),
+                    r#"{"arguments":{"target":"other","message":"new"}}"#.into(),
+                ],
+            )],
+        );
+        assert_eq!(
+            dispatcher.gate(HookEvent::MessageSending, payload.clone()),
+            HookDecision::Continue(payload)
+        );
+    }
+
+    #[test]
+    fn matchers_use_protocol_tool_names_levels_and_empty_wildcards() {
+        let directory = tempfile::tempdir().unwrap();
+        let deny_bash = test_hook(
+            "bash-only",
+            HookEvent::ToolDispatching,
+            HookKind::Gate,
+            vec!["/usr/bin/false".into()],
+        );
+        let dispatcher = test_dispatcher(
+            directory.path(),
+            vec![HookDefinition {
+                matcher: HookMatcher {
+                    tools: vec!["bash".into()],
+                    agent_levels: vec![2],
+                },
+                ..deny_bash
+            }],
+        );
+        let payload = json!({"tool":"bash_command", "agent_level":2, "arguments":{}});
+        assert_eq!(
+            dispatcher.gate(HookEvent::ToolDispatching, payload.clone()),
+            HookDecision::Continue(payload)
+        );
+        let payload = json!({"tool":"bash", "agent_level":1, "arguments":{}});
+        assert_eq!(
+            dispatcher.gate(HookEvent::ToolDispatching, payload.clone()),
+            HookDecision::Continue(payload)
+        );
+
+        // A matching tool and level reaches the hook; its missing executable fails closed.
+        assert!(matches!(
+            dispatcher.gate(
+                HookEvent::ToolDispatching,
+                json!({"tool":"bash", "agent_level":2, "arguments":{}})
+            ),
+            HookDecision::Deny(_)
+        ));
+
+        let dispatcher = test_dispatcher(
+            directory.path(),
+            vec![test_hook(
+                "all-events",
+                HookEvent::ToolDispatching,
+                HookKind::Gate,
+                vec!["/missing/hook".into()],
+            )],
+        );
+        assert!(matches!(
+            dispatcher.gate(
+                HookEvent::ToolDispatching,
+                json!({"tool":"read", "agent_level":0, "arguments":{}})
+            ),
+            HookDecision::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn builtin_safety_floor_rejects_invalid_spawn_and_messages() {
+        let directory = tempfile::tempdir().unwrap();
+        let dispatcher = test_dispatcher(directory.path(), Vec::new());
+        assert!(matches!(
+            dispatcher.gate(
+                HookEvent::AgentSpawning,
+                json!({"arguments":{"task":"work"}})
+            ),
+            HookDecision::Deny(_)
+        ));
+        assert!(matches!(
+            dispatcher.gate(
+                HookEvent::MessageSending,
+                json!({"arguments":{"message":"  "}})
+            ),
+            HookDecision::Deny(_)
+        ));
+        assert!(matches!(
+            dispatcher.gate(
+                HookEvent::MessageSending,
+                json!({"arguments":{"message":"x".repeat(crate::MAX_MESSAGE_BYTES + 1)}})
+            ),
+            HookDecision::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn hook_config_validation_rejects_security_boundaries() {
+        let _directory = tempfile::tempdir().unwrap();
+        let valid = || {
+            test_hook(
+                "valid",
+                HookEvent::ToolDispatching,
+                HookKind::Gate,
+                vec!["/usr/bin/true".into()],
+            )
+        };
+
+        let mut config = HookConfig {
+            version: 2,
+            revision: String::new(),
+            hooks: vec![valid()],
+        };
+        assert!(config.validate().is_err());
+        config.version = 1;
+        config.hooks = (0..65)
+            .map(|index| {
+                test_hook(
+                    &format!("hook-{index}"),
+                    HookEvent::ToolDispatching,
+                    HookKind::Gate,
+                    vec!["/usr/bin/true".into()],
+                )
+            })
+            .collect();
+        assert!(config.validate().is_err());
+        config.hooks = vec![test_hook(
+            "non-ascii-ä",
+            HookEvent::ToolDispatching,
+            HookKind::Gate,
+            vec!["/usr/bin/true".into()],
+        )];
+        assert!(config.validate().is_err());
+        config.hooks = vec![test_hook(
+            "relative",
+            HookEvent::ToolDispatching,
+            HookKind::Gate,
+            vec!["echo".into()],
+        )];
+        assert!(config.validate().is_err());
+        config.hooks = vec![HookDefinition {
+            timeout_ms: Some(30_001),
+            ..valid()
+        }];
+        assert!(config.validate().is_err());
+    }
+
     #[test]
     fn event_specific_transforms_cannot_widen_their_contract() {
-        assert!(
-            validate_transform(
-                HookEvent::MessageSending,
-                &json!({"target":"child", "message":"old"}),
-                &json!({"target":"child", "message":"new"})
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_transform(
-                HookEvent::MessageSending,
-                &json!({"target":"child", "message":"old"}),
-                &json!({"target":"other", "message":"new"})
-            )
-            .is_err()
-        );
+        assert!(transform_is_valid(
+            HookEvent::MessageSending,
+            &json!({"arguments":{"target":"child", "message":"old"}}),
+            &json!({"arguments":{"target":"child", "message":"new"}})
+        ));
+        assert!(!transform_is_valid(
+            HookEvent::MessageSending,
+            &json!({"arguments":{"target":"child", "message":"old"}}),
+            &json!({"arguments":{"target":"other", "message":"new"}})
+        ));
         assert!(
             validate_transform(
                 HookEvent::AgentSpawning,

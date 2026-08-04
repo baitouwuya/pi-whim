@@ -86,6 +86,32 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ("general", "General", "通用"),
     ("execution", "Execution", "执行"),
     ("providers", "Providers", "模型提供商"),
+    (
+        "providers-help",
+        "Configure model providers used by Pi.",
+        "配置 Pi 使用的模型提供商。",
+    ),
+    ("model-config", "Model configuration", "模型配置"),
+    (
+        "model-config-protocol",
+        "Request protocol (per-model)",
+        "请求协议（模型级别）",
+    ),
+    (
+        "model-config-context-window",
+        "Context window (tokens)",
+        "上下文窗口（Token 数）",
+    ),
+    (
+        "context-window",
+        "Context window (tokens)",
+        "上下文窗口（Token 数）",
+    ),
+    (
+        "context-window-help",
+        "The maximum number of tokens the model can process in one request. Leave empty for default.",
+        "模型单次请求可处理的最大 Token 数。留空则使用默认值。",
+    ),
     ("background-ai", "Background AI", "后台 AI"),
     ("web-search", "Web Search", "网页搜索"),
     (
@@ -126,11 +152,6 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ("test-search-engine", "Test connection", "测试连接"),
     ("testing-connection", "Testing…", "测试中…"),
     ("connection-ok", "Connected", "连接成功"),
-    (
-        "providers-help",
-        "Configure model providers used by Pi.",
-        "配置 Pi 使用的模型提供商。",
-    ),
     ("provider-name", "Name", "名称"),
     ("preset", "Preset", "预设"),
     ("protocol", "Request protocol", "请求协议"),

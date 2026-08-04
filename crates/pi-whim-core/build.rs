@@ -15,6 +15,8 @@ struct Record {
     reasoning: bool,
     supports_images: bool,
     thinking_level_map: Vec<(String, Option<String>)>,
+    api: String,
+    context_window: Option<u32>,
 }
 
 fn main() {
@@ -146,6 +148,15 @@ fn read_catalog_file(path: &Path, records: &mut BTreeMap<(String, String), Recor
             })
             .unwrap_or_default();
         thinking_level_map.sort_by(|left, right| left.0.cmp(&right.0));
+        let api = value
+            .get("api")
+            .and_then(Value::as_str)
+            .unwrap_or("openai-completions")
+            .to_owned();
+        let context_window = value
+            .get("contextWindow")
+            .and_then(Value::as_u64)
+            .map(|v| v as u32);
         let record = Record {
             provider: provider.to_owned(),
             id: id.to_owned(),
@@ -153,6 +164,8 @@ fn read_catalog_file(path: &Path, records: &mut BTreeMap<(String, String), Recor
             reasoning,
             supports_images,
             thinking_level_map,
+            api,
+            context_window,
         };
         records.insert((provider.to_owned(), id.to_owned()), record);
     }
@@ -173,14 +186,19 @@ fn render_catalog(records: impl Iterator<Item = Record>) -> String {
             })
             .collect::<Vec<_>>()
             .join(", ");
+        let ctx = match record.context_window {
+            Some(tokens) => format!("Some({tokens})"),
+            None => "None".to_owned(),
+        };
         output.push_str(&format!(
-            "    BundledCapability {{ provider: {:?}, id: {:?}, name: {:?}, reasoning: {}, supports_images: {}, thinking_level_map: &[{}] }},\n",
+            "    BundledCapability {{ provider: {:?}, id: {:?}, name: {:?}, reasoning: {}, supports_images: {}, thinking_level_map: &[{}], api: {:?}, context_window: {ctx} }},\n",
             record.provider,
             record.id,
             record.name,
             record.reasoning,
             record.supports_images,
             map,
+            record.api,
         ));
     }
     output.push_str("];\n");

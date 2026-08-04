@@ -3,6 +3,8 @@ use std::{collections::BTreeMap, fmt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::ProviderProtocol;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThinkingLevel {
@@ -105,6 +107,10 @@ pub struct ModelCapability {
     pub supports_images: bool,
     pub thinking_level_map: ThinkingLevelMap,
     pub source: ModelCapabilitySource,
+    /// The protocol the vendor catalog recommends for this model.
+    pub recommended_protocol: Option<ProviderProtocol>,
+    /// Context window size in tokens, from the vendor catalog.
+    pub context_window: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -128,6 +134,8 @@ pub(super) struct BundledCapability {
     reasoning: bool,
     supports_images: bool,
     thinking_level_map: &'static [(&'static str, Option<&'static str>)],
+    api: &'static str,
+    context_window: Option<u32>,
 }
 
 include!(concat!(env!("OUT_DIR"), "/bundled_model_capabilities.rs"));
@@ -219,6 +227,8 @@ fn bundled_capability(record: &BundledCapability) -> ModelCapability {
                 }),
         ),
         source: ModelCapabilitySource::BundledCatalog,
+        recommended_protocol: ProviderProtocol::from_pi_api(record.api),
+        context_window: record.context_window,
     }
 }
 
@@ -226,6 +236,8 @@ fn same_usable_capability(left: &ModelCapability, right: &ModelCapability) -> bo
     left.reasoning == right.reasoning
         && left.supports_images == right.supports_images
         && left.thinking_level_map == right.thinking_level_map
+        && left.recommended_protocol == right.recommended_protocol
+        && left.context_window == right.context_window
 }
 
 /// Discovery shape for a custom Pi provider: how to reach its model-listing

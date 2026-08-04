@@ -897,6 +897,21 @@ impl Workspace {
                 self.settings
                     .update(cx, |settings, cx| settings.new_provider(window, cx));
             }
+            SettingsEvent::ConfigureModel(model_id) => {
+                self.settings.update(cx, |settings, cx| {
+                    settings.configure_model(&model_id, window, cx);
+                });
+            }
+            SettingsEvent::CloseModelConfig => {
+                self.settings.update(cx, |settings, cx| {
+                    settings.close_model_config(cx);
+                });
+            }
+            SettingsEvent::SaveModelConfig => {
+                self.settings.update(cx, |settings, cx| {
+                    settings.save_model_config(window, cx);
+                });
+            }
 
             SettingsEvent::SelectSearchEngine(profile) => {
                 self.settings.update(cx, |settings, cx| {

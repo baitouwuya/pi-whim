@@ -246,6 +246,38 @@ impl ProviderDraft {
         true
     }
 
+    /// Open a model config draft for the model with the given id.
+    pub fn open_model_config(&self, model_id: &str) -> Option<ModelConfigDraft> {
+        let model = self.models.iter().find(|m| m.id == model_id)?;
+        Some(ModelConfigDraft {
+            model_id: model.id.clone(),
+            protocol: model.protocol.unwrap_or(self.protocol),
+            has_protocol_override: model.protocol.is_some(),
+        })
+    }
+
+    /// Apply the protocol from a model config draft back into the provider's model list.
+    pub fn apply_model_config_protocol(&mut self, config: &ModelConfigDraft) {
+        if let Some(model) = self.models.iter_mut().find(|m| m.id == config.model_id) {
+            model.protocol = if config.has_protocol_override {
+                Some(config.protocol)
+            } else {
+                None
+            };
+        }
+    }
+
+    /// Apply the context window from the dialog to the model.
+    pub fn apply_model_config_context_window(
+        &mut self,
+        model_id: &str,
+        context_window: Option<u32>,
+    ) {
+        if let Some(model) = self.models.iter_mut().find(|m| m.id == model_id) {
+            model.context_window = context_window;
+        }
+    }
+
     /// Change the protocol, moving the base URL with it when it was the default.
     ///
     /// A URL the reader typed is left alone; one that was only there because of
@@ -258,6 +290,14 @@ impl ProviderDraft {
             self.base_url = protocol.default_base_url().into();
         }
     }
+}
+
+/// A model whose config is being edited in the dialog.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelConfigDraft {
+    pub model_id: String,
+    pub protocol: ProviderProtocol,
+    pub has_protocol_override: bool,
 }
 
 /// A search engine being edited.

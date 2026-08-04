@@ -36,7 +36,8 @@ use pi_whim_core::{
     SESSION_TITLE_TASK_KIND, SearchEngineId, SearchEngineKind, SearchEngineProfile, strings::tr,
 };
 use pi_whim_engine::settings::{
-    Preset, ProviderDraft, SearchEngineDraft, Section, move_search_engine, remove_search_engine,
+    ModelConfigDraft, Preset, ProviderDraft, SearchEngineDraft, Section, move_search_engine,
+    remove_search_engine,
 };
 use pi_whim_theme::{Tokens, font, layout, text};
 
@@ -112,6 +113,12 @@ pub enum SettingsEvent {
     /// Add the model id typed into the field.
     AddManualModel,
     RemoveModel(String),
+    /// Open the config dialog for a model.
+    ConfigureModel(String),
+    /// Close the model config dialog without saving.
+    CloseModelConfig,
+    /// Save the model config draft.
+    SaveModelConfig,
     /// Ask the provider what models it has.
     DiscoverModels,
     /// Store the draft, and its key if one was typed.
@@ -147,6 +154,8 @@ pub struct Settings {
     /// the drafts, and the shell owns the real one.
     state: AppState,
     provider: ProviderDraft,
+    /// The model being configured in the model config dialog, if any.
+    model_config: Option<ModelConfigDraft>,
     background_ai_task_kind: Option<String>,
     background_ai_task: OneShotAiTaskConfig,
     background_ai_editor_open: bool,
@@ -305,6 +314,14 @@ impl Settings {
             model_id: cx.new(|cx| InputState::new(window, cx).placeholder("gpt-5")),
             preset: choice_picker(providers::preset_choices(), provider.preset, window, cx),
             protocol: choice_picker(providers::protocol_choices(), provider.protocol, window, cx),
+            model_config_protocol: choice_picker(
+                providers::protocol_choices(),
+                provider.protocol,
+                window,
+                cx,
+            ),
+            model_config_context_window: cx
+                .new(|cx| InputState::new(window, cx).placeholder("4096")),
         };
         let search_fields = web_search::Fields {
             name: cx.new(|cx| InputState::new(window, cx).placeholder("SearXNG")),
@@ -357,6 +374,7 @@ impl Settings {
             background_ai_fields,
             provider_fields,
             search_fields,
+            model_config: None,
             scroll: ScrollHandle::new(),
             model_scroll: ScrollHandle::new(),
         };
@@ -558,6 +576,8 @@ impl Settings {
             }
         })
         .detach();
+        // The model config protocol dropdown is read directly in save_model_config.
+        // No subscription needed here.
         cx.subscribe_in(&search.kind, window, |_, _, event, _, cx| {
             if let SelectEvent::Confirm(Some(kind)) = event {
                 cx.emit(SettingsEvent::SetSearchEngineKind(*kind));
@@ -715,7 +735,66 @@ impl Settings {
 
     pub fn remove_model(&mut self, id: &str, cx: &mut Context<Self>) {
         self.provider.models.retain(|model| model.id != id);
+        // Close the model config dialog if the model being edited was removed.
+        if self
+            .model_config
+            .as_ref()
+            .is_some_and(|config| config.model_id == id)
+        {
+            self.model_config = None;
+        }
         cx.notify();
+    }
+
+    /// Open the model config dialog for the model with the given id.
+    pub fn configure_model(&mut self, model_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.model_config = self.provider.open_model_config(model_id);
+        if let Some(config) = self.model_config.clone() {
+            self.seed_model_config_fields(&config, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Close the model config dialog without saving.
+    pub fn close_model_config(&mut self, cx: &mut Context<Self>) {
+        self.model_config = None;
+        cx.notify();
+    }
+
+    /// Save the model config draft back into the provider's model list.
+    pub fn save_model_config(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(config) = self.model_config.clone() {
+            // Read the protocol from the choice picker.
+            let protocol = self
+                .provider_fields
+                .model_config_protocol
+                .read(cx)
+                .selected_value()
+                .copied();
+            // Read the context window from the input field.
+            let context_window = self
+                .provider_fields
+                .model_config_context_window
+                .read(cx)
+                .value();
+            let context_window = if context_window.trim().is_empty() {
+                None
+            } else {
+                context_window.trim().parse::<u32>().ok()
+            };
+
+            if let Some(model) = self
+                .provider
+                .models
+                .iter_mut()
+                .find(|m| m.id == config.model_id)
+            {
+                model.protocol = protocol;
+                model.context_window = context_window;
+            }
+            self.model_config = None;
+            cx.notify();
+        }
     }
 
     /// Replace the draft's models with what discovery found.
@@ -921,6 +1000,35 @@ impl Settings {
         self.seed_background_ai_choices(window, cx);
         self.seed_provider_fields(window, cx);
         self.seed_search_fields(window, cx);
+    }
+
+    /// Fill the model config dialog fields from the draft.
+    fn seed_model_config_fields(
+        &mut self,
+        config: &ModelConfigDraft,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        sync_choice_picker(
+            &self.provider_fields.model_config_protocol,
+            providers::protocol_choices(),
+            config.protocol,
+            window,
+            cx,
+        );
+        // Find the model's current context_window to seed the text field.
+        let ctx = self
+            .provider
+            .models
+            .iter()
+            .find(|m| m.id == config.model_id)
+            .and_then(|m| m.context_window)
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        self.provider_fields
+            .model_config_context_window
+            .update(cx, |input, cx| input.set_value(ctx, window, cx));
+        cx.notify();
     }
 
     fn seed_general_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1194,6 +1302,16 @@ impl Render for Settings {
                 cx,
             )
         });
+        let model_config_dialog = self.model_config.as_ref().map(|config| {
+            providers::render_model_config(
+                &self.state,
+                config,
+                &self.provider_fields,
+                tokens,
+                emit.clone(),
+                cx,
+            )
+        });
         let body = match self.section {
             Section::General => {
                 general::render_general(&self.state, &self.general_fields, tokens, emit)
@@ -1242,6 +1360,7 @@ impl Render for Settings {
             )
             .when_some(background_ai_editor, |this, editor| this.child(editor))
             .when_some(search_engine_editor, |this, editor| this.child(editor))
+            .when_some(model_config_dialog, |this, dialog| this.child(dialog))
     }
 }
 

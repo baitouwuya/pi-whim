@@ -285,6 +285,8 @@ fn parse_online_catalog(value: &Value) -> Result<Vec<CatalogModelCapability>, St
                     supports_images,
                     thinking_level_map,
                     source: ModelCapabilitySource::OnlineCatalog,
+                    recommended_protocol: None,
+                    context_window: None,
                 },
             });
         }
@@ -378,6 +380,8 @@ mod tests {
                 supports_images: false,
                 thinking_level_map: ThinkingLevelMap::default(),
                 source: ModelCapabilitySource::OnlineCatalog,
+                recommended_protocol: None,
+                context_window: None,
             },
         };
         assert_eq!(

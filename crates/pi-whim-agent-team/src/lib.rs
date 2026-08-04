@@ -158,6 +158,8 @@ pub enum SupervisorError {
     Address(#[source] std::io::Error),
     #[error("agent team state lock was poisoned")]
     Poisoned,
+    #[error("invalid hook configuration: {0}")]
+    HookConfig(String),
 }
 
 #[derive(Clone)]
@@ -190,6 +192,10 @@ pub struct AgentSupervisor {
 impl AgentSupervisor {
     pub fn start(mut launch: AgentLaunchConfig) -> Result<Self, SupervisorError> {
         launch.team_config = launch.team_config.normalized();
+        launch
+            .hooks
+            .validate()
+            .map_err(SupervisorError::HookConfig)?;
         let listener = TcpListener::bind("127.0.0.1:0").map_err(SupervisorError::Bind)?;
         listener
             .set_nonblocking(true)

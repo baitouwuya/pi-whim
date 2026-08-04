@@ -606,6 +606,18 @@ impl ProviderProtocol {
             Self::GoogleGenerativeAi => "https://generativelanguage.googleapis.com/v1beta",
         }
     }
+
+    /// Return the protocol string from the vendor catalog, if it differs from
+    /// the provider-level default. This is what a model's `api` field carries.
+    pub fn from_pi_api(api: &str) -> Option<Self> {
+        match api {
+            "openai-completions" => Some(Self::OpenAiCompletions),
+            "openai-responses" => Some(Self::OpenAiResponses),
+            "anthropic-messages" => Some(Self::AnthropicMessages),
+            "google-generative-ai" => Some(Self::GoogleGenerativeAi),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -620,6 +632,14 @@ pub struct ProviderModel {
     pub thinking_level_map: ThinkingLevelMap,
     #[serde(default)]
     pub capability_source: ModelCapabilitySource,
+    /// Per-model protocol override. When `None`, the provider-level protocol
+    /// is used. When `Some`, Pi is told to use this protocol for this model
+    /// instead of the provider default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<ProviderProtocol>,
+    /// Context window size in tokens. `None` means "unknown / not configured".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
 }
 
 impl ProviderModel {
@@ -632,6 +652,8 @@ impl ProviderModel {
             supports_images: false,
             thinking_level_map: ThinkingLevelMap::default(),
             capability_source: ModelCapabilitySource::Unverified,
+            protocol: None,
+            context_window: None,
         }
     }
 
@@ -643,10 +665,24 @@ impl ProviderModel {
         self.supports_images |= capability.supports_images;
         self.thinking_level_map = capability.thinking_level_map;
         self.capability_source = capability.source;
+        // Use the catalog's recommended protocol, but only if the user has not
+        // explicitly set one (keeping user overrides intact).
+        if self.protocol.is_none() {
+            self.protocol = capability.recommended_protocol;
+        }
+        if self.context_window.is_none() {
+            self.context_window = capability.context_window;
+        }
     }
 
     pub fn available_thinking_levels(&self) -> Vec<ThinkingLevel> {
         self.thinking_level_map.available_levels(self.reasoning)
+    }
+
+    /// The effective protocol for this model: per-model override, or
+    /// `provider_protocol` as fallback.
+    pub fn effective_protocol(&self, provider_protocol: ProviderProtocol) -> ProviderProtocol {
+        self.protocol.unwrap_or(provider_protocol)
     }
 }
 

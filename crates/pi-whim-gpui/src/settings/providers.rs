@@ -5,16 +5,17 @@
 //! parts that need an `InputState`.
 
 use gpui::{
-    AnyElement, Entity, IntoElement, ParentElement, ScrollHandle, SharedString, Styled, div,
-    prelude::FluentBuilder, px,
+    AnyElement, App, Entity, InteractiveElement, IntoElement, ParentElement, ScrollHandle,
+    SharedString, StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px,
 };
 use gpui_component::{
     Disableable, Icon, Sizable,
     button::{Button, ButtonVariants},
+    dialog::Dialog,
     input::{Input, InputState},
 };
 use pi_whim_core::{AppState, ProviderModel, ProviderProtocol, strings::tr};
-use pi_whim_engine::settings::{Preset, ProviderDraft};
+use pi_whim_engine::settings::{ModelConfigDraft, Preset, ProviderDraft};
 use pi_whim_theme::{Tokens, font, radius, text};
 
 use crate::{
@@ -44,6 +45,9 @@ pub struct Fields {
     pub model_id: Entity<InputState>,
     pub preset: Entity<ChoiceState<Preset>>,
     pub protocol: Entity<ChoiceState<ProviderProtocol>>,
+    /// Model config dialog fields.
+    pub model_config_protocol: Entity<ChoiceState<ProviderProtocol>>,
+    pub model_config_context_window: Entity<InputState>,
 }
 
 /// Build the Providers page.
@@ -415,6 +419,8 @@ fn model_grid(
 
 fn model_cell(model: &ProviderModel, state: &AppState, tokens: Tokens, emit: Emit) -> AnyElement {
     let id = model.id.clone();
+    let id2 = model.id.clone();
+    let configure = emit.clone();
     // The thinking levels are listed because they are the reason a model is worth
     // picking over another, and they are not inferable from the id.
     let levels = model
@@ -440,6 +446,7 @@ fn model_cell(model: &ProviderModel, state: &AppState, tokens: Tokens, emit: Emi
     };
 
     div()
+        .id(SharedString::from(model.id.clone()))
         .min_w(px(MODEL_CELL_MIN_WIDTH))
         .flex_1()
         .flex_basis(px(MODEL_CELL_MIN_WIDTH))
@@ -449,6 +456,11 @@ fn model_cell(model: &ProviderModel, state: &AppState, tokens: Tokens, emit: Emi
         .gap(px(form::INLINE_GAP))
         .px(px(10.0))
         .bg(tokens.panel.hsla())
+        .hover(move |this| this.bg(tokens.control_background_hover().hsla()))
+        .cursor_pointer()
+        .on_click(move |_, window, cx| {
+            configure(SettingsEvent::ConfigureModel(id.clone()), window, cx)
+        })
         .child(
             div()
                 .size(px(28.0))
@@ -494,14 +506,20 @@ fn model_cell(model: &ProviderModel, state: &AppState, tokens: Tokens, emit: Emi
                 ),
         )
         .child(
-            Button::new(SharedString::from(format!("remove-model:{}", model.id)))
-                .icon(icons::close())
-                .ghost()
-                .xsmall()
-                .tooltip(tr(state, "remove"))
-                .on_click(move |_, window, cx| {
-                    emit(SettingsEvent::RemoveModel(id.clone()), window, cx)
-                }),
+            div()
+                .id(SharedString::from(format!("remove:{}", model.id)))
+                .flex_none()
+                .on_click(|_, _, cx| cx.stop_propagation())
+                .child(
+                    Button::new(SharedString::from(format!("remove-model:{}", model.id)))
+                        .icon(icons::close())
+                        .ghost()
+                        .xsmall()
+                        .tooltip(tr(state, "remove"))
+                        .on_click(move |_, window, cx| {
+                            emit(SettingsEvent::RemoveModel(id2.clone()), window, cx)
+                        }),
+                ),
         )
         .into_any_element()
 }
@@ -544,6 +562,86 @@ fn save_row(state: &AppState, draft: &ProviderDraft, tokens: Tokens, emit: Emit)
         .into_any_element()
 }
 
+/// Show the model config dialog.
+pub fn render_model_config(
+    state: &AppState,
+    config: &ModelConfigDraft,
+    fields: &Fields,
+    tokens: Tokens,
+    emit: Emit,
+    cx: &mut App,
+) -> AnyElement {
+    let save = emit.clone();
+    let cancel_btn = emit.clone();
+    let cancel_ok = emit.clone();
+    let cancel_close = emit.clone();
+
+    div()
+        .child(
+            Dialog::new(cx)
+                .w(px(480.0))
+                .title(SharedString::from(format!(
+                    "{}: {}",
+                    tr(state, "model"),
+                    config.model_id
+                )))
+                .footer(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_end()
+                        .gap(px(8.0))
+                        .child(
+                            Button::new("cancel-model-config")
+                                .label(tr(state, "cancel"))
+                                .outline()
+                                .small()
+                                .on_click(move |_, window, cx| {
+                                    cancel_btn(SettingsEvent::CloseModelConfig, window, cx)
+                                }),
+                        )
+                        .child(
+                            Button::new("save-model-config")
+                                .label(tr(state, "save"))
+                                .primary()
+                                .small()
+                                .on_click(move |_, window, cx| {
+                                    save(SettingsEvent::SaveModelConfig, window, cx)
+                                }),
+                        ),
+                )
+                .on_ok(move |_, window, cx| {
+                    cancel_ok(SettingsEvent::CloseModelConfig, window, cx);
+                    false
+                })
+                .on_cancel(move |_, window, cx| {
+                    cancel_close(SettingsEvent::CloseModelConfig, window, cx);
+                    true
+                })
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_col()
+                        .gap(px(12.0))
+                        .child(form::row(
+                            tr(state, "protocol"),
+                            None,
+                            tokens,
+                            dropdown::dropdown(&fields.model_config_protocol),
+                        ))
+                        .child(form::row(
+                            tr(state, "context-window"),
+                            None,
+                            tokens,
+                            div()
+                                .w(px(180.0))
+                                .child(Input::new(&fields.model_config_context_window).w_full()),
+                        )),
+                ),
+        )
+        .into_any_element()
+}
 #[cfg(test)]
 mod tests {
     use super::*;
