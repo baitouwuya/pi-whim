@@ -1,10 +1,12 @@
 //! The prompt input.
 //!
-//! Enter submits, Shift+Enter inserts a newline. Both are the component's own
-//! behavior — `InputState` inserts the newline itself and emits `PressEnter` only
-//! when a submit is meant, including while an IME is mid-composition. The egui
-//! build had to guard that by hand, tracking preedit events across frames; there
-//! is nothing to reimplement here.
+//! Enter submits, Shift+Enter inserts a newline. The component needs telling:
+//! in multi-line mode its default is newline-on-Enter, and it emits
+//! `PressEnter` even for the Shift+Enter it just inserted — so
+//! `submit_on_enter(true)` sets the default and the subscription filters the
+//! shifted echo. IME composition still guards itself upstream; the egui build
+//! tracked preedit events across frames by hand, and there is nothing to
+//! reimplement here.
 
 use gpui::{
     AnyElement, App, AppContext, ClipboardEntry, Context, Entity, EventEmitter, FocusHandle,
@@ -109,6 +111,7 @@ impl Composer {
         let input = cx.new(|cx| {
             InputState::new(window, cx)
                 .multi_line(true)
+                .submit_on_enter(true)
                 .auto_grow(MIN_ROWS, MAX_ROWS)
                 .soft_wrap(true)
                 .placeholder(translate("composer-placeholder", Language::default()))
@@ -118,7 +121,14 @@ impl Composer {
             &input,
             window,
             |composer, _, event, window, cx| match event {
-                InputEvent::PressEnter { .. } => composer.submit(window, cx),
+                // Upstream emits PressEnter for Shift+Enter too, after it has
+                // inserted the newline — that newline is the whole point of the
+                // chord, so only an unshifted Enter is a submit.
+                InputEvent::PressEnter { shift, .. } => {
+                    if !shift {
+                        composer.submit(window, cx);
+                    }
+                }
                 InputEvent::Change => {
                     let text = composer.text(cx);
                     cx.emit(ComposerEvent::TextChanged(text));
