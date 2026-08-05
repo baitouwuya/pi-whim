@@ -17,6 +17,7 @@ struct Record {
     thinking_level_map: Vec<(String, Option<String>)>,
     api: String,
     context_window: Option<u32>,
+    max_tokens: Option<u32>,
 }
 
 fn main() {
@@ -157,6 +158,10 @@ fn read_catalog_file(path: &Path, records: &mut BTreeMap<(String, String), Recor
             .get("contextWindow")
             .and_then(Value::as_u64)
             .map(|v| v as u32);
+        let max_tokens = value
+            .get("maxTokens")
+            .and_then(Value::as_u64)
+            .map(|v| v as u32);
         let record = Record {
             provider: provider.to_owned(),
             id: id.to_owned(),
@@ -166,6 +171,7 @@ fn read_catalog_file(path: &Path, records: &mut BTreeMap<(String, String), Recor
             thinking_level_map,
             api,
             context_window,
+            max_tokens,
         };
         records.insert((provider.to_owned(), id.to_owned()), record);
     }
@@ -190,8 +196,12 @@ fn render_catalog(records: impl Iterator<Item = Record>) -> String {
             Some(tokens) => format!("Some({tokens})"),
             None => "None".to_owned(),
         };
+        let max = match record.max_tokens {
+            Some(tokens) => format!("Some({tokens})"),
+            None => "None".to_owned(),
+        };
         output.push_str(&format!(
-            "    BundledCapability {{ provider: {:?}, id: {:?}, name: {:?}, reasoning: {}, supports_images: {}, thinking_level_map: &[{}], api: {:?}, context_window: {ctx} }},\n",
+            "    BundledCapability {{ provider: {:?}, id: {:?}, name: {:?}, reasoning: {}, supports_images: {}, thinking_level_map: &[{}], api: {:?}, context_window: {ctx}, max_tokens: {max} }},\n",
             record.provider,
             record.id,
             record.name,

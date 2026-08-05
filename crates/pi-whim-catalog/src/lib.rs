@@ -276,6 +276,10 @@ fn parse_online_catalog(value: &Value) -> Result<Vec<CatalogModelCapability>, St
                         inputs.iter().any(|input| input.as_str() == Some("image"))
                     });
             let thinking_level_map = online_thinking_level_map(model, reasoning);
+            let max_output_tokens = model
+                .pointer("/limit/output")
+                .and_then(Value::as_u64)
+                .map(|tokens| tokens as u32);
             records.push(CatalogModelCapability {
                 provider: provider_id.clone(),
                 id: id.to_owned(),
@@ -287,6 +291,7 @@ fn parse_online_catalog(value: &Value) -> Result<Vec<CatalogModelCapability>, St
                     source: ModelCapabilitySource::OnlineCatalog,
                     recommended_protocol: None,
                     context_window: None,
+                    max_output_tokens,
                 },
             });
         }
@@ -382,6 +387,7 @@ mod tests {
                 source: ModelCapabilitySource::OnlineCatalog,
                 recommended_protocol: None,
                 context_window: None,
+                max_output_tokens: None,
             },
         };
         assert_eq!(

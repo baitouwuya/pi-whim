@@ -103,6 +103,9 @@ pub(crate) fn pi_models_json(profiles: &[ProviderProfile]) -> Value {
                     if let Some(ctx) = model.context_window {
                         record["contextWindow"] = json!(ctx);
                     }
+                    if let Some(max_tokens) = model.max_output_tokens {
+                        record["maxTokens"] = json!(max_tokens);
+                    }
                     record
                 })
                 .collect::<Vec<_>>();
@@ -169,6 +172,7 @@ mod tests {
             (ThinkingLevel::Xhigh, Some("xhigh".into())),
         ]);
         model.capability_source = ModelCapabilitySource::BundledCatalog;
+        model.max_output_tokens = Some(128_000);
         let profile = ProviderProfile {
             id: Uuid::new_v4(),
             name: "Private gateway".into(),
@@ -197,6 +201,9 @@ mod tests {
             Value::Null
         );
         assert_eq!(provider["models"][0]["thinkingLevelMap"]["xhigh"], "xhigh");
+        // Without a configured max output, Pi silently clamps responses to its
+        // own built-in default; the configured value must reach Pi.
+        assert_eq!(provider["models"][0]["maxTokens"], 128_000);
     }
 
     #[test]

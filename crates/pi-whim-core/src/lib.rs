@@ -736,6 +736,10 @@ pub struct ProviderModel {
     /// Context window size in tokens. `None` means "unknown / not configured".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u32>,
+    /// Maximum output tokens per response. `None` means "unknown / not
+    /// configured", in which case Pi falls back to its own default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
 }
 
 impl ProviderModel {
@@ -750,6 +754,7 @@ impl ProviderModel {
             capability_source: ModelCapabilitySource::Unverified,
             protocol: None,
             context_window: None,
+            max_output_tokens: None,
         }
     }
 
@@ -768,6 +773,9 @@ impl ProviderModel {
         }
         if self.context_window.is_none() {
             self.context_window = capability.context_window;
+        }
+        if self.max_output_tokens.is_none() {
+            self.max_output_tokens = capability.max_output_tokens;
         }
     }
 

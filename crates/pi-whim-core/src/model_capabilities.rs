@@ -111,6 +111,8 @@ pub struct ModelCapability {
     pub recommended_protocol: Option<ProviderProtocol>,
     /// Context window size in tokens, from the vendor catalog.
     pub context_window: Option<u32>,
+    /// Maximum output tokens per response, from the vendor catalog.
+    pub max_output_tokens: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -136,6 +138,7 @@ pub(super) struct BundledCapability {
     thinking_level_map: &'static [(&'static str, Option<&'static str>)],
     api: &'static str,
     context_window: Option<u32>,
+    max_tokens: Option<u32>,
 }
 
 include!(concat!(env!("OUT_DIR"), "/bundled_model_capabilities.rs"));
@@ -229,6 +232,7 @@ fn bundled_capability(record: &BundledCapability) -> ModelCapability {
         source: ModelCapabilitySource::BundledCatalog,
         recommended_protocol: ProviderProtocol::from_pi_api(record.api),
         context_window: record.context_window,
+        max_output_tokens: record.max_tokens,
     }
 }
 
@@ -238,6 +242,7 @@ fn same_usable_capability(left: &ModelCapability, right: &ModelCapability) -> bo
         && left.thinking_level_map == right.thinking_level_map
         && left.recommended_protocol == right.recommended_protocol
         && left.context_window == right.context_window
+        && left.max_output_tokens == right.max_output_tokens
 }
 
 /// Discovery shape for a custom Pi provider: how to reach its model-listing
