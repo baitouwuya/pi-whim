@@ -1344,25 +1344,6 @@ impl Workspace {
     }
 }
 
-/// The banner a session status calls for, if any.
-///
-/// Failure takes precedence: if the session has broken, that matters more than
-/// reporting that it is busy.
-fn banner_for(status: &SessionStatus, language: Language, tokens: Tokens) -> Option<Banner> {
-    match status {
-        // The error text is the agent's own, so it travels through untranslated;
-        // everything the app says around it does not.
-        SessionStatus::Failed(error) => Some(Banner::error(error.clone(), tokens)),
-        SessionStatus::Compacting => Some(
-            Banner::progress(translate("compacting-banner", language), tokens)
-                // The headline names the condition; the line under it says the
-                // conversation survives it, which is the part worth knowing.
-                .detail(translate("compacting-detail", language)),
-        ),
-        _ => None,
-    }
-}
-
 /// The backend request a preference change needs, if `event` is one.
 ///
 /// Returns `None` for the provider and search-engine events, which are drafts
@@ -1433,6 +1414,9 @@ impl Render for Workspace {
         }
         let language = self.state.language;
         let status = self.state.session_status.clone();
+        // Only a failure earns the banner: compaction and streaming are ordinary
+        // work the status pill already reports, and a banner for them pushed the
+        // whole conversation down on every automatic compaction pass.
         let banner = match &status {
             SessionStatus::Failed(error)
                 if self.dismissed_error.as_deref() == Some(error.as_str()) =>
@@ -1459,7 +1443,7 @@ impl Render for Workspace {
                         ),
                 )
             }
-            _ => banner_for(&status, language, tokens),
+            _ => None,
         };
         let state = &self.state;
         let project_name = state.selected_project.and_then(|id| {
@@ -1584,39 +1568,6 @@ mod tests {
     use pi_whim_core::{ConversationItem, ConversationRole, stable_session_id};
 
     use super::*;
-    use crate::chrome::Severity;
-
-    #[test]
-    fn an_idle_session_shows_no_banner() {
-        let tokens = Tokens::light();
-        assert!(banner_for(&SessionStatus::Offline, Language::English, tokens).is_none());
-        assert!(banner_for(&SessionStatus::Ready, Language::English, tokens).is_none());
-        assert!(banner_for(&SessionStatus::Streaming, Language::English, tokens).is_none());
-    }
-
-    #[test]
-    fn compaction_shows_a_progress_banner() {
-        let banner = banner_for(
-            &SessionStatus::Compacting,
-            Language::English,
-            Tokens::light(),
-        )
-        .expect("a banner while compacting");
-        assert_eq!(banner.severity(), Severity::Progress);
-    }
-
-    #[test]
-    fn failure_shows_an_error_banner() {
-        // A broken session matters more than reporting that it is busy, so this
-        // is the variant that wins when both could apply.
-        let banner = banner_for(
-            &SessionStatus::Failed("boom".into()),
-            Language::English,
-            Tokens::light(),
-        )
-        .expect("a banner after failure");
-        assert_eq!(banner.severity(), Severity::Error);
-    }
 
     #[test]
     fn toggling_a_project_flips_it_and_back() {

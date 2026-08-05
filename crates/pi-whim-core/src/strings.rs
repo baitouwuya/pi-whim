@@ -525,12 +525,6 @@ const STRINGS: &[(&str, &str, &str)] = &[
         "Discover or manually add available models.",
         "发现或手动添加可用模型。",
     ),
-    ("compacting-banner", "Compacting context", "正在压缩上下文"),
-    (
-        "compacting-detail",
-        "Pi is condensing earlier messages.",
-        "Pi 正在整理早期消息。",
-    ),
     ("copy-session-id", "Copy session ID", "复制会话 ID"),
     ("hint-enter", "Enter to send", "Enter 发送"),
     (
