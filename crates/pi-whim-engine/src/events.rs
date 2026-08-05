@@ -138,6 +138,7 @@ pub fn translate(event: &Value, context: Context<'_>, turn: &mut Turn) -> Outcom
             // A user message opens a turn just as an assistant one does: a queue
             // drained while the session idles starts its turn right here.
             turn.running = true;
+            turn.run_active = true;
             outcome.session_running(&context, true);
             let text = content_text(message.get("content")).unwrap_or_default();
             // A prompt the workbench already placed optimistically is matched
@@ -189,6 +190,7 @@ pub fn translate(event: &Value, context: Context<'_>, turn: &mut Turn) -> Outcom
                 return outcome;
             }
             turn.running = true;
+            turn.run_active = true;
             outcome.session_running(&context, true);
             if !context.is_active {
                 return outcome;
@@ -277,6 +279,7 @@ pub fn translate(event: &Value, context: Context<'_>, turn: &mut Turn) -> Outcom
 
         Some("agent_settled") => {
             turn.running = false;
+            turn.run_active = false;
             // Whatever was placed optimistically is on the transcript now; a
             // leftover would eat the next turn's first queued message.
             turn.optimistic_prompts.clear();
@@ -329,36 +332,48 @@ pub fn translate(event: &Value, context: Context<'_>, turn: &mut Turn) -> Outcom
 
         Some("compaction_end") => {
             let error = event.get("errorMessage").and_then(Value::as_str);
-            turn.running = false;
+            // Pi reports "nothing to compact" as an error, but a session too
+            // small to compact is not a failure the user should see as one.
+            let benign = error.is_some_and(|error| error.contains("Nothing to compact"));
             turn.conversation_compacted = error.is_none();
             let pending_prompt = turn.pending_prompt.take();
             let item_id = turn.compaction_item_id.take();
-            outcome.session_running(&context, false);
 
-            if context.is_active {
-                // Pi reports "nothing to compact" as an error, but a session
-                // too small to compact is not a failure the user should see as
-                // one.
-                let benign = error.is_some_and(|error| error.contains("Nothing to compact"));
-                outcome.act(Action::SetSessionStatus(match error {
-                    Some(error) if !benign => SessionStatus::Failed(error.to_owned()),
-                    _ => SessionStatus::Ready,
-                }));
-                if let Some(item_id) = item_id {
-                    let (text, is_error) = match error {
-                        Some(_) if benign => {
-                            ("Nothing to compact (session too small)".to_owned(), false)
-                        }
-                        Some(error) => (error.to_owned(), true),
-                        None => (compaction_summary(event.get("result")), false),
-                    };
-                    outcome.act(Action::UpsertConversation(compaction_card(
-                        item_id,
-                        text,
-                        event.get("result"),
-                        is_error,
-                    )));
+            if turn.run_active {
+                // Auto-compaction inside an agent run: Pi goes on to drain its
+                // follow-up queue and emits `agent_settled` only when the whole
+                // run ends. Going quiet here would show Ready while Pi still
+                // runs — and a prompt submitted into that window is rejected
+                // and lost — so the session stays busy until the run settles.
+                outcome.session_running(&context, true);
+                outcome.act_if_active(&context, Action::SetSessionStatus(SessionStatus::Streaming));
+            } else {
+                turn.running = false;
+                outcome.session_running(&context, false);
+                if context.is_active {
+                    outcome.act(Action::SetSessionStatus(match error {
+                        Some(error) if !benign => SessionStatus::Failed(error.to_owned()),
+                        _ => SessionStatus::Ready,
+                    }));
                 }
+            }
+
+            if context.is_active
+                && let Some(item_id) = item_id
+            {
+                let (text, is_error) = match error {
+                    Some(_) if benign => {
+                        ("Nothing to compact (session too small)".to_owned(), false)
+                    }
+                    Some(error) => (error.to_owned(), true),
+                    None => (compaction_summary(event.get("result")), false),
+                };
+                outcome.act(Action::UpsertConversation(compaction_card(
+                    item_id,
+                    text,
+                    event.get("result"),
+                    is_error,
+                )));
             }
 
             // The deferred prompt continues even with the session in the
@@ -1420,6 +1435,70 @@ mod tests {
         );
         assert!(upserted(&end)[0].is_error);
         assert!(!turn.conversation_compacted);
+    }
+
+    #[test]
+    fn auto_compaction_inside_a_run_keeps_the_session_busy_until_it_settles() {
+        let mut turn = Turn::default();
+        // The reply opens the run; auto-compaction triggers as it ends.
+        translate(&assistant_message("Working"), active(), &mut turn);
+        assert!(turn.run_active);
+        translate(&json!({"type": "compaction_start"}), active(), &mut turn);
+
+        let end = translate(
+            &json!({
+                "type": "compaction_end",
+                "result": {"summary": "Kept context", "tokensBefore": 90_000},
+            }),
+            active(),
+            &mut turn,
+        );
+
+        // The card completes, but Pi may still continue with queued follow-ups
+        // — `agent_settled` has not arrived, so the session stays busy. Going
+        // Ready here is what made prompts submitted in this window vanish.
+        assert_eq!(upserted(&end).len(), 1);
+        assert!(turn.running);
+        assert!(turn.run_active);
+        assert_eq!(running(&end), Some(true));
+        assert_eq!(status(&end), Some(&SessionStatus::Streaming));
+
+        let settled = translate(&json!({"type": "agent_settled"}), active(), &mut turn);
+        assert!(!turn.running);
+        assert!(!turn.run_active);
+        assert_eq!(running(&settled), Some(false));
+        assert_eq!(status(&settled), Some(&SessionStatus::Ready));
+    }
+
+    #[test]
+    fn a_run_internal_compaction_in_the_background_stays_running_quietly() {
+        let mut turn = Turn::default();
+        translate(&assistant_message("Working"), background(), &mut turn);
+        translate(
+            &json!({"type": "compaction_start"}),
+            background(),
+            &mut turn,
+        );
+
+        let end = translate(&json!({"type": "compaction_end"}), background(), &mut turn);
+
+        assert!(turn.running);
+        assert_eq!(running(&end), Some(true));
+        assert_eq!(status(&end), None);
+    }
+
+    #[test]
+    fn a_standalone_compaction_still_finishes_the_turn() {
+        // A manual or model-switch compaction runs outside an agent run, so
+        // its end is what releases the session.
+        let mut turn = Turn::default();
+        translate(&json!({"type": "compaction_start"}), active(), &mut turn);
+        let end = translate(&json!({"type": "compaction_end"}), active(), &mut turn);
+
+        assert!(!turn.running);
+        assert!(!turn.run_active);
+        assert_eq!(running(&end), Some(false));
+        assert_eq!(status(&end), Some(&SessionStatus::Ready));
     }
 
     #[test]

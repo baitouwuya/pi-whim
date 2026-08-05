@@ -39,6 +39,14 @@ pub type PendingPrompt = (String, Vec<Attachment>, SubmitMode);
 pub struct Turn {
     /// True while the agent is streaming or compacting.
     pub running: bool,
+    /// True from a run's first message event until its `agent_settled`.
+    ///
+    /// Compaction happens either inside a run (auto-compaction after a reply,
+    /// before Pi continues with its queued follow-ups) or standalone (a manual
+    /// or model-switch compaction). Only the standalone kind ends the busy
+    /// state at `compaction_end`; inside a run that event just completes the
+    /// card, and the run keeps the session busy until it settles.
+    pub run_active: bool,
     /// The entry a stream is appending to. Pi renames it once the model has
     /// answered, so this is a placeholder until then.
     pub assistant_message_id: Option<String>,

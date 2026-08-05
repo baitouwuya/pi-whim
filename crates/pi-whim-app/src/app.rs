@@ -2301,6 +2301,12 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 SubmitMode::Prompt => session.runtime.send(json!({
                     "type": "prompt",
                     "message": prompt_with_attachment_paths(&content, &attachments),
+                    // Pi rejects a prompt that arrives mid-run unless told how
+                    // to queue it. The session status normally keeps a plain
+                    // prompt from going out then, but a run Pi started on its
+                    // own is invisible until its first event lands — queue the
+                    // message rather than lose it. Idle Pi ignores this field.
+                    "streamingBehavior": "followUp",
                 })),
                 SubmitMode::Steer => session
                     .runtime
@@ -3851,6 +3857,9 @@ mod tests {
             format!("Please inspect this.\n{expected_path}")
         );
         assert!(prompt.get("images").is_none());
+        // A prompt reaching Pi mid-run queues instead of being rejected and
+        // lost; idle Pi ignores the field.
+        assert_eq!(prompt["streamingBehavior"], "followUp");
     }
 
     #[test]
