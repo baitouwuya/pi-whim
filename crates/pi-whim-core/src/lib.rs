@@ -485,12 +485,21 @@ impl HookConfig {
             if gate_only_event && !matches!(hook.kind, HookKind::Gate) {
                 return Err(format!("hook {} must be a Gate for this event", hook.id));
             }
+            if matches!(hook.event, HookEvent::InteractionResolving)
+                && !matches!(hook.kind, HookKind::Transform)
+            {
+                return Err(format!(
+                    "hook {} must be a Transform for this event",
+                    hook.id
+                ));
+            }
             if matches!(hook.kind, HookKind::Transform)
                 && !matches!(
                     hook.event,
                     HookEvent::ToolDispatching
                         | HookEvent::AgentSpawning
                         | HookEvent::MessageSending
+                        | HookEvent::InteractionResolving
                 )
             {
                 return Err(format!("hook {} cannot transform this event", hook.id));
@@ -553,6 +562,13 @@ pub enum HookEvent {
     AgentFinished,
     MessageDelivered,
     InteractionCreated,
+    /// Transform only: fires when an interaction is created, before it
+    /// reaches its owner. A Transform may set `arguments.decision` to answer
+    /// in the owner's place — any non-empty text for a question, only `deny`
+    /// for an approval, since a hook must never grant access the reader did
+    /// not. An unchanged or invalid decision leaves the question to the
+    /// owner.
+    InteractionResolving,
     InteractionResolved,
     TeamReset,
 }
@@ -1376,6 +1392,35 @@ mod tests {
             "permission-transform",
             HookEvent::PermissionResolving,
             HookKind::Transform,
+        )];
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn interaction_resolving_is_transform_only() {
+        // The event answers a question, so only a Transform — the one kind
+        // that can return a value — is allowed on it.
+        let mut config = HookConfig {
+            hooks: vec![valid_hook(
+                "auto-answer",
+                HookEvent::InteractionResolving,
+                HookKind::Transform,
+            )],
+            ..HookConfig::default()
+        };
+        assert!(config.validate().is_ok());
+
+        config.hooks = vec![valid_hook(
+            "auto-answer-gate",
+            HookEvent::InteractionResolving,
+            HookKind::Gate,
+        )];
+        assert!(config.validate().is_err());
+
+        config.hooks = vec![valid_hook(
+            "auto-answer-observe",
+            HookEvent::InteractionResolving,
+            HookKind::Observe,
         )];
         assert!(config.validate().is_err());
     }

@@ -1,10 +1,11 @@
 //! Questions the agent asks the user, and the answers that go back.
 //!
-//! Two sources ask: Pi's extension protocol sends a `confirm` request when a
-//! tool wants permission, and the agent-team supervisor sends an interaction
-//! when a sub-agent needs an approval or a decision. Both arrive as untyped
-//! wire JSON and both need the same thing on screen — a title, a message, and a
-//! row of choices — so they are parsed into one shape here.
+//! Two sources ask: Pi's extension protocol sends a dialog request (`select`,
+//! `confirm`, `input`, or `editor`) when an extension needs the reader, and the
+//! agent-team supervisor sends an interaction when a sub-agent needs an
+//! approval or a decision. Both arrive as untyped wire JSON and both need the
+//! same thing on screen — a title, a message, and a row of choices — so they
+//! are parsed into one shape here.
 //!
 //! The egui app held these in `Option<(String, Value)>` and `Vec<(String,
 //! Value)>` on the application struct, reaching into the JSON again at render
@@ -89,10 +90,27 @@ impl Choice {
 /// Which protocol asked, and so how the answer travels back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
-    /// Pi's extension confirmation, answered over the extension RPC as a bool.
-    Extension,
+    /// Pi's extension dialog, answered over the extension RPC.
+    Extension(ExtensionMethod),
     /// A supervisor interaction, answered with the option that was picked.
     Interaction,
+}
+
+/// The extension_ui method that asked.
+///
+/// Pi blocks the calling extension on the answer and each method reads a
+/// different field of the response, so the method has to survive the trip
+/// through the queue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExtensionMethod {
+    /// A choice from a list.
+    Select,
+    /// A yes/no confirmation.
+    Confirm,
+    /// A line of free text.
+    Input,
+    /// Free text the extension seeded.
+    Editor,
 }
 
 /// The value an extension confirmation treats as consent.
@@ -114,20 +132,35 @@ pub struct Prompt {
     /// Closing the window is itself an answer: the agent is blocked waiting, so
     /// there has to be one, and it should be the cautious one.
     pub dismissal: String,
+    /// Whether the reader may type an answer of their own.
+    ///
+    /// A supervisor question and the extension's free-text methods accept any
+    /// text back; an approval, a confirmation, and a list are pinned to what
+    /// they offered, so those offer no input.
+    pub allows_custom_answer: bool,
+    /// What the empty answer field hints at, when the request named one.
+    pub placeholder: Option<String>,
+    /// What the answer field starts with, when the request named one.
+    pub prefill: Option<String>,
 }
 
 impl Prompt {
-    /// Read an extension confirmation.
+    /// Read an extension dialog.
     ///
-    /// Returns `None` for any other extension method, since those are not
-    /// questions and nothing on screen would make sense.
+    /// Returns `None` for any other extension method: the fire-and-forget
+    /// ones (notify, status, widgets) ask for nothing, and a dialog waiting
+    /// on an answer nothing wants would block the extension forever.
     pub fn from_extension(session_key: &str, request: &Value) -> Option<Self> {
-        if request.get("method").and_then(Value::as_str) != Some("confirm") {
-            return None;
-        }
-        Some(Self {
+        let method = match request.get("method").and_then(Value::as_str)? {
+            "select" => ExtensionMethod::Select,
+            "confirm" => ExtensionMethod::Confirm,
+            "input" => ExtensionMethod::Input,
+            "editor" => ExtensionMethod::Editor,
+            _ => return None,
+        };
+        let base = Self {
             session_key: session_key.to_owned(),
-            source: Source::Extension,
+            source: Source::Extension(method),
             request_id: request
                 .get("id")
                 .and_then(Value::as_str)
@@ -135,19 +168,70 @@ impl Prompt {
                 .to_owned(),
             title: Label::or_key(
                 request.get("title").and_then(Value::as_str),
-                "confirm-title",
+                match method {
+                    ExtensionMethod::Confirm => "confirm-title",
+                    _ => "ask-title",
+                },
             ),
             message: Label::or_key(
                 request.get("message").and_then(Value::as_str),
                 "confirm-message",
             ),
-            choices: vec![
-                Choice::new(ALLOW, Label::Key("allow"), Tone::Primary),
-                Choice::new("deny", Label::Key("deny"), Tone::Danger),
-            ],
-            // Dismissing a permission request denies it. Anything else would
-            // grant access the reader never agreed to.
-            dismissal: "deny".to_owned(),
+            choices: Vec::new(),
+            dismissal: String::new(),
+            allows_custom_answer: false,
+            placeholder: None,
+            prefill: None,
+        };
+        Some(match method {
+            ExtensionMethod::Confirm => Self {
+                choices: vec![
+                    Choice::new(ALLOW, Label::Key("allow"), Tone::Primary),
+                    Choice::new("deny", Label::Key("deny"), Tone::Danger),
+                ],
+                // Dismissing a permission request denies it. Anything else
+                // would grant access the reader never agreed to.
+                dismissal: "deny".to_owned(),
+                ..base
+            },
+            ExtensionMethod::Select => {
+                let choices: Vec<Choice> = request
+                    .get("options")
+                    .and_then(Value::as_array)?
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|option| Choice::new(option, Label::verbatim(option), Tone::Neutral))
+                    .collect();
+                // A list with nothing on it cannot be answered, and the
+                // extension's own timeout is kinder than a dead dialog.
+                if choices.is_empty() {
+                    return None;
+                }
+                Self {
+                    choices,
+                    // A list under its title needs no body repeating it.
+                    message: Label::verbatim(""),
+                    ..base
+                }
+            }
+            ExtensionMethod::Input => Self {
+                message: Label::verbatim(""),
+                allows_custom_answer: true,
+                placeholder: request
+                    .get("placeholder")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                ..base
+            },
+            ExtensionMethod::Editor => Self {
+                message: Label::verbatim(""),
+                allows_custom_answer: true,
+                prefill: request
+                    .get("prefill")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                ..base
+            },
         })
     }
 
@@ -204,16 +288,22 @@ impl Prompt {
                 .map(|option| choice_for(kind, option))
                 .collect(),
             dismissal,
+            allows_custom_answer: kind == "question",
+            placeholder: None,
+            prefill: None,
         })
     }
 
     /// What to send back for `value`.
     pub fn answer(&self, value: &str) -> Answer {
         match self.source {
-            Source::Extension => Answer::Extension {
+            Source::Extension(method) => Answer::Extension {
                 session_key: self.session_key.clone(),
                 request_id: self.request_id.clone(),
-                confirmed: value == ALLOW,
+                response: match method {
+                    ExtensionMethod::Confirm => ExtensionResponse::Confirmed(value == ALLOW),
+                    _ => ExtensionResponse::Value(value.to_owned()),
+                },
             },
             Source::Interaction => Answer::Interaction {
                 session_key: self.session_key.clone(),
@@ -225,7 +315,18 @@ impl Prompt {
 
     /// What to send back when the dialog is closed unanswered.
     pub fn dismissed(&self) -> Answer {
-        self.answer(&self.dismissal)
+        match self.source {
+            // A confirmation closed unanswered denies; anything else the
+            // extension asked cancels, since picking for the reader could
+            // choose something they never meant.
+            Source::Extension(ExtensionMethod::Confirm) => self.answer(&self.dismissal),
+            Source::Extension(_) => Answer::Extension {
+                session_key: self.session_key.clone(),
+                request_id: self.request_id.clone(),
+                response: ExtensionResponse::Cancelled,
+            },
+            Source::Interaction => self.answer(&self.dismissal),
+        }
     }
 }
 
@@ -250,13 +351,25 @@ pub enum Answer {
     Extension {
         session_key: String,
         request_id: String,
-        confirmed: bool,
+        response: ExtensionResponse,
     },
     Interaction {
         session_key: String,
         request_id: String,
         decision: String,
     },
+}
+
+/// The payload an extension dialog reads back.
+///
+/// Pi picks the field by the method it called: `confirmed` for a confirm,
+/// `value` for a select, input, or editor, and `cancelled` when the reader
+/// closed the dialog instead of answering.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExtensionResponse {
+    Confirmed(bool),
+    Value(String),
+    Cancelled,
 }
 
 impl Answer {
@@ -375,7 +488,7 @@ mod tests {
     fn a_confirmation_offers_allow_and_deny() {
         let prompt = Prompt::from_extension("s1", &confirm()).expect("a prompt");
 
-        assert_eq!(prompt.source, Source::Extension);
+        assert_eq!(prompt.source, Source::Extension(ExtensionMethod::Confirm));
         assert_eq!(prompt.request_id, "req-1");
         assert_eq!(prompt.title, Label::verbatim("Run a command?"));
         // The two buttons are the app's own words, so they travel as keys and
@@ -422,7 +535,7 @@ mod tests {
             Answer::Extension {
                 session_key: "s1".into(),
                 request_id: "req-1".into(),
-                confirmed: false,
+                response: ExtensionResponse::Confirmed(false),
             }
         );
     }
@@ -431,15 +544,108 @@ mod tests {
     fn only_allow_counts_as_consent() {
         let prompt = Prompt::from_extension("s1", &confirm()).unwrap();
 
-        let Answer::Extension { confirmed, .. } = prompt.answer("allow") else {
+        let Answer::Extension { response, .. } = prompt.answer("allow") else {
             panic!("an extension answer");
         };
-        assert!(confirmed);
+        assert_eq!(response, ExtensionResponse::Confirmed(true));
 
-        let Answer::Extension { confirmed, .. } = prompt.answer("deny") else {
+        let Answer::Extension { response, .. } = prompt.answer("deny") else {
             panic!("an extension answer");
         };
-        assert!(!confirmed);
+        assert_eq!(response, ExtensionResponse::Confirmed(false));
+    }
+
+    #[test]
+    fn a_select_offers_its_options_verbatim() {
+        let prompt = Prompt::from_extension(
+            "s1",
+            &json!({"id": "req-2", "method": "select", "title": "Pick a branch",
+                "options": ["main", "release"]}),
+        )
+        .expect("a prompt");
+
+        assert_eq!(prompt.source, Source::Extension(ExtensionMethod::Select));
+        assert_eq!(
+            prompt.choices,
+            vec![
+                Choice::new("main", Label::verbatim("main"), Tone::Neutral),
+                Choice::new("release", Label::verbatim("release"), Tone::Neutral),
+            ]
+        );
+        // The list is the question; there is nothing to type into it.
+        assert!(!prompt.allows_custom_answer);
+        assert!(prompt.message.is_empty());
+
+        let Answer::Extension { response, .. } = prompt.answer("release") else {
+            panic!("an extension answer");
+        };
+        assert_eq!(response, ExtensionResponse::Value("release".into()));
+    }
+
+    #[test]
+    fn a_select_without_options_is_not_a_question() {
+        // Nothing to pick means nothing to show; the extension's own timeout
+        // ends its wait instead of a dead dialog.
+        assert!(
+            Prompt::from_extension(
+                "s1",
+                &json!({"id": "x", "method": "select", "title": "t", "options": []}),
+            )
+            .is_none()
+        );
+        assert!(
+            Prompt::from_extension("s1", &json!({"id": "x", "method": "select", "title": "t"}))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn an_input_asks_for_typed_text() {
+        let prompt = Prompt::from_extension(
+            "s1",
+            &json!({"id": "req-3", "method": "input", "title": "Branch name?",
+                "placeholder": "feat/…"}),
+        )
+        .expect("a prompt");
+
+        assert!(prompt.allows_custom_answer);
+        assert_eq!(prompt.placeholder.as_deref(), Some("feat/…"));
+        assert_eq!(prompt.prefill, None);
+
+        let Answer::Extension { response, .. } = prompt.answer("feat/ask") else {
+            panic!("an extension answer");
+        };
+        assert_eq!(response, ExtensionResponse::Value("feat/ask".into()));
+    }
+
+    #[test]
+    fn an_editor_seeds_the_field() {
+        let prompt = Prompt::from_extension(
+            "s1",
+            &json!({"id": "req-4", "method": "editor", "title": "Commit message",
+                "prefill": "fix: "}),
+        )
+        .expect("a prompt");
+
+        assert!(prompt.allows_custom_answer);
+        assert_eq!(prompt.prefill.as_deref(), Some("fix: "));
+    }
+
+    #[test]
+    fn dismissing_a_select_or_text_dialog_cancels_it() {
+        // Pi resolves a cancellation to the extension's own default; picking a
+        // value for the reader could answer something they never meant.
+        for request in [
+            json!({"id": "r1", "method": "select", "title": "t", "options": ["a"]}),
+            json!({"id": "r2", "method": "input", "title": "t"}),
+            json!({"id": "r3", "method": "editor", "title": "t"}),
+        ] {
+            let prompt = Prompt::from_extension("s1", &request).unwrap();
+            let Answer::Extension { response, .. } = prompt.dismissed() else {
+                panic!("an extension answer");
+            };
+            assert_eq!(response, ExtensionResponse::Cancelled);
+        }
     }
 
     #[test]
@@ -453,6 +659,29 @@ mod tests {
                 Choice::new("approve", Label::Key("allow-once"), Tone::Primary),
                 Choice::new("deny", Label::Key("deny"), Tone::Danger),
             ]
+        );
+    }
+
+    #[test]
+    fn only_a_question_offers_a_typed_answer() {
+        let question = Prompt::from_interaction(
+            "s1",
+            &json!({"request_id": "q", "kind": "question", "options": ["a"]}),
+        )
+        .unwrap();
+        assert!(question.allows_custom_answer);
+
+        // An approval and an extension confirmation are pinned to their
+        // protocol words; a typed answer is not one of them.
+        assert!(
+            !Prompt::from_interaction("s1", &approval())
+                .unwrap()
+                .allows_custom_answer
+        );
+        assert!(
+            !Prompt::from_extension("s1", &confirm())
+                .unwrap()
+                .allows_custom_answer
         );
     }
 
@@ -545,14 +774,14 @@ mod tests {
 
         assert_eq!(
             queue.current().map(|prompt| prompt.source),
-            Some(Source::Extension)
+            Some(Source::Extension(ExtensionMethod::Confirm))
         );
         assert_eq!(
             queue.answer("allow"),
             Some(Answer::Extension {
                 session_key: "s1".into(),
                 request_id: "req-1".into(),
-                confirmed: true,
+                response: ExtensionResponse::Confirmed(true),
             })
         );
         assert_eq!(

@@ -356,6 +356,7 @@ const STRINGS: &[(&str, &str, &str)] = &[
     // sends them; these stand in when it does not, and the buttons are always the
     // app's own words.
     ("confirm-title", "Pi confirmation", "Pi 确认"),
+    ("ask-title", "Pi question", "Pi 提问"),
     (
         "confirm-message",
         "Allow this operation?",
@@ -363,6 +364,12 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ),
     ("agent-request", "Agent request", "代理请求"),
     ("allow-once", "Allow once", "允许一次"),
+    (
+        "prompt-custom-placeholder",
+        "Or type your own answer…",
+        "或输入自定义回答…",
+    ),
+    ("prompt-custom-send", "Reply", "回复"),
     // Messages the host reports through the notification stack. They are written
     // where the failure happens, which is outside any view, so they are looked up
     // against the stored language rather than a view's own copy of it.

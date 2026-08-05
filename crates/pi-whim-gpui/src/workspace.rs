@@ -364,12 +364,16 @@ impl Workspace {
         })
         .detach();
 
-        let prompts = cx.new(|_| Prompts::new(tokens));
-        cx.subscribe(&prompts, |workspace, _, event, cx| {
+        let prompts = cx.new(|cx| Prompts::new(tokens, window, cx));
+        cx.subscribe_in(&prompts, window, |workspace, _, event, window, cx| {
             let PromptEvent::Answered(answer) = event;
             // Straight through: the shell has no session pool, and an unanswered
             // question leaves the agent that asked it blocked.
             workspace.request(Request::AnswerPrompt(answer.clone()), cx);
+            // The composer takes its place back once nothing is left to ask.
+            if !workspace.prompts.read(cx).is_asking() {
+                workspace.focus_composer(window, cx);
+            }
         })
         .detach();
 
@@ -679,11 +683,18 @@ impl Workspace {
 
     /// What one Escape means depends on the turn.
     ///
-    /// While the agent works it interrupts; a typed draft is not lost to that
-    /// but queued behind the turn it just stopped. Two presses in a row stop
-    /// everything, queue included. Idle, Escape stays the stream-reveal
-    /// shortcut it always was.
+    /// A waiting question comes first: the agent is blocked on its answer, so
+    /// Escape picks the cautious answer the prompt names rather than
+    /// interrupting past it. While the agent works it interrupts; a typed draft
+    /// is not lost to that but queued behind the turn it just stopped. Two
+    /// presses in a row stop everything, queue included. Idle, Escape stays the
+    /// stream-reveal shortcut it always was.
     fn handle_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.prompts.read(cx).is_asking() {
+            self.prompts.update(cx, |prompts, cx| prompts.dismiss(cx));
+            cx.stop_propagation();
+            return;
+        }
         let busy = matches!(
             self.state.session_status,
             SessionStatus::Streaming | SessionStatus::Compacting
@@ -1257,28 +1268,34 @@ impl Workspace {
     /// `border-radius: 0`, and the only round thing on this row is the permission
     /// dot.
     fn prompt_area(&self, tokens: Tokens, cx: &mut Context<Self>) -> impl IntoElement {
-        let (attach, send) = self.composer.update(cx, |composer, cx| {
-            (composer.attach_button(cx), composer.send_button(cx))
-        });
+        // A waiting question takes the composer's place: the asking agent is
+        // blocked on its answer, so that answer is the one thing typing can
+        // mean right now.
+        let asking = self.prompts.read(cx).is_asking();
+        let footer = (!asking).then(|| {
+            let (attach, send) = self.composer.update(cx, |composer, cx| {
+                (composer.attach_button(cx), composer.send_button(cx))
+            });
 
-        // One line, never wrapped. Attach and the permission grant sit on the
-        // left — both about what goes into the turn, not how it runs; model and
-        // thinking gather at the right beside send, so the turn's own settings
-        // read as one group next to the action they apply to.
-        let footer = div()
-            .flex()
-            .items_center()
-            .gap(px(8.0))
-            .child(attach)
-            .when_some(
-                self.controls.read(cx).permission_indicator(),
-                |this, grant| this.child(grant),
-            )
-            // Takes the slack, so the group stays at the right edge however wide
-            // the window gets.
-            .child(div().flex_1().min_w(px(0.0)))
-            .child(div().flex_none().child(self.controls.clone()))
-            .child(send);
+            // One line, never wrapped. Attach and the permission grant sit on the
+            // left — both about what goes into the turn, not how it runs; model and
+            // thinking gather at the right beside send, so the turn's own settings
+            // read as one group next to the action they apply to.
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .child(attach)
+                .when_some(
+                    self.controls.read(cx).permission_indicator(),
+                    |this, grant| this.child(grant),
+                )
+                // Takes the slack, so the group stays at the right edge however wide
+                // the window gets.
+                .child(div().flex_1().min_w(px(0.0)))
+                .child(div().flex_none().child(self.controls.clone()))
+                .child(send)
+        });
 
         let queue_status = QueueStatus::from_state(&self.state, tokens).map(|status| {
             status.on_clear(cx.listener(|workspace, _, _, cx| {
@@ -1338,8 +1355,10 @@ impl Workspace {
                     // prompt begins and ends.
                     .border_1()
                     .border_color(tokens.line.hsla())
-                    .child(self.composer.clone())
-                    .child(footer),
+                    .when(asking, |this| this.child(self.prompts.clone()))
+                    .when_some(footer, |this, footer| {
+                        this.child(self.composer.clone()).child(footer)
+                    }),
             )
     }
 }
@@ -1554,8 +1573,8 @@ impl Render for Workspace {
                     }),
             )
             // Modals last, so they paint over the panes. Each renders nothing
-            // when it has nothing to ask.
-            .child(self.prompts.clone())
+            // when it has nothing to ask. The question prompt is not among
+            // them: it takes the composer's place inside `prompt_area` instead.
             .child(self.rename.clone())
     }
 }

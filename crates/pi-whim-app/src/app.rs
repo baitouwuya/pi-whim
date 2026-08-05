@@ -3099,11 +3099,25 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         let result = match &answer {
             dialogs::Answer::Extension {
                 request_id,
-                confirmed,
+                response,
                 ..
-            } => session.runtime.respond_extension_ui(
-                json!({"type":"extension_ui_response", "id": request_id, "confirmed": confirmed}),
-            ),
+            } => {
+                // Pi reads the field its method waits on: `confirmed` for a
+                // confirm, `value` for a select, input, or editor, and
+                // `cancelled` when the dialog was closed unanswered.
+                let payload = match response {
+                    dialogs::ExtensionResponse::Confirmed(confirmed) => {
+                        json!({"type":"extension_ui_response", "id": request_id, "confirmed": confirmed})
+                    }
+                    dialogs::ExtensionResponse::Value(value) => {
+                        json!({"type":"extension_ui_response", "id": request_id, "value": value})
+                    }
+                    dialogs::ExtensionResponse::Cancelled => {
+                        json!({"type":"extension_ui_response", "id": request_id, "cancelled": true})
+                    }
+                };
+                session.runtime.respond_extension_ui(payload)
+            }
             dialogs::Answer::Interaction {
                 request_id,
                 decision,

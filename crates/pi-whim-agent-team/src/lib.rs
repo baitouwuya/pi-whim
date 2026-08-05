@@ -2157,16 +2157,9 @@ fn resolve_interaction_for_owner(
                 "question response cannot be empty",
             ));
         }
-        InteractionKind::Question
-            if !request.options.is_empty()
-                && decision != "cancel"
-                && !request.options.iter().any(|option| option == decision) =>
-        {
-            return Err(HostError::new(
-                "invalid_arguments",
-                "question response must be one of the supplied options",
-            ));
-        }
+        // A question's options are offers, not a closed set: the answer UI
+        // lets the reader type a free-form response instead, and only an
+        // approval is safety-sensitive enough to pin to its protocol words.
         _ => {}
     }
     request.response = Some(decision.to_owned());
@@ -2392,7 +2385,6 @@ fn create_interaction(
         .lock()
         .map_err(|_| HostError::new("internal", "interaction state is unavailable"))?
         .insert(request.id, request.clone());
-    notify_interaction_owner(host, owner_id, request.id)?;
     record_interaction_audit(
         host,
         requester_id,
@@ -2408,7 +2400,63 @@ fn create_interaction(
             json!({"request_id": request.id, "requester_id": requester_id, "owner_id": owner_id}),
         ),
     );
+    // The hooks answer first: a transform on interaction_resolving may
+    // resolve the question before its owner ever sees it.
+    if !auto_resolve_interaction(host, &request) {
+        notify_interaction_owner(host, owner_id, request.id)?;
+    }
     Ok(request)
+}
+
+/// First refusal on a fresh interaction belongs to the hooks.
+///
+/// A transform on `interaction_resolving` answers in the owner's place: the
+/// decision goes through the same validation as one picked in the dialog, the
+/// requester is notified as usual, and the owner is never shown the question.
+/// A question accepts any non-empty answer; an approval can only be
+/// auto-denied — a hook must never grant access the reader did not. Anything
+/// else, and the question takes its normal course to the owner.
+fn auto_resolve_interaction(host: &HostContext, request: &PendingInteraction) -> bool {
+    let payload = hook_payload_for_agent(
+        host,
+        request.requester_id,
+        Some(&request.id.to_string()),
+        json!({
+            "request_id": request.id,
+            "kind": request.kind,
+            "title": request.title,
+            "message": request.message,
+            "options": request.options,
+            "default_option": request.default_option,
+            "arguments": {"decision": null},
+        }),
+    );
+    let hooks::HookDecision::Continue(payload) =
+        host.hooks.gate(HookEvent::InteractionResolving, payload)
+    else {
+        return false;
+    };
+    let Some(decision) = payload["arguments"]
+        .get("decision")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|decision| !decision.is_empty())
+    else {
+        return false;
+    };
+    if matches!(request.kind, InteractionKind::Approval) && decision != "deny" {
+        record_interaction_audit(
+            host,
+            request.requester_id,
+            "interaction_auto_answer_rejected",
+            &format!(
+                "Interaction {} auto-answer rejected: an approval can only be denied",
+                request.id
+            ),
+        );
+        return false;
+    }
+    resolve_interaction_for_owner(host, request.owner_id, request.id, decision, false).is_ok()
 }
 
 fn parent_id(host: &HostContext, agent_id: AgentId) -> Result<AgentId, HostError> {
@@ -2896,17 +2944,24 @@ fn take_peer_messages(host: &HostContext, actor_id: AgentId) -> HostResult {
     let mut state = lock
         .lock()
         .map_err(|_| HostError::new("internal", "agent state is unavailable"))?;
-    let inbox = state.inboxes.entry(actor_id).or_default();
+    let pending = std::mem::take(state.inboxes.entry(actor_id).or_default());
     let mut messages = Vec::new();
-    let mut retained = VecDeque::with_capacity(inbox.len());
-    while let Some(message) = inbox.pop_front() {
-        if message.kind == MessageKind::PeerMessage {
-            messages.push(message);
-        } else {
+    let mut retained = VecDeque::with_capacity(pending.len());
+    for message in pending {
+        // The session's poller is the only reader for peer messages and for
+        // notifications from the user or a parent, so those go to the
+        // conversation now. A direct child's notifications stay: `wait_agent`
+        // returns them to the owner waiting on that child, and taking them
+        // here would starve the wait.
+        let waits_on_sender = message.kind == MessageKind::DirectNotification
+            && is_direct_child(&state, actor_id, message.sender_id);
+        if waits_on_sender {
             retained.push_back(message);
+        } else {
+            messages.push(message);
         }
     }
-    *inbox = retained;
+    *state.inboxes.entry(actor_id).or_default() = retained;
     Ok(json!({ "messages": messages }))
 }
 
@@ -4939,6 +4994,210 @@ mod tests {
         .unwrap();
         assert_eq!(result["wait_status"], "message");
         assert_eq!(result["messages"][0]["content"], "question");
+        supervisor.stop().unwrap();
+    }
+
+    #[test]
+    fn the_poller_leaves_a_childs_notification_for_wait_agent() {
+        // A direct child's notification is how `wait_agent` reports early; the
+        // session poller must not take it first.
+        let (mut supervisor, _) = test_host(AgentTeamConfig::default());
+        let (child_id, _, _, _, _) = reserve_child(
+            &supervisor.host,
+            supervisor.root_id,
+            &SpawnAgentArguments {
+                name: "child".into(),
+                role: String::new(),
+                task: "task".into(),
+                provider: None,
+                model: None,
+                permission_level: None,
+                enabled_tools: None,
+                trusted_extensions: None,
+                preset: None,
+            },
+        )
+        .unwrap();
+        send_message(
+            &supervisor.host,
+            child_id,
+            &json!({ "target": "parent", "message": "from child" }),
+        )
+        .unwrap();
+
+        let taken = take_peer_messages(&supervisor.host, supervisor.root_id).unwrap();
+        assert_eq!(taken["messages"].as_array().unwrap().len(), 0);
+        supervisor.stop().unwrap();
+    }
+
+    #[test]
+    fn the_poller_takes_a_parents_notification() {
+        // Nothing else reads a child's inbox: a notification from its parent
+        // would sit there forever unless the poller delivers it.
+        let (mut supervisor, _) = test_host(AgentTeamConfig::default());
+        let (child_id, _, _, _, _) = reserve_child(
+            &supervisor.host,
+            supervisor.root_id,
+            &SpawnAgentArguments {
+                name: "child".into(),
+                role: String::new(),
+                task: "task".into(),
+                provider: None,
+                model: None,
+                permission_level: None,
+                enabled_tools: None,
+                trusted_extensions: None,
+                preset: None,
+            },
+        )
+        .unwrap();
+        send_message(
+            &supervisor.host,
+            supervisor.root_id,
+            &json!({ "target": child_id, "message": "from parent" }),
+        )
+        .unwrap();
+
+        let taken = take_peer_messages(&supervisor.host, child_id).unwrap();
+        let messages = taken["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["content"], "from parent");
+        supervisor.stop().unwrap();
+    }
+
+    #[test]
+    fn a_resolved_questions_notification_reaches_the_polling_session() {
+        // The L0 user answers as the root session itself, so the resolution
+        // arrives as a direct notification; it is the asking agent's only
+        // copy of the answer.
+        let (mut supervisor, _) = test_host(AgentTeamConfig::default());
+        let request = ask_user(
+            &supervisor.host,
+            supervisor.root_id,
+            AskUserArguments {
+                title: "Choose".into(),
+                message: "Pick".into(),
+                options: vec!["yes".into(), "no".into()],
+                default_option: None,
+            },
+        )
+        .unwrap();
+        let request_id = request["request"]["request_id"].as_str().unwrap();
+        supervisor
+            .resolve_user_interaction(request_id, "yes")
+            .unwrap();
+
+        let taken = take_peer_messages(&supervisor.host, supervisor.root_id).unwrap();
+        let messages = taken["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0]["content"].as_str().unwrap().contains("yes"));
+        supervisor.stop().unwrap();
+    }
+
+    fn test_host_with_hooks(hooks: Vec<pi_whim_core::HookDefinition>) -> AgentSupervisor {
+        AgentSupervisor::start(AgentLaunchConfig {
+            executable: PathBuf::from("/missing/pi"),
+            project_path: PathBuf::from("/tmp"),
+            sessions_path: PathBuf::from("/tmp"),
+            extension_paths: Vec::new(),
+            environment: HashMap::new(),
+            team_config: AgentTeamConfig::default(),
+            search_engines: Vec::new(),
+            search_engine_api_keys: SearchEngineApiKeys::default(),
+            hooks: HookConfig {
+                version: 1,
+                revision: String::new(),
+                hooks,
+            },
+        })
+        .unwrap()
+    }
+
+    fn answering_hook(decision: &str) -> pi_whim_core::HookDefinition {
+        pi_whim_core::HookDefinition {
+            id: "auto-answer".into(),
+            event: HookEvent::InteractionResolving,
+            kind: pi_whim_core::HookKind::Transform,
+            command: vec![
+                "/bin/echo".into(),
+                format!(r#"{{"arguments":{{"decision":"{decision}"}}}}"#),
+            ],
+            timeout_ms: Some(1_000),
+            matcher: pi_whim_core::HookMatcher::default(),
+            entrypoint_fingerprint: None,
+        }
+    }
+
+    fn interaction_response(supervisor: &AgentSupervisor, request_id: &str) -> Option<String> {
+        supervisor
+            .host
+            .interactions
+            .lock()
+            .unwrap()
+            .get(&Uuid::parse_str(request_id).unwrap())
+            .and_then(|request| request.response.clone())
+    }
+
+    #[test]
+    fn a_hook_can_answer_a_question_before_its_owner_sees_it() {
+        if !std::path::Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+        let mut supervisor = test_host_with_hooks(vec![answering_hook("from the hook")]);
+        let request = ask_user(
+            &supervisor.host,
+            supervisor.root_id,
+            AskUserArguments {
+                title: "Choose".into(),
+                message: "Pick".into(),
+                options: vec!["yes".into(), "no".into()],
+                default_option: None,
+            },
+        )
+        .unwrap();
+        let request_id = request["request"]["request_id"].as_str().unwrap();
+
+        // Resolved on the spot, and the asker holds the answer already.
+        assert_eq!(
+            interaction_response(&supervisor, request_id).as_deref(),
+            Some("from the hook")
+        );
+        let taken = take_peer_messages(&supervisor.host, supervisor.root_id).unwrap();
+        assert!(
+            taken["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("from the hook")
+        );
+        supervisor.stop().unwrap();
+    }
+
+    #[test]
+    fn a_hook_can_auto_deny_but_never_auto_approve() {
+        if !std::path::Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+        // An auto-deny lands: policy may refuse an operation without asking.
+        let mut supervisor = test_host_with_hooks(vec![answering_hook("deny")]);
+        let request_id =
+            request_bash_approval(&supervisor.host, supervisor.root_id, "rm -rf build", false)
+                .unwrap();
+        assert_eq!(
+            interaction_response(&supervisor, &request_id.to_string()).as_deref(),
+            Some("deny")
+        );
+        supervisor.stop().unwrap();
+
+        // An auto-approve cannot: granting access stays with the reader, so
+        // the interaction is left for its owner.
+        let mut supervisor = test_host_with_hooks(vec![answering_hook("approve")]);
+        let request_id =
+            request_bash_approval(&supervisor.host, supervisor.root_id, "rm -rf build", false)
+                .unwrap();
+        assert_eq!(
+            interaction_response(&supervisor, &request_id.to_string()),
+            None
+        );
         supervisor.stop().unwrap();
     }
 

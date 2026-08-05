@@ -393,6 +393,23 @@ fn validate_transform(event: HookEvent, original: &Value, transformed: &Value) -
                 .ok_or(())
         }
         HookEvent::AgentSpawning => validate_spawn_transform(original, transformed),
+        HookEvent::InteractionResolving => {
+            // Only the decision may change: an answer hook replies to the
+            // question as asked, not to a question it rewrote.
+            let mut original = original.clone();
+            let mut transformed = transformed.clone();
+            let decision_valid = match transformed.get("decision") {
+                None | Some(Value::Null) => true,
+                Some(value) => value
+                    .as_str()
+                    .is_some_and(|decision| !decision.trim().is_empty() && decision.len() <= 4096),
+            };
+            original.remove("decision");
+            transformed.remove("decision");
+            (original == transformed && decision_valid)
+                .then_some(())
+                .ok_or(())
+        }
         _ => Err(()),
     }
 }
@@ -1106,6 +1123,58 @@ esac
                     .gate(HookEvent::ToolDispatching, payload.clone()),
                 HookDecision::Deny(_)
             ));
+        }
+    }
+
+    #[test]
+    fn interaction_resolving_transforms_only_set_the_decision() {
+        if !Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let payload =
+            || json!({"request_id":"r1", "kind":"question", "arguments":{"decision":null}});
+
+        // An answer comes through.
+        let dispatcher = test_dispatcher(
+            directory.path(),
+            vec![test_hook(
+                "answer",
+                HookEvent::InteractionResolving,
+                HookKind::Transform,
+                vec![
+                    "/bin/echo".into(),
+                    r#"{"arguments":{"decision":"use pnpm"}}"#.into(),
+                ],
+            )],
+        );
+        assert_eq!(
+            dispatcher.gate(HookEvent::InteractionResolving, payload()),
+            HookDecision::Continue(
+                json!({"request_id":"r1", "kind":"question", "arguments":{"decision":"use pnpm"}})
+            )
+        );
+
+        // A blank or reshaping answer is a failure, and the question is left
+        // to its owner.
+        for response in [
+            r#"{"arguments":{"decision":"  "}}"#,
+            r#"{"arguments":{"decision":"x","kind":"approval"}}"#,
+            r#"{"arguments":{"decision":"x"},"extra":1}"#,
+        ] {
+            let dispatcher = test_dispatcher(
+                directory.path(),
+                vec![test_hook(
+                    "invalid-answer",
+                    HookEvent::InteractionResolving,
+                    HookKind::Transform,
+                    vec!["/bin/echo".into(), response.into()],
+                )],
+            );
+            assert_eq!(
+                dispatcher.gate(HookEvent::InteractionResolving, payload()),
+                HookDecision::Continue(payload())
+            );
         }
     }
 

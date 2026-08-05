@@ -84,7 +84,13 @@ byte-for-byte equivalent in JSON value terms. `agent_spawning` may change only a
 (including task, name, role, model, provider, and target) must be unchanged; transforms
 cannot add fields or expand permissions. `permission_resolving` is a deny-only Gate and
 runs only before an approval is granted; denials and cancellations can never be blocked by
-a Hook.
+a Hook. `interaction_resolving` runs when an interaction is created, before it reaches its
+owner, and its `arguments` are `{"decision": null}`: a Transform may set `decision` to a
+non-empty string of at most 4096 bytes and must change nothing else. A valid decision
+resolves the interaction at once, with the same audit record and requester notification as
+an owner's answer. Questions accept any answer; approvals accept only `deny` — a Hook can
+never auto-approve, matching the rule that hooks cannot authorize operations. An unchanged,
+empty, or invalid decision leaves the interaction to its owner.
 
 Gate events fail closed on launch, timeout, oversized output, or invalid JSON. Transform
 failures preserve the prior arguments. Observe events are best effort. Hook output is
@@ -121,12 +127,14 @@ protocol.
 | `agent_finished` | observe | `interrupted` (boolean), nullable `exit_code` |
 | `message_delivered` | observe | `sender_id`, `delivery` (the send operation's delivery-result object) |
 | `interaction_created` | observe | `request_id`, `requester_id`, `owner_id` |
+| `interaction_resolving` | transform only | `request_id`, `kind` (`question` or `approval`), `title`, `message`, `options`, nullable `default_option`; `arguments` is `{"decision": null}` and a Transform may set only `decision` |
 | `interaction_resolved` | observe | `request_id`, `requester_id`, `decision` |
 | `team_reset` | observe | `team_id`, `session_id` (the newly reset root session) |
 
-This is a strict matrix, not a general `15 × 3` event/kind system:
+This is a strict matrix, not a general event/kind system:
 `tool_dispatching`, `agent_spawning`, and `message_sending` support Gate and Transform;
-`permission_resolving` supports only Gate; the other eleven events support only Observe.
+`permission_resolving` supports only Gate; `interaction_resolving` supports only Transform;
+the other eleven events support only Observe.
 Invalid event/kind combinations are rejected when the manifest is validated.
 
 `matcher.tools` and `matcher.agent_levels` compare exact top-level payload values. Tool
