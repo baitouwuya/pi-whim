@@ -179,6 +179,10 @@ impl SupervisorHooks {
             key.manifest_revision.clone(),
             canonical_root.to_string_lossy().into_owned(),
         );
+        let context = match scope.grants_hash() {
+            Some(grants_hash) => context.with_grants_hash(grants_hash),
+            None => context,
+        };
         Ok(Self::active(scope, context, audit_sender, None))
     }
 
@@ -485,6 +489,12 @@ impl SupervisorHooks {
             duration_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
             output_truncated: false,
             revision: BUILTIN_REVISION.to_owned(),
+            scope_id: None,
+            kind: None,
+            dropped: false,
+            restart_count: 0,
+            drop_count: 0,
+            grants_hash: None,
         });
     }
 
@@ -765,6 +775,12 @@ fn adapt_host_audit(sender: &mpsc::SyncSender<HookAuditRecord>, event: HookAudit
         duration_ms: event.duration_ms,
         output_truncated: false,
         revision: event.revision,
+        scope_id: Some(event.scope_id),
+        kind: Some(event.kind),
+        dropped: event.dropped,
+        restart_count: event.restart_count,
+        drop_count: event.drop_count,
+        grants_hash: event.grants_hash,
     });
 }
 
@@ -1195,7 +1211,9 @@ mod tests {
         )]);
         let manager = HookHostManager::new_with_registry(
             supervisor_registry().unwrap(),
-            approved(&global_config),
+            approved(&global_config)
+                .with_grants_hash("a".repeat(64))
+                .unwrap(),
         )
         .unwrap();
         let manager_events = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1205,6 +1223,7 @@ mod tests {
         });
         let key = HookScopeKey::project(directory.path(), global_config.revision).unwrap();
         let scope = manager.open_scope(key, None).unwrap();
+        let expected_grants_hash = scope.grants_hash().unwrap();
         let (first_sender, first_receiver) = mpsc::sync_channel(16);
         let (second_sender, second_receiver) = mpsc::sync_channel(16);
         let first =
@@ -1225,6 +1244,11 @@ mod tests {
                 .filter(|event| event.hook_id == "shared-allow")
                 .count(),
             2
+        );
+        assert!(
+            manager_events.iter().all(|event| {
+                event.grants_hash.as_deref() == Some(expected_grants_hash.as_str())
+            })
         );
         for receiver in [first_receiver, second_receiver] {
             let records = receiver.try_iter().collect::<Vec<_>>();
@@ -1544,30 +1568,35 @@ mod tests {
     }
 
     #[test]
-    fn host_audit_adapter_records_metadata_only_outcome() {
-        if !sandbox_available() {
-            return;
-        }
-        let directory = tempfile::tempdir().unwrap();
-        let (pipeline, receiver) = test_pipeline(
-            directory.path(),
-            vec![definition(
-                "allow",
-                HookEvent::ToolDispatching,
-                CoreHookKind::Gate,
-                vec!["/bin/echo".to_owned(), "{}".to_owned()],
-            )],
+    fn host_audit_adapter_preserves_rich_metadata_only_outcome() {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        adapt_host_audit(
+            &sender,
+            HookAuditEvent {
+                hook_id: "allow".into(),
+                scope_id: "scope".into(),
+                event: "pi.tool.dispatching".into(),
+                kind: "gate".into(),
+                outcome: HostAuditOutcome::Allowed,
+                duration_ms: 7,
+                revision: "revision-test".into(),
+                dropped: true,
+                restart_count: 2,
+                drop_count: 3,
+                grants_hash: Some("grant".into()),
+            },
         );
-        assert!(pipeline.adapts_external_audit());
-        let _ = pipeline.control_tool_dispatch(tool_input("read", json!({})), validate_object);
-        let records = receiver.try_iter().collect::<Vec<_>>();
-        assert!(records.iter().any(|record| {
-            record.hook_id == "allow"
-                && record.event == HookEvent::ToolDispatching
-                && record.outcome == CoreAuditOutcome::Allowed
-                && !record.output_truncated
-                && record.revision == "revision-test"
-        }));
+        let record = receiver.try_recv().unwrap();
+        assert_eq!(record.hook_id, "allow");
+        assert_eq!(record.event, HookEvent::ToolDispatching);
+        assert_eq!(record.outcome, CoreAuditOutcome::Allowed);
+        assert!(!record.output_truncated);
+        assert_eq!(record.scope_id.as_deref(), Some("scope"));
+        assert_eq!(record.kind.as_deref(), Some("gate"));
+        assert!(record.dropped);
+        assert_eq!(record.restart_count, 2);
+        assert_eq!(record.drop_count, 3);
+        assert_eq!(record.grants_hash.as_deref(), Some("grant"));
     }
 
     #[test]

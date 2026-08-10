@@ -354,6 +354,18 @@ pub struct HookAuditRecord {
     pub duration_ms: u64,
     pub output_truncated: bool,
     pub revision: String,
+    #[serde(default)]
+    pub scope_id: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub dropped: bool,
+    #[serde(default)]
+    pub restart_count: u32,
+    #[serde(default)]
+    pub drop_count: u64,
+    #[serde(default)]
+    pub grants_hash: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -646,7 +658,7 @@ pub enum ProjectHookStatus {
     Invalid(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HookAuditSummary {
     pub hook_id: String,
     pub event: String,
@@ -655,6 +667,43 @@ pub struct HookAuditSummary {
     pub output_truncated: bool,
     pub revision: String,
     pub created_at_ms: i64,
+    #[serde(default)]
+    pub scope_id: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub dropped: bool,
+    #[serde(default)]
+    pub restart_count: u32,
+    #[serde(default)]
+    pub drop_count: u64,
+    #[serde(default)]
+    pub grants_hash: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookHealthStatus {
+    Starting,
+    Ready,
+    Unhealthy,
+    #[default]
+    Stopped,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookHealthSummary {
+    pub hook_id: String,
+    pub scope_id: String,
+    pub event: String,
+    pub status: HookHealthStatus,
+    pub revision: String,
+    #[serde(default)]
+    pub restart_count: u32,
+    #[serde(default)]
+    pub drop_count: u64,
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1142,6 +1191,7 @@ pub struct AppState {
     pub search_engine_profiles: Vec<SearchEngineProfile>,
     pub project_hook_status: ProjectHookStatus,
     pub hook_audit: Vec<HookAuditSummary>,
+    pub hook_health: Vec<HookHealthSummary>,
 }
 
 /// Where the visible session's Pi process stands.
@@ -1186,6 +1236,7 @@ pub enum Action {
     SetOneShotAiConfig(OneShotAiConfig),
     SetProjectHookStatus(ProjectHookStatus),
     SetHookAudit(Vec<HookAuditSummary>),
+    SetHookHealth(Vec<HookHealthSummary>),
     ProviderProfilesLoaded(Vec<ProviderProfile>),
     /// Which providers have a key in the OS keychain.
     ///
@@ -1264,6 +1315,7 @@ impl AppState {
             }
             Action::SetProjectHookStatus(status) => self.project_hook_status = status,
             Action::SetHookAudit(entries) => self.hook_audit = entries,
+            Action::SetHookHealth(entries) => self.hook_health = entries,
             Action::SetOneShotAiConfig(config) => {
                 self.one_shot_ai_config = config.normalized();
             }
@@ -1722,6 +1774,42 @@ mod tests {
             task.max_output_tokens,
             DEFAULT_ONE_SHOT_AI_MAX_OUTPUT_TOKENS
         );
+    }
+
+    #[test]
+    fn legacy_hook_audit_json_receives_safe_metadata_defaults() {
+        let record: HookAuditRecord = serde_json::from_value(serde_json::json!({
+            "hook_id": "policy",
+            "event": "tool_dispatching",
+            "outcome": "allowed",
+            "duration_ms": 1,
+            "output_truncated": false,
+            "revision": "r1"
+        }))
+        .unwrap();
+        assert_eq!(record.scope_id, None);
+        assert_eq!(record.kind, None);
+        assert!(!record.dropped);
+        assert_eq!(record.restart_count, 0);
+        assert_eq!(record.drop_count, 0);
+        assert_eq!(record.grants_hash, None);
+    }
+
+    #[test]
+    fn hook_health_action_replaces_replayable_state() {
+        let health = HookHealthSummary {
+            hook_id: "resident".into(),
+            scope_id: "scope".into(),
+            event: "pi.ui.command.submitting".into(),
+            status: HookHealthStatus::Unhealthy,
+            revision: "r1".into(),
+            restart_count: 2,
+            drop_count: 3,
+            last_error: Some("bounded".into()),
+        };
+        let mut state = AppState::default();
+        state.dispatch(Action::SetHookHealth(vec![health.clone()]));
+        assert_eq!(state.hook_health, vec![health]);
     }
 
     #[test]

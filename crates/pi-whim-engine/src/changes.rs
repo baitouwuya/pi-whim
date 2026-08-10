@@ -236,7 +236,9 @@ pub fn topics_for_action(action: &Action) -> &'static [StateTopic] {
         | Action::SetBashBlockedPatterns(_)
         | Action::SetAgentTeamConfig(_)
         | Action::SetOneShotAiConfig(_) => PREFERENCES,
-        Action::SetProjectHookStatus(_) | Action::SetHookAudit(_) => HOOKS,
+        Action::SetProjectHookStatus(_) | Action::SetHookAudit(_) | Action::SetHookHealth(_) => {
+            HOOKS
+        }
         Action::ProviderProfilesLoaded(_) | Action::ProviderKeyStatusLoaded(_) => PROVIDERS,
         Action::SearchEngineProfilesLoaded(_) | Action::SearchEngineKeyStatusLoaded(_) => {
             SEARCH_ENGINES
@@ -390,6 +392,7 @@ mod tests {
             Action::SetOneShotAiConfig(Default::default()),
             Action::SetProjectHookStatus(ProjectHookStatus::default()),
             Action::SetHookAudit(Vec::new()),
+            Action::SetHookHealth(Vec::new()),
             Action::ProviderProfilesLoaded(Vec::new()),
             Action::ProviderKeyStatusLoaded(Vec::new()),
             Action::SearchEngineProfilesLoaded(Vec::<SearchEngineProfile>::new()),

@@ -7,8 +7,8 @@
 use std::collections::{BTreeMap, HashSet};
 
 use pi_whim_core::{
-    AgentTeamConfig, AppState, BashPolicy, ConversationItem, HookAuditSummary, Language,
-    ModelOption, OneShotAiConfig, Project, ProjectHookStatus, ProjectId, ProviderProfile,
+    AgentTeamConfig, AppState, BashPolicy, ConversationItem, HookAuditSummary, HookHealthSummary,
+    Language, ModelOption, OneShotAiConfig, Project, ProjectHookStatus, ProjectId, ProviderProfile,
     QueueMode, SearchEngineProfile, SessionId, SessionMetrics, SessionStatus, SessionSummary,
     SlashCommandInfo, ThinkingLevel,
 };
@@ -162,6 +162,7 @@ pub struct SettingsProjection {
     search_engine_profiles: Vec<SearchEngineProfile>,
     project_hook_status: ProjectHookStatus,
     hook_audit: Vec<HookAuditSummary>,
+    hook_health: Vec<HookHealthSummary>,
 }
 
 impl SettingsProjection {
@@ -180,6 +181,7 @@ impl SettingsProjection {
             search_engine_profiles: state.search_engine_profiles.clone(),
             project_hook_status: state.project_hook_status.clone(),
             hook_audit: state.hook_audit.clone(),
+            hook_health: state.hook_health.clone(),
         }
     }
 
@@ -197,6 +199,7 @@ impl SettingsProjection {
         state.search_engine_profiles = self.search_engine_profiles;
         state.project_hook_status = self.project_hook_status;
         state.hook_audit = self.hook_audit;
+        state.hook_health = self.hook_health;
     }
 }
 
@@ -332,6 +335,35 @@ mod tests {
         assert!(topics[3].contains(&StateTopic::Providers));
         assert!(topics[3].contains(&StateTopic::SearchEngines));
         assert!(topics[3].contains(&StateTopic::Hooks));
+    }
+
+    #[test]
+    fn hook_health_is_replayed_by_the_settings_projection() {
+        let initial = AppState::default();
+        let projection = SettingsProjection::from_state(&initial);
+        let mut cache = AppState::default();
+        projection.apply_to(&mut cache);
+        assert!(cache.hook_health.is_empty());
+
+        let mut changed = initial;
+        changed.hook_health.push(pi_whim_core::HookHealthSummary {
+            hook_id: "policy".into(),
+            scope_id: "scope".into(),
+            event: "pi.ui.command.submitting".into(),
+            status: pi_whim_core::HookHealthStatus::Ready,
+            revision: "revision".into(),
+            restart_count: 1,
+            drop_count: 2,
+            last_error: None,
+        });
+        let selections = WorkspaceStateSelections::new(&AppState::default());
+        assert_eq!(
+            selections.publish(&change_set(StateTopic::Hooks), &changed),
+            1
+        );
+        let replayed = selections.settings_signal().get();
+        replayed.apply_to(&mut cache);
+        assert_eq!(cache.hook_health, changed.hook_health);
     }
 
     #[test]

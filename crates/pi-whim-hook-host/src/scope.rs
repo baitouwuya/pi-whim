@@ -37,6 +37,8 @@ pub struct ApprovedHookManifest {
     pub revision: String,
     /// SHA-256 hex fingerprints indexed by hook id.
     pub entrypoint_fingerprints: BTreeMap<String, String>,
+    /// Exact caller-approved grants digest, when available.
+    pub grants_hash: Option<String>,
 }
 
 impl ApprovedHookManifest {
@@ -74,7 +76,16 @@ impl ApprovedHookManifest {
             manifest,
             revision,
             entrypoint_fingerprints,
+            grants_hash: None,
         })
+    }
+
+    /// Attaches the exact caller-approved grants digest.
+    pub fn with_grants_hash(mut self, grants_hash: impl Into<String>) -> HookHostResult<Self> {
+        let grants_hash = grants_hash.into();
+        validate_sha256(&grants_hash, "grants hash")?;
+        self.grants_hash = Some(grants_hash);
+        Ok(self)
     }
 }
 
@@ -267,15 +278,28 @@ impl HookHostManager {
         key: HookScopeKey,
         project_manifest: Option<ApprovedHookManifest>,
     ) -> HookHostResult<HookScopeHandle> {
-        if let Some(existing) = self
-            .inner
-            .scopes
-            .lock()
-            .get(&key)
-            .and_then(std::sync::Weak::upgrade)
+        let grants_hash = combined_grants_hash(
+            self.inner.global.grants_hash.as_deref(),
+            project_manifest
+                .as_ref()
+                .and_then(|manifest| manifest.grants_hash.as_deref()),
+        );
         {
-            return Ok(HookScopeHandle { state: existing });
+            let mut scopes = self.inner.scopes.lock();
+            if let Some(existing) = scopes.get(&key).and_then(std::sync::Weak::upgrade) {
+                if !existing.revoked.load(Ordering::Acquire) {
+                    if existing.grants_hash != grants_hash {
+                        return Err(HookHostError::InvalidScope(
+                            "scope key reused with different approved grants".to_owned(),
+                        ));
+                    }
+                    return Ok(HookScopeHandle { state: existing });
+                }
+                existing.stop();
+            }
+            scopes.remove(&key);
         }
+
         if let Some(project) = &project_manifest {
             self.inner.registry.validate_manifest(&project.manifest)?;
             if project.revision != key.manifest_revision {
@@ -294,7 +318,13 @@ impl HookHostManager {
                 "app scope revision must match the global manifest revision".to_owned(),
             ));
         }
-        let state = HookScopeState::new(self.inner.clone(), key.clone(), project_manifest)?;
+
+        let state = HookScopeState::new(
+            self.inner.clone(),
+            key.clone(),
+            project_manifest,
+            grants_hash,
+        )?;
         let handle = HookScopeHandle {
             state: state.clone(),
         };
@@ -334,6 +364,11 @@ impl HookScopeHandle {
     /// Returns the stable scope digest.
     pub fn scope_id(&self) -> String {
         self.state.scope_id.clone()
+    }
+
+    /// Returns the combined exact grants digest for this scope, when available.
+    pub fn grants_hash(&self) -> Option<String> {
+        self.state.grants_hash.clone()
     }
 
     /// Returns whether the scope has been revoked.
@@ -392,6 +427,7 @@ struct HookScopeState {
     manager: Arc<ManagerInner>,
     key: HookScopeKey,
     scope_id: String,
+    grants_hash: Option<String>,
     workspace_root: PathBuf,
     hooks: Vec<BoundHook>,
     revoked: AtomicBool,
@@ -417,6 +453,7 @@ impl HookScopeState {
         manager: Arc<ManagerInner>,
         key: HookScopeKey,
         project_manifest: Option<ApprovedHookManifest>,
+        grants_hash: Option<String>,
     ) -> HookHostResult<Arc<Self>> {
         let scope_id = key.scope_id();
         let workspace_root = match &key.project_root {
@@ -465,6 +502,7 @@ impl HookScopeState {
             manager: manager.clone(),
             key,
             scope_id: scope_id.clone(),
+            grants_hash,
             workspace_root,
             hooks,
             revoked: AtomicBool::new(false),
@@ -802,7 +840,8 @@ impl HookScopeState {
             .project_root
             .as_ref()
             .map(|root| root.to_string_lossy().into_owned());
-        if context.project_root != expected_project_root {
+        if context.project_root != expected_project_root || context.grants_hash != self.grants_hash
+        {
             return Err(HookHostError::UnauthenticatedContext);
         }
         Ok(())
@@ -858,9 +897,14 @@ impl HookScopeState {
                 persistent.stop();
             }
         }
-        self.manager
-            .health_signal
-            .update(|values| values.retain(|health| health.scope_id != self.scope_id));
+        self.manager.health_signal.update(|values| {
+            for health in values
+                .iter_mut()
+                .filter(|health| health.scope_id == self.scope_id)
+            {
+                health.status = HookHealthStatus::Stopped;
+            }
+        });
         if self.key.project_root.is_none() {
             let _ = std::fs::remove_dir_all(&self.workspace_root);
         }
@@ -1008,6 +1052,42 @@ fn gate_decision(response: &Value) -> HookHostResult<Option<String>> {
             "gate decision must be allow or deny".to_owned(),
         )),
     }
+}
+
+fn validate_sha256(value: &str, label: &str) -> HookHostResult<()> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(HookHostError::InvalidScope(format!(
+            "{label} must be 64 hexadecimal bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn combined_grants_hash(global: Option<&str>, project: Option<&str>) -> Option<String> {
+    if global.is_none() && project.is_none() {
+        return None;
+    }
+    let mut digest = Sha256::new();
+    for value in [global, project] {
+        match value {
+            Some(value) => {
+                digest.update([1]);
+                digest.update((value.len() as u64).to_be_bytes());
+                digest.update(value.as_bytes());
+            }
+            None => {
+                digest.update([0]);
+                digest.update(0_u64.to_be_bytes());
+            }
+        }
+    }
+    Some(
+        digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
 }
 
 fn kind_name(kind: HookKind) -> &'static str {

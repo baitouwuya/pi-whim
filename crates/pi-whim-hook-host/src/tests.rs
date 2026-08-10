@@ -71,7 +71,11 @@ fn app_scope(
 
 fn app_context(handle: &crate::HookScopeHandle) -> HookInvocationContext {
     let key = handle.key();
-    HookInvocationContext::app(handle.scope_id(), key.manifest_revision)
+    let context = HookInvocationContext::app(handle.scope_id(), key.manifest_revision);
+    match handle.grants_hash() {
+        Some(grants_hash) => context.with_grants_hash(grants_hash),
+        None => context,
+    }
 }
 
 fn payload(value: Value) -> Result<HookPayload, HookHostError> {
@@ -724,6 +728,59 @@ fn scope_reuse_reentrancy_and_project_root_authentication_are_enforced() -> Test
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn revoked_scope_reopens_as_fresh_active_state_before_old_handle_drops() -> TestResult {
+    let directory = TestDirectory::new("revoked-reopen")?;
+    let script = directory.script(
+        "allow.sh",
+        "#!/bin/sh\ncat >/dev/null\nprintf '%s\n' '{\"decision\":\"allow\"}'\n",
+    )?;
+    let project = manifest(json!({
+        "version": 1,
+        "hooks": [{
+            "id": "project",
+            "event": "tool_dispatching",
+            "kind": "gate",
+            "command": [script]
+        }]
+    }))?;
+    let mut fingerprints = BTreeMap::new();
+    fingerprints.insert("project".to_owned(), sha256(&script)?);
+    let approved = ApprovedHookManifest::new(project, "project-r1", fingerprints)?
+        .with_grants_hash("c".repeat(64))?;
+    let manager = HookHostManager::empty()?;
+    let key = HookScopeKey::project(directory.path(), "project-r1")?;
+    let first = manager.open_scope(key.clone(), Some(approved.clone()))?;
+
+    first.revoke();
+    assert!(first.is_revoked());
+    assert_eq!(first.health()[0].status, HookHealthStatus::Stopped);
+
+    let replacement = manager.open_scope(key.clone(), Some(approved))?;
+    assert!(first.is_revoked());
+    assert!(!replacement.is_revoked());
+    assert_eq!(replacement.health()[0].status, HookHealthStatus::Ready);
+
+    let project_root = key
+        .project_root
+        .as_ref()
+        .ok_or("project key lost its root")?
+        .to_string_lossy()
+        .into_owned();
+    let grants_hash = replacement
+        .grants_hash()
+        .ok_or("replacement scope lost grants hash")?;
+    let decision = replacement.gate(
+        "pi.tool.dispatching",
+        HookInvocationContext::project(replacement.scope_id(), key.manifest_revision, project_root)
+            .with_grants_hash(grants_hash),
+        payload(json!({"tool": "shell"}))?,
+    )?;
+    assert!(matches!(decision, HookGateDecision::Allow));
+    Ok(())
+}
+
 #[test]
 fn protocol_rejects_unknown_response_fields() {
     let parsed = HookWireMessage::parse_line(
@@ -775,7 +832,8 @@ fn global_hooks_run_before_project_hooks_and_scope_is_shared() -> TestResult {
     }))?;
     let manager = HookHostManager::new_with_registry(
         EventRegistry::default(),
-        ApprovedHookManifest::new(global, "global-r1", BTreeMap::new())?,
+        ApprovedHookManifest::new(global, "global-r1", BTreeMap::new())?
+            .with_grants_hash("a".repeat(64))?,
     )?;
     let project = manifest(json!({
         "version": 1,
@@ -786,7 +844,8 @@ fn global_hooks_run_before_project_hooks_and_scope_is_shared() -> TestResult {
     }))?;
     let mut fingerprints = BTreeMap::new();
     fingerprints.insert("project".to_owned(), sha256(&project_script)?);
-    let approved = ApprovedHookManifest::new(project, "project-r1", fingerprints)?;
+    let approved = ApprovedHookManifest::new(project, "project-r1", fingerprints)?
+        .with_grants_hash("b".repeat(64))?;
     let key = HookScopeKey::project(directory.path(), "project-r1")?;
     let first = manager.open_scope(key.clone(), Some(approved.clone()))?;
     let second = manager.open_scope(key.clone(), Some(approved))?;
@@ -803,9 +862,12 @@ fn global_hooks_run_before_project_hooks_and_scope_is_shared() -> TestResult {
         .ok_or("project key lost its root")?
         .to_string_lossy()
         .into_owned();
+    let grants_hash = first.grants_hash().ok_or("scope lost exact grants hash")?;
+    assert_eq!(second.grants_hash().as_deref(), Some(grants_hash.as_str()));
     let decision = first.gate(
         "pi.tool.dispatching",
-        HookInvocationContext::project(first.scope_id(), "project-r1", project_root),
+        HookInvocationContext::project(first.scope_id(), "project-r1", project_root)
+            .with_grants_hash(grants_hash.clone()),
         payload(json!({"tool": "shell"}))?,
     )?;
     assert!(matches!(
@@ -818,6 +880,12 @@ fn global_hooks_run_before_project_hooks_and_scope_is_shared() -> TestResult {
         .map(|event| event.hook_id.clone())
         .collect::<Vec<_>>();
     assert_eq!(hook_ids, ["global", "project"]);
+    assert!(
+        audits
+            .lock()
+            .iter()
+            .all(|event| event.grants_hash.as_deref() == Some(grants_hash.as_str()))
+    );
     Ok(())
 }
 

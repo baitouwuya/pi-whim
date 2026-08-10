@@ -142,6 +142,24 @@ fn project_hook_rows(state: &AppState, tokens: Tokens, emit: Emit) -> Vec<AnyEle
             div().into_any_element(),
         )
     }));
+    rows.extend(state.hook_health.iter().map(|health| {
+        let scope = short_hash(&health.scope_id);
+        let diagnostic = health
+            .last_error
+            .as_deref()
+            .map(|error| format!(" / {}", compact_display(error, 80)))
+            .unwrap_or_default();
+        let details = format!(
+            "{} / scope={} / {:?} / restart={} / drop={}{}",
+            health.event, scope, health.status, health.restart_count, health.drop_count, diagnostic
+        );
+        form::row(
+            compact_display(&health.hook_id, 28),
+            Some(&details),
+            tokens,
+            div().into_any_element(),
+        )
+    }));
     rows.extend(state.hook_audit.iter().take(5).map(|entry| {
         let revision = entry.revision.get(..19).unwrap_or(&entry.revision);
         let truncation = if entry.output_truncated {
@@ -149,9 +167,25 @@ fn project_hook_rows(state: &AppState, tokens: Tokens, emit: Emit) -> Vec<AnyEle
         } else {
             ""
         };
+        let kind = entry.kind.as_deref().unwrap_or("-");
+        let scope = entry.scope_id.as_deref().map(short_hash).unwrap_or("-");
+        let grants = entry
+            .grants_hash
+            .as_deref()
+            .map(short_hash)
+            .unwrap_or("-");
+        let dropped = if entry.dropped { " / dropped" } else { "" };
         let details = format!(
-            "{} / {} / {} ms{truncation} / {revision}",
-            entry.event, entry.outcome, entry.duration_ms
+            "{} / {} / kind={} / scope={} / grants={} / restart={} / drop={}{} / {} ms{truncation} / {revision}",
+            entry.event,
+            entry.outcome,
+            kind,
+            scope,
+            grants,
+            entry.restart_count,
+            entry.drop_count,
+            dropped,
+            entry.duration_ms
         );
         form::row(
             compact_display(&entry.hook_id, 28),
@@ -260,6 +294,10 @@ fn grant_details(grant: &pi_whim_core::HookGrantDescriptor) -> String {
             .get(..12)
             .unwrap_or(&grant.entrypoint_sha256)
     )
+}
+
+fn short_hash(value: &str) -> &str {
+    value.get(..12).unwrap_or(value)
 }
 
 fn compact_display(value: &str, maximum_chars: usize) -> String {

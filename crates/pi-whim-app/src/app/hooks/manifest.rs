@@ -36,15 +36,17 @@ pub(crate) fn empty_manifest(revision: &str) -> PreparedHookManifest {
         revision: revision.to_owned(),
         ..HookConfig::default()
     };
+    let grants_hash = sha256_hex(b"[]");
     PreparedHookManifest {
         approved: ApprovedHookManifest {
             manifest,
             revision: revision.to_owned(),
             entrypoint_fingerprints: BTreeMap::new(),
+            grants_hash: Some(grants_hash.clone()),
         },
         legacy,
         fingerprint: sha256_hex(br#"{"version":1,"hooks":[]}"#),
-        grants_hash: sha256_hex(b"[]"),
+        grants_hash,
         grants: Vec::new(),
     }
 }
@@ -152,6 +154,7 @@ pub(crate) fn prepare_manifest(
         HookConfig::default()
     };
     let approved = ApprovedHookManifest::new(manifest, revision, entrypoint_fingerprints)
+        .and_then(|approved| approved.with_grants_hash(grants_hash.clone()))
         .map_err(|error| error.to_string())?;
     Ok(PreparedHookManifest {
         approved,

@@ -5,10 +5,11 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
+use pi_whim_core::{HookHealthStatus as CoreHookHealthStatus, HookHealthSummary};
 use pi_whim_hook_host::{
-    EventRegistry, HookAuditEvent, HookAuditOutcome, HookHostHealth, HookHostManager,
-    HookInvocationContext, HookScopeKey,
+    EventRegistry, HookAuditEvent, HookAuditOutcome, HookHealthStatus as HostHookHealthStatus,
+    HookHostHealth, HookHostManager, HookInvocationContext, HookScopeKey,
 };
 use pi_whim_persistence::hook_manifest_fingerprint;
 use pi_whim_runtime::RuntimeHookScope;
@@ -89,6 +90,12 @@ pub(super) struct AppHookAudit {
     pub(super) outcome: String,
     pub(super) duration_ms: u64,
     pub(super) revision: String,
+    pub(super) scope_id: String,
+    pub(super) kind: String,
+    pub(super) dropped: bool,
+    pub(super) restart_count: u32,
+    pub(super) drop_count: u64,
+    pub(super) grants_hash: Option<String>,
 }
 
 struct ManagerOwner {
@@ -109,6 +116,8 @@ pub(super) struct ApplicationHookHost {
     latest_scopes: HashMap<String, RuntimeHookScope>,
     audit_sender: Sender<HookAuditEvent>,
     audit_receiver: Receiver<HookAuditEvent>,
+    health_sender: Sender<()>,
+    health_receiver: Receiver<()>,
     pending_unmapped_audits: VecDeque<HookAuditEvent>,
     pending_mapped_audits: VecDeque<AppHookAudit>,
 }
@@ -127,12 +136,15 @@ impl std::fmt::Debug for ApplicationHookHost {
 impl Default for ApplicationHookHost {
     fn default() -> Self {
         let (audit_sender, audit_receiver) = unbounded();
+        let (health_sender, health_receiver) = bounded(1);
         Self {
             owners: HashMap::new(),
             scope_projects: HashMap::new(),
             latest_scopes: HashMap::new(),
             audit_sender,
             audit_receiver,
+            health_sender,
+            health_receiver,
             pending_unmapped_audits: VecDeque::new(),
             pending_mapped_audits: VecDeque::new(),
         }
@@ -165,9 +177,11 @@ impl ApplicationHookHost {
             });
             let latest_health = Arc::new(Mutex::new(Vec::new()));
             let health_sink = latest_health.clone();
+            let health_sender = self.health_sender.clone();
             let health_subscription = manager.health_signal().subscribe_fn(move |snapshot| {
                 if let Ok(mut latest) = health_sink.lock() {
                     *latest = snapshot;
+                    let _ = health_sender.try_send(());
                 }
             });
             self.owners.insert(
@@ -209,7 +223,11 @@ impl ApplicationHookHost {
     pub(super) fn revoke_project(&mut self, project_path: &Path) {
         let project_key = project_path.to_string_lossy();
         if let Some(runtime_scope) = self.latest_scopes.remove(project_key.as_ref()) {
-            runtime_scope.scope().revoke();
+            let key = runtime_scope.key();
+            let scope = runtime_scope.scope();
+            if !runtime_scope.manager().revoke_scope(&key) || !scope.is_revoked() {
+                scope.revoke();
+            }
         }
     }
 
@@ -221,6 +239,10 @@ impl ApplicationHookHost {
         let project_root = key.project_root?.to_string_lossy().into_owned();
         let context =
             HookInvocationContext::project(scope.scope_id(), key.manifest_revision, project_root);
+        let context = match scope.grants_hash() {
+            Some(grants_hash) => context.with_grants_hash(grants_hash),
+            None => context,
+        };
         Some(CommandHookController::new(
             scope,
             context,
@@ -256,6 +278,12 @@ impl ApplicationHookHost {
                 outcome: audit_outcome_name(event.outcome).to_owned(),
                 duration_ms: event.duration_ms,
                 revision: event.revision,
+                scope_id: event.scope_id,
+                kind: event.kind,
+                dropped: event.dropped,
+                restart_count: event.restart_count,
+                drop_count: event.drop_count,
+                grants_hash: event.grants_hash,
             });
         }
         self.pending_unmapped_audits = unmapped;
@@ -268,15 +296,44 @@ impl ApplicationHookHost {
         }
     }
 
-    /// Retained for the forthcoming UI health surface. Reading snapshots does
-    /// not create another subscription.
-    #[allow(dead_code)]
-    pub(super) fn health_snapshot(&self) -> Vec<HookHostHealth> {
-        self.owners
+    pub(super) fn health_updates(&self) -> Receiver<()> {
+        self.health_receiver.clone()
+    }
+
+    /// Aggregates manager-owned replay snapshots without creating subscriptions.
+    pub(super) fn health_snapshot(&self) -> Vec<HookHealthSummary> {
+        let mut snapshot = self
+            .owners
             .values()
             .filter_map(|owner| owner.latest_health.lock().ok())
             .flat_map(|snapshot| snapshot.clone())
-            .collect()
+            .map(map_health)
+            .collect::<Vec<_>>();
+        snapshot.sort_by(|left, right| {
+            left.scope_id
+                .cmp(&right.scope_id)
+                .then_with(|| left.hook_id.cmp(&right.hook_id))
+                .then_with(|| left.event.cmp(&right.event))
+        });
+        snapshot
+    }
+}
+
+fn map_health(health: HookHostHealth) -> HookHealthSummary {
+    HookHealthSummary {
+        hook_id: health.hook_id,
+        scope_id: health.scope_id,
+        event: health.event,
+        status: match health.status {
+            HostHookHealthStatus::Starting => CoreHookHealthStatus::Starting,
+            HostHookHealthStatus::Ready => CoreHookHealthStatus::Ready,
+            HostHookHealthStatus::Unhealthy => CoreHookHealthStatus::Unhealthy,
+            HostHookHealthStatus::Stopped => CoreHookHealthStatus::Stopped,
+        },
+        revision: health.revision,
+        restart_count: health.restart_count,
+        drop_count: health.drop_count,
+        last_error: health.last_error,
     }
 }
 
@@ -318,6 +375,7 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     fn script(directory: &TempDir, name: &str, decision: &str) -> Result<String, String> {
@@ -391,15 +449,17 @@ mod tests {
             .ok_or_else(|| "scope lost project root".to_owned())?
             .to_string_lossy()
             .into_owned();
+        let context =
+            HookInvocationContext::project(scope.scope_id(), key.manifest_revision, project_root);
+        let context = match scope.scope().grants_hash() {
+            Some(grants_hash) => context.with_grants_hash(grants_hash),
+            None => context,
+        };
         scope
             .scope()
             .gate(
                 "pi.tool.dispatching",
-                HookInvocationContext::project(
-                    scope.scope_id(),
-                    key.manifest_revision,
-                    project_root,
-                ),
+                context,
                 HookPayload::from_value(json!({"tool": "shell", "arguments": {}}))
                     .map_err(|error| error.to_string())?,
             )
@@ -479,6 +539,12 @@ mod tests {
 
         assert!(retained.is_revoked());
         assert!(host.controller(directory.path()).is_none());
+
+        let replacement = host
+            .resolve_scope(directory.path(), &global, Some(&project))?
+            .ok_or_else(|| "expected replacement scope".to_owned())?;
+        assert!(!replacement.scope().is_revoked());
+        assert!(host.controller(directory.path()).is_some());
         Ok(())
     }
 
@@ -574,6 +640,68 @@ mod tests {
         assert_eq!(audits[0].hook_id, "project");
         assert_eq!(audits[0].project_path, directory.path().to_string_lossy());
         Ok(())
+    }
+
+    #[test]
+    fn health_wake_replays_ready_and_stopped_without_duplicate_subscription() -> Result<(), String>
+    {
+        let _guard = hook_test_lock()?;
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let mut host = ApplicationHookHost::default();
+        let receiver = host.health_updates();
+        let global = empty_global();
+        let project = gate_manifest(
+            "project",
+            script(&directory, "allow.sh", "allow")?,
+            "project-r1",
+            true,
+        )?;
+        let first = host
+            .resolve_scope(directory.path(), &global, Some(&project))?
+            .ok_or_else(|| "expected scope".to_owned())?;
+        receiver
+            .recv_timeout(Duration::from_secs(1))
+            .map_err(|error| error.to_string())?;
+        assert_eq!(host.health_snapshot().len(), 1);
+        assert_eq!(
+            host.health_snapshot()[0].status,
+            CoreHookHealthStatus::Ready
+        );
+        while receiver.try_recv().is_ok() {}
+
+        let second = host
+            .resolve_scope(directory.path(), &global, Some(&project))?
+            .ok_or_else(|| "expected reused scope".to_owned())?;
+        assert_eq!(first.scope_id(), second.scope_id());
+        assert!(receiver.try_recv().is_err());
+
+        host.revoke_project(directory.path());
+        receiver
+            .recv_timeout(Duration::from_secs(1))
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            host.health_snapshot()[0].status,
+            CoreHookHealthStatus::Stopped
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn health_mapping_preserves_unhealthy_restart_drop_and_diagnostic() {
+        let mapped = map_health(HookHostHealth {
+            hook_id: "resident".into(),
+            scope_id: "scope".into(),
+            event: "pi.ui.command.submitting".into(),
+            status: HostHookHealthStatus::Unhealthy,
+            revision: "revision".into(),
+            restart_count: 3,
+            drop_count: 4,
+            last_error: Some("bounded diagnostic".into()),
+        });
+        assert_eq!(mapped.status, CoreHookHealthStatus::Unhealthy);
+        assert_eq!(mapped.restart_count, 3);
+        assert_eq!(mapped.drop_count, 4);
+        assert_eq!(mapped.last_error.as_deref(), Some("bounded diagnostic"));
     }
 
     #[test]

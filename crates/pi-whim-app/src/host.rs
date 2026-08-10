@@ -293,6 +293,14 @@ impl<R: AgentRuntime + 'static> Host<R> {
                 }
             }),
             pump::spawn(
+                application.hook_health_updates(),
+                window,
+                cx,
+                |host, _, _window, _cx| {
+                    host.application.refresh_hook_health();
+                },
+            ),
+            pump::spawn(
                 application.session_events(),
                 window,
                 cx,

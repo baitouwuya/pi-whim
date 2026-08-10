@@ -116,6 +116,12 @@ pub struct HookAuditEntry {
     pub output_truncated: bool,
     pub revision: String,
     pub created_at_ms: i64,
+    pub scope_id: Option<String>,
+    pub kind: Option<String>,
+    pub dropped: bool,
+    pub restart_count: u32,
+    pub drop_count: u64,
+    pub grants_hash: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -313,7 +319,13 @@ impl SqliteStore {
                 duration_ms INTEGER NOT NULL,
                 output_truncated INTEGER NOT NULL DEFAULT 0,
                 revision TEXT NOT NULL,
-                created_at_ms INTEGER NOT NULL
+                created_at_ms INTEGER NOT NULL,
+                scope_id TEXT,
+                kind TEXT,
+                dropped INTEGER NOT NULL DEFAULT 0,
+                restart_count INTEGER NOT NULL DEFAULT 0,
+                drop_count INTEGER NOT NULL DEFAULT 0,
+                grants_hash TEXT
             );
             CREATE INDEX IF NOT EXISTS hook_audit_project_created_idx
                 ON hook_audit (project_path, created_at_ms DESC);
@@ -420,11 +432,37 @@ impl SqliteStore {
             .prepare("PRAGMA table_info(hook_audit)")?
             .query_map([], |row| row.get::<_, String>(1))?
             .collect::<Result<Vec<_>, _>>()?;
-        if !columns.iter().any(|column| column == "output_truncated") {
-            self.connection.execute(
+        let additions = [
+            (
+                "output_truncated",
                 "ALTER TABLE hook_audit ADD COLUMN output_truncated INTEGER NOT NULL DEFAULT 0",
-                [],
-            )?;
+            ),
+            (
+                "scope_id",
+                "ALTER TABLE hook_audit ADD COLUMN scope_id TEXT",
+            ),
+            ("kind", "ALTER TABLE hook_audit ADD COLUMN kind TEXT"),
+            (
+                "dropped",
+                "ALTER TABLE hook_audit ADD COLUMN dropped INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "restart_count",
+                "ALTER TABLE hook_audit ADD COLUMN restart_count INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "drop_count",
+                "ALTER TABLE hook_audit ADD COLUMN drop_count INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "grants_hash",
+                "ALTER TABLE hook_audit ADD COLUMN grants_hash TEXT",
+            ),
+        ];
+        for (column, statement) in additions {
+            if !columns.iter().any(|existing| existing == column) {
+                self.connection.execute(statement, [])?;
+            }
         }
         Ok(())
     }
@@ -893,8 +931,9 @@ impl HookRepository for SqliteStore {
     fn append_hook_audit(&self, entry: &HookAuditEntry) -> Result<(), PersistenceError> {
         self.connection.execute(
             "INSERT INTO hook_audit
-             (project_path, hook_id, event, outcome, duration_ms, output_truncated, revision, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             (project_path, hook_id, event, outcome, duration_ms, output_truncated, revision, created_at_ms,
+              scope_id, kind, dropped, restart_count, drop_count, grants_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 entry.project_path,
                 entry.hook_id,
@@ -904,6 +943,12 @@ impl HookRepository for SqliteStore {
                 entry.output_truncated,
                 entry.revision,
                 entry.created_at_ms,
+                entry.scope_id,
+                entry.kind,
+                entry.dropped,
+                entry.restart_count,
+                entry.drop_count,
+                entry.grants_hash,
             ],
         )?;
         self.connection.execute(
@@ -922,7 +967,8 @@ impl HookRepository for SqliteStore {
         limit: usize,
     ) -> Result<Vec<HookAuditEntry>, PersistenceError> {
         let mut statement = self.connection.prepare(
-            "SELECT project_path, hook_id, event, outcome, duration_ms, output_truncated, revision, created_at_ms
+            "SELECT project_path, hook_id, event, outcome, duration_ms, output_truncated, revision, created_at_ms,
+                    scope_id, kind, dropped, restart_count, drop_count, grants_hash
              FROM hook_audit WHERE project_path = ?1 ORDER BY created_at_ms DESC, id DESC LIMIT ?2",
         )?;
         Ok(statement
@@ -936,6 +982,12 @@ impl HookRepository for SqliteStore {
                     output_truncated: row.get(5)?,
                     revision: row.get(6)?,
                     created_at_ms: row.get(7)?,
+                    scope_id: row.get(8)?,
+                    kind: row.get(9)?,
+                    dropped: row.get(10)?,
+                    restart_count: row.get(11)?,
+                    drop_count: row.get(12)?,
+                    grants_hash: row.get(13)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?)
@@ -1665,6 +1717,36 @@ mod tests {
     }
 
     #[test]
+    fn legacy_hook_audit_rows_migrate_with_safe_metadata_defaults() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("legacy.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE hook_audit (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_path TEXT NOT NULL, hook_id TEXT NOT NULL, event TEXT NOT NULL,
+                    outcome TEXT NOT NULL, duration_ms INTEGER NOT NULL,
+                    revision TEXT NOT NULL, created_at_ms INTEGER NOT NULL
+                 );
+                 INSERT INTO hook_audit
+                 (project_path, hook_id, event, outcome, duration_ms, revision, created_at_ms)
+                 VALUES ('/legacy', 'policy', 'tool_dispatching', 'allowed', 2, 'r1', 7);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = SqliteStore::open(path).unwrap();
+        let entry = store.recent_hook_audit("/legacy", 1).unwrap().remove(0);
+        assert_eq!(entry.scope_id, None);
+        assert_eq!(entry.kind, None);
+        assert!(!entry.dropped);
+        assert_eq!(entry.restart_count, 0);
+        assert_eq!(entry.drop_count, 0);
+        assert_eq!(entry.grants_hash, None);
+    }
+
+    #[test]
     fn hook_audit_is_bounded_and_contains_no_payload_column() {
         let directory = tempdir().unwrap();
         let store = SqliteStore::open(directory.path().join("test.sqlite")).unwrap();
@@ -1679,12 +1761,23 @@ mod tests {
                     output_truncated: false,
                     revision: "sha256:test".into(),
                     created_at_ms,
+                    scope_id: Some("scope".into()),
+                    kind: Some("gate".into()),
+                    dropped: false,
+                    restart_count: 1,
+                    drop_count: 2,
+                    grants_hash: Some("grant".into()),
                 })
                 .unwrap();
         }
         let entries = store.recent_hook_audit("/project", 2).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].created_at_ms, 3);
+        assert_eq!(entries[0].scope_id.as_deref(), Some("scope"));
+        assert_eq!(entries[0].kind.as_deref(), Some("gate"));
+        assert_eq!(entries[0].restart_count, 1);
+        assert_eq!(entries[0].drop_count, 2);
+        assert_eq!(entries[0].grants_hash.as_deref(), Some("grant"));
         let columns = store
             .connection
             .prepare("PRAGMA table_info(hook_audit)")
@@ -1693,6 +1786,8 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert!(!columns.iter().any(|column| column == "payload"));
+        for forbidden in ["payload", "raw_output", "secret", "message", "command_args"] {
+            assert!(!columns.iter().any(|column| column == forbidden));
+        }
     }
 }

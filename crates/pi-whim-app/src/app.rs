@@ -293,6 +293,19 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         self.signals.command_lifecycle()
     }
 
+    /// Subscribe to coalesced wakeups for replayable shared Hook health.
+    pub(crate) fn hook_health_updates(&self) -> crossbeam_channel::Receiver<()> {
+        self.hook_host.health_updates()
+    }
+
+    /// Refresh Hook health state after a manager-owned replay snapshot changes.
+    pub(crate) fn refresh_hook_health(&mut self) {
+        let snapshot = self.hook_host.health_snapshot();
+        if self.state().hook_health != snapshot {
+            self.apply(Action::SetHookHealth(snapshot));
+        }
+    }
+
     /// Subscribe to reliable, ordered framework-owned effects.
     pub(crate) fn application_effects(&self) -> Signal<signals::ApplicationEffect> {
         self.signals.application_effects()
@@ -1560,6 +1573,12 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 output_truncated: entry.output_truncated,
                 revision: entry.revision,
                 created_at_ms: entry.created_at_ms,
+                scope_id: entry.scope_id,
+                kind: entry.kind,
+                dropped: entry.dropped,
+                restart_count: entry.restart_count,
+                drop_count: entry.drop_count,
+                grants_hash: entry.grants_hash,
             })
             .collect();
         self.apply(Action::SetHookAudit(entries));
@@ -2915,6 +2934,12 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 output_truncated: false,
                 revision: audit.revision.clone(),
                 created_at_ms: now_ms(),
+                scope_id: Some(audit.scope_id.clone()),
+                kind: Some(audit.kind.clone()),
+                dropped: audit.dropped,
+                restart_count: audit.restart_count,
+                drop_count: audit.drop_count,
+                grants_hash: audit.grants_hash.clone(),
             };
             if let Err(error) = store.append_hook_audit(&entry) {
                 self.hook_host.requeue_audits(audits[index..].to_vec());
@@ -2955,6 +2980,12 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             output_truncated: record.output_truncated,
             revision: record.revision,
             created_at_ms: now_ms(),
+            scope_id: record.scope_id,
+            kind: record.kind,
+            dropped: record.dropped,
+            restart_count: record.restart_count,
+            drop_count: record.drop_count,
+            grants_hash: record.grants_hash,
         }) {
             self.emit_error(error.to_string());
         } else if self.state().selected_project == Some(project.id) {
@@ -3850,11 +3881,28 @@ done
                 duration_ms: 7,
                 output_truncated: false,
                 revision: "sha256:test".into(),
+                scope_id: Some("scope-test".into()),
+                kind: Some("gate".into()),
+                dropped: false,
+                restart_count: 1,
+                drop_count: 2,
+                grants_hash: Some("grant-test".into()),
             }),
         );
         assert_eq!(app.state().hook_audit.len(), 1);
         assert_eq!(app.state().hook_audit[0].hook_id, "policy");
         assert_eq!(app.state().hook_audit[0].outcome, "denied");
+        assert_eq!(
+            app.state().hook_audit[0].scope_id.as_deref(),
+            Some("scope-test")
+        );
+        assert_eq!(app.state().hook_audit[0].kind.as_deref(), Some("gate"));
+        assert_eq!(app.state().hook_audit[0].restart_count, 1);
+        assert_eq!(app.state().hook_audit[0].drop_count, 2);
+        assert_eq!(
+            app.state().hook_audit[0].grants_hash.as_deref(),
+            Some("grant-test")
+        );
     }
 
     fn project(name: &str, path: &Path) -> Project {
