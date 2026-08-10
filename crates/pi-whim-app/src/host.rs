@@ -30,7 +30,9 @@ use pi_whim_persistence::session_title_context_from_jsonl;
 use pi_whim_runtime::{AgentRuntime, test_search_engine};
 use pi_whim_signal::SignalEvent;
 
-use crate::app::{CommandHookController, CommandHookError, PiWhimApplication, Picker};
+use crate::app::{
+    ApplicationEffect, CommandHookController, CommandHookError, PiWhimApplication, Picker,
+};
 
 fn command_values<T>(events: Vec<SignalEvent<T, Infallible>>) -> impl Iterator<Item = T> {
     events.into_iter().filter_map(|event| match event {
@@ -42,6 +44,26 @@ fn command_values<T>(events: Vec<SignalEvent<T, Infallible>>) -> impl Iterator<I
 
 fn latest_state_value<T>(events: Vec<SignalEvent<T, Infallible>>) -> Option<T> {
     command_values(events).last()
+}
+
+enum HostApplicationEffect {
+    ReportNotice(pi_whim_engine::notice::Notice),
+    Ask(pi_whim_engine::dialogs::Prompt),
+    ForgetSession(String),
+    Attach(Attachment),
+    WriteClipboard(String),
+    OpenPicker(Picker),
+}
+
+fn route_application_effect(effect: ApplicationEffect) -> HostApplicationEffect {
+    match effect {
+        ApplicationEffect::Notice(notice) => HostApplicationEffect::ReportNotice(notice),
+        ApplicationEffect::Prompt(prompt) => HostApplicationEffect::Ask(prompt),
+        ApplicationEffect::SessionClosed(key) => HostApplicationEffect::ForgetSession(key),
+        ApplicationEffect::AttachmentReady(attachment) => HostApplicationEffect::Attach(attachment),
+        ApplicationEffect::ClipboardWrite(text) => HostApplicationEffect::WriteClipboard(text),
+        ApplicationEffect::OpenPicker(picker) => HostApplicationEffect::OpenPicker(picker),
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -178,6 +200,8 @@ pub struct Host<R: AgentRuntime + 'static> {
     #[allow(dead_code, reason = "held for signal subscription lifetime")]
     shell_command_bridge: SignalBridge<ShellCommand, Infallible>,
     #[allow(dead_code, reason = "held for signal subscription lifetime")]
+    application_effect_bridge: SignalBridge<ApplicationEffect, Infallible>,
+    #[allow(dead_code, reason = "held for signal subscription lifetime")]
     change_set_bridge: SignalBridge<ChangeSet, Infallible>,
     state_selections: WorkspaceStateSelections,
     #[allow(dead_code, reason = "held for state signal subscription lifetime")]
@@ -206,6 +230,7 @@ impl<R: AgentRuntime + 'static> Host<R> {
         // can be emitted between construction and Host ownership.
         let app_command_bridge = SignalBridge::new(&shell.read(cx).app_commands());
         let shell_command_bridge = SignalBridge::new(&shell.read(cx).shell_commands());
+        let application_effect_bridge = SignalBridge::new(&application.application_effects());
         let state_selections = WorkspaceStateSelections::new(application.state());
         let navigation_bridge = StateSignalBridge::new(&state_selections.navigation_signal())
             .expect("navigation state bridge worker must start");
@@ -219,23 +244,18 @@ impl<R: AgentRuntime + 'static> Host<R> {
 
         let pumps = vec![
             app_command_bridge.spawn(window, cx, |host, batch, window, cx| {
-                let mut handled = false;
                 for command in command_values(batch) {
-                    handled = true;
                     host.handle_app_command(command, window, cx);
-                }
-                if handled {
-                    host.flush_effects(window, cx);
                 }
             }),
             shell_command_bridge.spawn(window, cx, |host, batch, window, cx| {
-                let mut handled = false;
                 for command in command_values(batch) {
-                    handled = true;
                     host.handle_shell(command, window, cx);
                 }
-                if handled {
-                    host.flush_effects(window, cx);
+            }),
+            application_effect_bridge.spawn(window, cx, |host, batch, window, cx| {
+                for effect in command_values(batch) {
+                    host.handle_application_effect(effect, window, cx);
                 }
             }),
             change_set_bridge.spawn(window, cx, |host, batch, _window, _cx| {
@@ -276,41 +296,37 @@ impl<R: AgentRuntime + 'static> Host<R> {
                 application.session_events(),
                 window,
                 cx,
-                |host, batch, window, cx| {
+                |host, batch, _window, _cx| {
                     host.application.handle_deliveries(batch);
-                    host.flush_effects(window, cx);
                 },
             ),
             pump::spawn(
                 application.control_answers(),
                 window,
                 cx,
-                |host, batch, window, cx| {
+                |host, batch, _window, _cx| {
                     for (key, actions) in batch {
                         host.application.settle_controls(key, actions);
                     }
-                    host.flush_effects(window, cx);
                 },
             ),
             pump::spawn(
                 application.one_shot_installs(),
                 window,
                 cx,
-                |host, batch, window, cx| {
+                |host, batch, _window, _cx| {
                     for (generation, resolved) in batch {
                         host.application
                             .settle_one_shot_install(generation, resolved);
                     }
-                    host.flush_effects(window, cx);
                 },
             ),
             pump::spawn(
                 application.one_shot_completions(),
                 window,
                 cx,
-                |host, batch, window, cx| {
+                |host, batch, _window, _cx| {
                     host.application.settle_one_shot_completions(batch);
-                    host.flush_effects(window, cx);
                 },
             ),
             // Fires once, when the models.dev catalog lands. The egui build asked
@@ -320,19 +336,20 @@ impl<R: AgentRuntime + 'static> Host<R> {
                 application.catalog_refreshed(),
                 window,
                 cx,
-                |host, _, window, cx| {
+                |host, _, _window, _cx| {
                     host.application.absorb_capability_catalog();
-                    host.flush_effects(window, cx);
                 },
             ),
         ];
 
-        let mut host = Self {
+        application.activate_effect_delivery();
+        Self {
             application,
             shell,
             pumps,
             app_command_bridge,
             shell_command_bridge,
+            application_effect_bridge,
             change_set_bridge,
             state_selections,
             navigation_bridge,
@@ -341,50 +358,42 @@ impl<R: AgentRuntime + 'static> Host<R> {
             settings_bridge,
             command_controls: OrderedControlQueue::default(),
             lifecycle_observes: OrderedControlQueue::default(),
-        };
-        host.flush_effects(window, cx);
-        host
+        }
     }
 
-    /// Deliver framework-bound effect outboxes after orchestration work.
-    ///
-    /// Committed domain state travels independently through ChangeSet-driven
-    /// feature projections; this method intentionally transports no AppState.
-    fn flush_effects(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let notices = self.application.take_notices();
-        let prompts = self.application.take_prompts();
-        let closed = self.application.take_closed_sessions();
-        let attachments = self.application.take_attachments();
-        // The clipboard is the window's, not the app's, so `/copy` leaves the text
-        // in an outbox for this to write.
-        if let Some(text) = self.application.take_clipboard() {
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
+    /// Execute one typed framework effect delivered by the application signal.
+    fn handle_application_effect(
+        &mut self,
+        effect: ApplicationEffect,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match route_application_effect(effect) {
+            HostApplicationEffect::ReportNotice(notice) => {
+                self.shell.update(cx, |shell, cx| {
+                    if notice.is_error() {
+                        shell.report_error(notice.message, cx);
+                    } else {
+                        shell.report_info(notice.message, cx);
+                    }
+                });
+            }
+            HostApplicationEffect::Ask(prompt) => {
+                self.shell.update(cx, |shell, cx| shell.ask(prompt, cx));
+            }
+            HostApplicationEffect::ForgetSession(key) => {
+                self.shell
+                    .update(cx, |shell, cx| shell.forget_session(&key, cx));
+            }
+            HostApplicationEffect::Attach(attachment) => {
+                self.shell
+                    .update(cx, |shell, cx| shell.attach(attachment, cx));
+            }
+            HostApplicationEffect::WriteClipboard(text) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            HostApplicationEffect::OpenPicker(picker) => self.open_picker(picker, window, cx),
         }
-        // `/attach` and "add project" stage a picker for the same reason: it
-        // needs the window.
-        if let Some(picker) = self.application.take_picker() {
-            self.open_picker(picker, window, cx);
-        }
-        self.shell.update(cx, |shell, cx| {
-            for key in closed {
-                shell.forget_session(&key, cx);
-            }
-            for prompt in prompts {
-                shell.ask(prompt, cx);
-            }
-            // Staged rather than returned: a file picker's result cannot travel
-            // back through a request handler that returns nothing.
-            for attachment in attachments {
-                shell.attach(attachment, cx);
-            }
-            for notice in notices {
-                if notice.is_error() {
-                    shell.report_error(notice.message, cx);
-                } else {
-                    shell.report_info(notice.message, cx);
-                }
-            }
-        });
     }
 
     /// Carry out one typed domain command from the Workspace signal.
@@ -512,7 +521,6 @@ impl<R: AgentRuntime + 'static> Host<R> {
                 host.command_controls.finish_current();
                 host.finish_command_control(completion, lifecycle, prompt_draft, window, cx);
                 host.start_next_command_control(window, cx);
-                host.flush_effects(window, cx);
             });
         })
         .detach();
@@ -631,10 +639,9 @@ impl<R: AgentRuntime + 'static> Host<R> {
                             .flatten()
                         })
                         .await;
-                    let _ = host.update_in(cx, |host, window, cx| {
+                    let _ = host.update_in(cx, |host, _window, _cx| {
                         host.application
                             .start_smart_session_rename(project_id, path, title, context);
-                        host.flush_effects(window, cx);
                     });
                 })
                 .detach();
@@ -686,7 +693,7 @@ impl<R: AgentRuntime + 'static> Host<R> {
                                     async move { test_search_engine(&profile, api_key.as_deref()) },
                                 )
                                 .await;
-                            let _ = host.update_in(cx, |host, window, cx| {
+                            let _ = host.update_in(cx, |host, _window, cx| {
                                 host.application
                                     .report_search_engine_test(&profile_name, &result);
                                 host.shell.update(cx, |shell, cx| {
@@ -694,7 +701,6 @@ impl<R: AgentRuntime + 'static> Host<R> {
                                         profile_id, editor, result, cx,
                                     );
                                 });
-                                host.flush_effects(window, cx);
                             });
                         })
                         .detach();
@@ -761,9 +767,8 @@ impl<R: AgentRuntime + 'static> Host<R> {
             let Ok(Ok(Some(paths))) = paths.await else {
                 return;
             };
-            let _ = host.update_in(cx, |host, window, cx| {
+            let _ = host.update_in(cx, |host, _window, _cx| {
                 host.application.picked(picker, paths);
-                host.flush_effects(window, cx);
             });
         })
         .detach();
@@ -786,6 +791,53 @@ mod tests {
     use super::*;
     use pi_whim_core::{AttachmentKind, SubmitMode};
     use uuid::Uuid;
+
+    #[test]
+    fn application_effect_routes_are_exhaustive_and_typed() {
+        let prompt = pi_whim_engine::dialogs::Prompt::from_interaction(
+            "private-session",
+            &serde_json::json!({
+                "request_id": "private-request",
+                "kind": "question",
+                "title": "Private title",
+                "message": "Private message",
+            }),
+        )
+        .expect("the test prompt is valid");
+        let attachment = Attachment {
+            name: "private.txt".into(),
+            path: "/private/private.txt".into(),
+            kind: AttachmentKind::File,
+            generated_by_app: false,
+        };
+
+        assert!(matches!(
+            route_application_effect(ApplicationEffect::Notice(
+                pi_whim_engine::notice::Notice::info("ready")
+            )),
+            HostApplicationEffect::ReportNotice(_)
+        ));
+        assert!(matches!(
+            route_application_effect(ApplicationEffect::Prompt(prompt)),
+            HostApplicationEffect::Ask(_)
+        ));
+        assert!(matches!(
+            route_application_effect(ApplicationEffect::SessionClosed("private-session".into())),
+            HostApplicationEffect::ForgetSession(_)
+        ));
+        assert!(matches!(
+            route_application_effect(ApplicationEffect::AttachmentReady(attachment)),
+            HostApplicationEffect::Attach(_)
+        ));
+        assert!(matches!(
+            route_application_effect(ApplicationEffect::ClipboardWrite("private text".into())),
+            HostApplicationEffect::WriteClipboard(_)
+        ));
+        assert!(matches!(
+            route_application_effect(ApplicationEffect::OpenPicker(Picker::Project)),
+            HostApplicationEffect::OpenPicker(Picker::Project)
+        ));
+    }
 
     #[test]
     fn command_signal_values_preserve_fifo_and_ignore_completion() {

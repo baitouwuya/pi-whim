@@ -1,14 +1,14 @@
 //! Orchestration: the session pool, the store, the keychain, and Pi.
 //!
 //! Split from `main.rs` so the entry point is only the entry point. Nothing here
-//! knows which UI is mounted — the view is reached through `state()` / `apply()`
-//! and a queue of requests — which is what lets the host be swapped without
-//! touching any of it.
+//! knows which UI is mounted — typed command, state, and framework-effect signals
+//! are what let the host be swapped without touching the orchestration.
 
 mod hooks;
 mod signals;
 
 pub(crate) use hooks::{CommandHookController, CommandHookError};
+pub(crate) use signals::ApplicationEffect;
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -84,33 +84,6 @@ pub struct PiWhimApplication<R: AgentRuntime = PiRpcRuntime> {
     secrets: MacosKeychainStore,
     runtime_factory: Box<dyn Fn() -> R + Send>,
     sessions: SessionPool<R>,
-    /// Extension confirmations and supervisor interactions, in the order they
-    /// arrived. Each carries the session that asked, so a background agent can
-    /// prompt the user and still get its answer back.
-    ///
-    /// Only a staging area: the shell holds the queue that decides which one is
-    /// on screen, so these are handed over and none are kept.
-    prompts: Vec<dialogs::Prompt>,
-    /// Sessions that have stopped since the shell was last told.
-    ///
-    /// The questions belong to the shell's queue now, so forgetting them is
-    /// something it has to be asked to do rather than something done here.
-    closed: Vec<String>,
-    /// Attachments chosen in a file dialog, waiting for the composer.
-    ///
-    /// Staged rather than answered, because the dialog is opened from a slash
-    /// command whose request carries nothing back.
-    attached: Vec<Attachment>,
-    /// Text waiting to go on the clipboard.
-    ///
-    /// Written by the host, which is the only part of this that has a window.
-    clipboard: Option<String>,
-    /// A file picker to open, and what its answer is for.
-    ///
-    /// Staged for the same reason as the clipboard: the platform picker needs the
-    /// window. `Option` rather than a queue — two pickers at once is two modal
-    /// dialogs, and the second would have nothing to add.
-    picker: Option<Picker>,
     capability_resolver: ModelCapabilityResolver,
     sessions_root_override: Option<PathBuf>,
     agent_directory_override: Option<PathBuf>,
@@ -120,12 +93,6 @@ pub struct PiWhimApplication<R: AgentRuntime = PiRpcRuntime> {
     pending_hook_reloads: HashSet<ProjectId>,
     pending_hook_inputs: HashMap<ProjectId, VecDeque<PendingPrompt>>,
     attachment_store: AttachmentStore,
-    /// Messages bound for the user, oldest first.
-    ///
-    /// A queue rather than two `Option<String>` fields: orchestration fails in
-    /// bursts — a project that has moved, then a provider with no key — and the
-    /// second was overwriting the first before anyone had read it.
-    notices: notice::Outbox,
     /// Control-state refreshes in flight, tagged with the session they were
     /// asked about.
     #[allow(clippy::type_complexity)]
@@ -258,11 +225,6 @@ impl Default for PiWhimApplication<PiRpcRuntime> {
             secrets: MacosKeychainStore::default(),
             runtime_factory: Box::new(PiRpcRuntime::default),
             sessions: SessionPool::new(),
-            prompts: Vec::new(),
-            closed: Vec::new(),
-            attached: Vec::new(),
-            clipboard: None,
-            picker: None,
             capability_resolver,
             sessions_root_override: None,
             agent_directory_override: None,
@@ -272,7 +234,6 @@ impl Default for PiWhimApplication<PiRpcRuntime> {
             pending_hook_reloads: HashSet::new(),
             pending_hook_inputs: HashMap::new(),
             attachment_store: AttachmentStore::open_default(),
-            notices: notice::Outbox::new(),
             control_updates: crossbeam_channel::unbounded(),
             one_shot_ai: None,
             one_shot_generation: 0,
@@ -317,7 +278,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     /// Report one of the app's own strings as a failure.
     fn report(&mut self, key: &str) {
         let message = self.say(key);
-        self.notices.error(message);
+        self.emit_error(message);
     }
 
     /// Subscribe to committed domain changes without access to the emitter.
@@ -330,6 +291,32 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     #[allow(dead_code, reason = "reserved for the Host/GPUI signal bridge")]
     pub(crate) fn command_lifecycle(&self) -> Signal<CommandLifecycle> {
         self.signals.command_lifecycle()
+    }
+
+    /// Subscribe to reliable, ordered framework-owned effects.
+    pub(crate) fn application_effects(&self) -> Signal<signals::ApplicationEffect> {
+        self.signals.application_effects()
+    }
+
+    /// Flush bounded startup effects after the Host has subscribed.
+    pub(crate) fn activate_effect_delivery(&self) {
+        self.signals.activate_effect_delivery();
+    }
+
+    fn emit_effect(&self, effect: signals::ApplicationEffect) {
+        self.signals.emit_effect(effect);
+    }
+
+    fn emit_error(&self, message: impl Into<String>) {
+        self.emit_effect(signals::ApplicationEffect::Notice(notice::Notice::error(
+            message,
+        )));
+    }
+
+    fn emit_info(&self, message: impl Into<String>) {
+        self.emit_effect(signals::ApplicationEffect::Notice(notice::Notice::info(
+            message,
+        )));
     }
 
     /// Wrap a UI command in authenticated metadata without exporting a session path.
@@ -354,7 +341,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
 
     /// Surface a bounded, metadata-only command diagnostic.
     pub(crate) fn report_command_diagnostic(&mut self, diagnostic: &CommandDiagnostic) {
-        self.notices.error(diagnostic.as_str().to_owned());
+        self.emit_error(diagnostic.as_str().to_owned());
     }
 
     /// Emit the local typed lifecycle stage and return its external observer.
@@ -423,7 +410,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
 
     fn report_commit_error(&mut self, error: CommitError) {
         let diagnostic = CommandDiagnostic::new(format!("state commit failed: {error}"));
-        self.notices.error(diagnostic.as_str().to_owned());
+        self.emit_error(diagnostic.as_str().to_owned());
     }
 
     /// The merged stream of every pooled session's events.
@@ -449,32 +436,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         self.one_shot_completions.1.clone()
     }
 
-    /// Messages bound for the user, taken off the queue.
-    pub(crate) fn take_notices(&mut self) -> Vec<notice::Notice> {
-        self.notices.drain()
-    }
-
-    /// Questions an agent is blocked on, handed to whoever will ask them.
-    pub(crate) fn take_prompts(&mut self) -> Vec<dialogs::Prompt> {
-        std::mem::take(&mut self.prompts)
-    }
-
-    /// Sessions that have stopped, so their questions can be dropped.
-    pub(crate) fn take_closed_sessions(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.closed)
-    }
-
-    /// Text a command produced for the clipboard.
-    pub(crate) fn take_clipboard(&mut self) -> Option<String> {
-        self.clipboard.take()
-    }
-
-    /// A file picker the host should open on this side's behalf.
-    pub(crate) fn take_picker(&mut self) -> Option<Picker> {
-        self.picker.take()
-    }
-
-    /// Act on what a picker returned.
+    /// Apply the paths returned by a framework-owned picker.
     pub(crate) fn picked(&mut self, picker: Picker, paths: Vec<PathBuf>) {
         match picker {
             Picker::Attachments => self.attach_paths(paths),
@@ -525,7 +487,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 if let Some(store) = self.store.as_ref()
                     && let Err(error) = store.delete_project(project_id)
                 {
-                    self.notices.error(error.to_string());
+                    self.emit_error(error.to_string());
                 }
                 self.reload_projects();
             }
@@ -547,20 +509,20 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 // Only the generated ones reach here — the composer decides that
                 // — so this deletes the file it wrote without asking again.
                 if let Err(error) = self.attachment_store.remove_generated(&path) {
-                    self.notices.error(error);
+                    self.emit_error(error);
                 }
             }
             AppCommand::SetAutoCompaction(enabled) => self.set_auto_compaction(enabled),
             AppCommand::Stop => {
                 if let Err(error) = self.active_command(json!({"type":"abort"})) {
-                    self.notices.error(error);
+                    self.emit_error(error);
                 }
             }
             AppCommand::ClearQueue => {
                 // Pi answers with the queue it dropped and a `queue_update`
                 // event, which is what refreshes the snapshot.
                 if let Err(error) = self.active_command(json!({"type":"clear_queue"})) {
-                    self.notices.error(error);
+                    self.emit_error(error);
                 }
             }
             AppCommand::SetLanguage(language) => {
@@ -639,13 +601,12 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         }) {
             Ok(fingerprint) => fingerprint,
             Err(error) => {
-                self.notices.error(error.to_string());
+                self.emit_error(error.to_string());
                 return;
             }
         };
         if fingerprint != expected_fingerprint {
-            self.notices
-                .error("project hook manifest changed before approval");
+            self.emit_error("project hook manifest changed before approval");
             self.restart_selected_project();
             return;
         }
@@ -653,7 +614,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             return;
         };
         if let Err(error) = store.approve_project_hooks(&project.path, &fingerprint, now_ms()) {
-            self.notices.error(error.to_string());
+            self.emit_error(error.to_string());
             return;
         }
         let _ = self.load_hooks(&project.path);
@@ -671,7 +632,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         if let Some(store) = self.store.as_ref()
             && let Err(error) = store.revoke_project_hooks(&project.path)
         {
-            self.notices.error(error.to_string());
+            self.emit_error(error.to_string());
             return;
         }
         let _ = self.load_hooks(&project.path);
@@ -693,7 +654,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 if self.state().selected_project.is_some() {
                     // Staged for the host: the picker needs the window, and the
                     // project check belongs here with the notice it produces.
-                    self.picker = Some(Picker::Attachments);
+                    self.emit_effect(signals::ApplicationEffect::OpenPicker(Picker::Attachments));
                 } else {
                     self.report("notice-select-project-attachments");
                 }
@@ -703,7 +664,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             SlashCommand::Compact => self.compact_session(),
             SlashCommand::Stop => {
                 if let Err(error) = self.active_command(json!({"type":"abort"})) {
-                    self.notices.error(error);
+                    self.emit_error(error);
                 }
             }
             SlashCommand::Clone => self.clone_session(),
@@ -719,7 +680,9 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                         && !message.streaming
                         && !message.full_text.trim().is_empty()
                 }) {
-                    self.clipboard = Some(message.full_text.clone());
+                    self.emit_effect(signals::ApplicationEffect::ClipboardWrite(
+                        message.full_text.clone(),
+                    ));
                 }
             }
             SlashCommand::ShowSessionInfo => {
@@ -782,7 +745,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         if let Some(store) = self.store.as_ref()
             && let Err(error) = store.save_project(&project)
         {
-            self.notices.error(error.to_string());
+            self.emit_error(error.to_string());
         }
         self.reload_projects();
     }
@@ -794,7 +757,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         let projects = match store.list_projects() {
             Ok(projects) => projects,
             Err(error) => {
-                self.notices.error(error.to_string());
+                self.emit_error(error.to_string());
                 return;
             }
         };
@@ -831,7 +794,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         if let Some(store) = self.store.as_ref()
             && let Err(error) = store.save_preferences(preferences)
         {
-            self.notices.error(error.to_string());
+            self.emit_error(error.to_string());
         }
     }
 
@@ -900,7 +863,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 self.refresh_provider_key_status(ids);
                 self.rebuild_one_shot_ai();
             }
-            Err(error) => self.notices.error(error.to_string()),
+            Err(error) => self.emit_error(error.to_string()),
         }
     }
 
@@ -1011,7 +974,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 self.apply(Action::SearchEngineProfilesLoaded(profiles));
                 self.refresh_search_engine_key_status(ids);
             }
-            Err(error) => self.notices.error(error.to_string()),
+            Err(error) => self.emit_error(error.to_string()),
         }
     }
 
@@ -1039,7 +1002,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 && provider_name_key(&existing.name) == provider_name_key(&profile.name)
         }) {
             let message = self.say("duplicate-provider-name");
-            self.notices.error(message);
+            self.emit_error(message);
             return None;
         }
         profile.base_url = normalize_base_url(&profile.base_url);
@@ -1050,7 +1013,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 .secrets
                 .set(&provider_keychain_account(profile.id), &api_key)
             {
-                self.notices.error(error.to_string());
+                self.emit_error(error.to_string());
                 return None;
             }
             profile.has_api_key = self
@@ -1080,7 +1043,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         if let Some(store) = self.store.as_ref()
             && let Err(error) = store.save_provider_profile(&profile)
         {
-            self.notices.error(error.to_string());
+            self.emit_error(error.to_string());
             return None;
         }
         self.reload_provider_profiles();
@@ -1093,11 +1056,11 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         if let Some(store) = self.store.as_ref()
             && let Err(error) = store.delete_provider_profile(profile_id)
         {
-            self.notices.error(error.to_string());
+            self.emit_error(error.to_string());
             return;
         }
         if let Err(error) = self.secrets.delete(&provider_keychain_account(profile_id)) {
-            self.notices.error(error.to_string());
+            self.emit_error(error.to_string());
         }
         self.reload_provider_profiles();
         self.restart_selected_project();
@@ -1108,7 +1071,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             profile.name.trim().is_empty() || !valid_search_engine_url(&profile.base_url)
         }) {
             let message = format!("{}: {}", invalid.name, self.say("search-engine-incomplete"));
-            self.notices.error(message);
+            self.emit_error(message);
             return false;
         }
         let profiles = profiles
@@ -1135,12 +1098,12 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         if let Some(store) = self.store.as_ref()
             && let Err(error) = store.save_search_engine_profiles(&profiles)
         {
-            self.notices.error(error.to_string());
+            self.emit_error(error.to_string());
             return false;
         }
         for id in stale_key_ids {
             if let Err(error) = self.secrets.delete(&search_engine_keychain_account(id)) {
-                self.notices.error(error.to_string());
+                self.emit_error(error.to_string());
             }
         }
         self.reload_search_engine_profiles();
@@ -1166,7 +1129,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             if let Some(api_key) = api_key
                 && let Err(error) = self.secrets.set(&account, &api_key)
             {
-                self.notices.error(error.to_string());
+                self.emit_error(error.to_string());
                 return false;
             }
             match self.secrets.get(&account) {
@@ -1176,7 +1139,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                     return false;
                 }
                 Err(error) => {
-                    self.notices.error(error.to_string());
+                    self.emit_error(error.to_string());
                     return false;
                 }
             }
@@ -1231,7 +1194,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         match result {
             Ok(()) => {
                 let message = format!("{} {}", profile_name, self.say("notice-search-engine-ok"));
-                self.notices.info(message);
+                self.emit_info(message);
             }
             Err(error) => {
                 let message = format!(
@@ -1239,7 +1202,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                     profile_name,
                     self.say("notice-test-failed")
                 );
-                self.notices.error(message);
+                self.emit_error(message);
             }
         }
     }
@@ -1276,7 +1239,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 None
             }
             Err(error) => {
-                self.notices.error(error);
+                self.emit_error(error);
                 None
             }
         }
@@ -1358,12 +1321,12 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         {
             Ok(root) => root.join(project.id.to_string()),
             Err(error) => {
-                self.notices.error(error.to_string());
+                self.emit_error(error.to_string());
                 return None;
             }
         };
         if let Err(error) = fs::create_dir_all(&sessions_path) {
-            self.notices.error(error.to_string());
+            self.emit_error(error.to_string());
             return None;
         }
         // Capabilities come from the catalog, which the app owns, so profiles
@@ -1385,7 +1348,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         ) {
             Ok(environment) => environment,
             Err(error) => {
-                self.notices.error(error);
+                self.emit_error(error);
                 return None;
             }
         };
@@ -1401,7 +1364,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                         error.to_string(),
                     )));
                 }
-                self.notices.error(error.to_string());
+                self.emit_error(error.to_string());
                 return None;
             }
         }
@@ -1422,7 +1385,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             }) {
                 Ok(api_keys) => api_keys,
                 Err(error) => {
-                    self.notices.error(error);
+                    self.emit_error(error);
                     return None;
                 }
             };
@@ -1438,7 +1401,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         ) {
             Ok(scope) => scope,
             Err(error) => {
-                self.notices.error(format!(
+                self.emit_error(format!(
                     "failed to create shared hook scope; using legacy hook runtime: {error}"
                 ));
                 None
@@ -1461,7 +1424,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                     error.to_string(),
                 )));
             }
-            self.notices.error(error.to_string());
+            self.emit_error(error.to_string());
             return None;
         }
         let events = runtime.events();
@@ -1500,7 +1463,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 self.apply(Action::SetProjectHookStatus(ProjectHookStatus::Invalid(
                     message.clone(),
                 )));
-                self.notices.error(message);
+                self.emit_error(message);
                 return hooks::LoadedHooks::global_only(global);
             }
         };
@@ -1513,7 +1476,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 self.apply(Action::SetProjectHookStatus(ProjectHookStatus::Invalid(
                     error.clone(),
                 )));
-                self.notices.error(format!(
+                self.emit_error(format!(
                     "invalid project hook manifest {}: {error}",
                     path.display()
                 ));
@@ -1527,7 +1490,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 self.apply(Action::SetProjectHookStatus(ProjectHookStatus::Invalid(
                     message.clone(),
                 )));
-                self.notices.error(message);
+                self.emit_error(message);
                 return hooks::LoadedHooks::global_only(global);
             }
         };
@@ -1558,7 +1521,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             self.apply(Action::SetProjectHookStatus(ProjectHookStatus::Invalid(
                 error.clone(),
             )));
-            self.notices.error(error);
+            self.emit_error(error);
             return hooks::LoadedHooks::global_only(HookConfig::default());
         }
         legacy.revision = format!(
@@ -1615,20 +1578,21 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                         config
                     }
                     Err(error) => {
-                        self.notices
-                            .error(format!("invalid hook manifest {}: {error}", path.display()));
+                        self.emit_error(format!(
+                            "invalid hook manifest {}: {error}",
+                            path.display()
+                        ));
                         HookConfig::default()
                     }
                 },
                 Err(error) => {
-                    self.notices
-                        .error(format!("invalid hook manifest {}: {error}", path.display()));
+                    self.emit_error(format!("invalid hook manifest {}: {error}", path.display()));
                     HookConfig::default()
                 }
             },
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => HookConfig::default(),
             Err(error) => {
-                self.notices.error(format!(
+                self.emit_error(format!(
                     "failed to read hook manifest {}: {error}",
                     path.display()
                 ));
@@ -1692,7 +1656,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         for key in self.sessions.remove_project(project_id) {
             // Nothing is left to answer, and a dialog still up would ask the
             // reader to unblock a process that has gone.
-            self.closed.push(key.clone());
+            self.emit_effect(signals::ApplicationEffect::SessionClosed(key.clone()));
             self.apply(Action::SessionRunning {
                 path: key,
                 running: false,
@@ -1777,7 +1741,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         match result {
             Some(Ok(_)) => {}
             Some(Err(error)) => {
-                self.notices.error(error.to_string());
+                self.emit_error(error.to_string());
                 return;
             }
             None => {
@@ -1809,7 +1773,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         if let Err(error) =
             self.active_command(json!({"type":"set_thinking_level", "level": level.as_str()}))
         {
-            self.notices.error(error);
+            self.emit_error(error);
             return;
         }
         self.refresh_runtime_controls();
@@ -1819,7 +1783,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         if let Err(error) =
             self.active_command(json!({"type":"set_auto_compaction", "enabled": enabled}))
         {
-            self.notices.error(error);
+            self.emit_error(error);
             return;
         }
         self.refresh_runtime_controls();
@@ -1836,7 +1800,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         }
         for (_, session) in self.sessions.iter() {
             if let Err(error) = session.runtime.set_default_permission_level(level) {
-                self.notices.error(error.to_string());
+                self.emit_error(error.to_string());
             }
         }
         let mut config = self.state().agent_team_config.clone();
@@ -1850,7 +1814,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             return;
         }
         if let Err(error) = self.active_send(json!({"type":"compact"})) {
-            self.notices.error(error);
+            self.emit_error(error);
             return;
         }
         if let Some(session) = self.active_mut() {
@@ -1868,7 +1832,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 self.active_command(json!({"type":"set_follow_up_mode", "mode": follow_up}))
             });
         if let Err(error) = result {
-            self.notices.error(error);
+            self.emit_error(error);
             return;
         }
         self.refresh_runtime_controls();
@@ -1895,7 +1859,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 }
                 let _ = self.load_current_entries();
             }
-            Err(error) => self.notices.error(error),
+            Err(error) => self.emit_error(error),
         }
     }
 
@@ -1917,7 +1881,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         }
         if let Some(store) = self.store.as_ref() {
             if let Err(error) = store.save_session(&session) {
-                self.notices.error(error.to_string());
+                self.emit_error(error.to_string());
                 return;
             }
             if let Ok(sessions) = store.list_sessions(project_id) {
@@ -1944,7 +1908,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             store.rename_session(session_id, title)
         };
         if let Err(error) = result {
-            self.notices.error(error.to_string());
+            self.emit_error(error.to_string());
             return false;
         }
         true
@@ -1967,7 +1931,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             if let Some(summary) = session_summary_from_jsonl(project_id, &path) {
                 valid_session_ids.insert(summary.id);
                 if let Err(error) = store.save_session(&summary) {
-                    self.notices.error(error.to_string());
+                    self.emit_error(error.to_string());
                 }
             }
         }
@@ -1977,7 +1941,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                     && !valid_session_ids.contains(&session.id)
                     && let Err(error) = store.delete_session(session.id)
                 {
-                    self.notices.error(error.to_string());
+                    self.emit_error(error.to_string());
                 }
             }
         }
@@ -2058,14 +2022,14 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 .runtime
                 .command(json!({"type":"set_session_name", "name": title}))
             {
-                self.notices.error(error.to_string());
+                self.emit_error(error.to_string());
                 return;
             }
             if let Some(token) = live_token {
                 self.expect_session_title_name(token, &title);
             }
         } else if let Err(error) = persist_session_title_to_jsonl(Path::new(&path), &title) {
-            self.notices.error(error.to_string());
+            self.emit_error(error.to_string());
             return;
         }
         if let Some(project_id) = self.state().selected_project {
@@ -2109,10 +2073,10 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             Ok(value) => {
                 if let Some(path) = value.get("path").and_then(Value::as_str) {
                     let message = format!("{} {path}", self.say("notice-session-exported"));
-                    self.notices.error(message);
+                    self.emit_error(message);
                 }
             }
-            Err(error) => self.notices.error(error),
+            Err(error) => self.emit_error(error),
         }
     }
 
@@ -2132,22 +2096,21 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             Ok(output) if output.status.success() => {
                 let url = String::from_utf8_lossy(&output.stdout).trim().to_owned();
                 let message = format!("{} {url}", self.say("notice-share-url"));
-                self.notices.error(message);
+                self.emit_error(message);
             }
             Ok(output) => {
-                self.notices
-                    .error(String::from_utf8_lossy(&output.stderr).trim().to_string());
+                self.emit_error(String::from_utf8_lossy(&output.stderr).trim().to_string());
             }
             Err(error) => {
                 let message = format!("{} {error}", self.say("notice-gh-unavailable"));
-                self.notices.error(message);
+                self.emit_error(message);
             }
         }
     }
 
     fn clone_session(&mut self) {
         if let Err(error) = self.active_command(json!({"type":"clone"})) {
-            self.notices.error(error);
+            self.emit_error(error);
             return;
         }
         if let Some(project_id) = self.state().selected_project {
@@ -2157,7 +2120,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
 
     fn fork_session(&mut self, entry_id: String) {
         if let Err(error) = self.active_command(json!({"type":"fork", "entryId": entry_id})) {
-            self.notices.error(error);
+            self.emit_error(error);
             return;
         }
         if let Some(project_id) = self.state().selected_project {
@@ -2202,7 +2165,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         if let Some(store) = self.store.as_ref()
             && let Err(error) = store.delete_session(stable_session_id(&path))
         {
-            self.notices.error(error.to_string());
+            self.emit_error(error.to_string());
         }
         if let Some(project_id) = self.state().selected_project {
             self.discover_sessions(project_id, target.parent().unwrap_or(Path::new("")));
@@ -2213,7 +2176,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         let entries = self
             .active_command(json!({"type":"get_entries"}))
             .map_err(|error| {
-                self.notices.error(error);
+                self.emit_error(error);
             })?;
         self.apply(Action::ClearConversation);
         for action in entries
@@ -2237,8 +2200,10 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     pub(crate) fn attach_paths(&mut self, paths: Vec<PathBuf>) {
         for path in paths {
             match attachment_from_path(&path, false) {
-                Ok(attachment) => self.attached.push(attachment),
-                Err(error) => self.notices.error(error),
+                Ok(attachment) => {
+                    self.emit_effect(signals::ApplicationEffect::AttachmentReady(attachment));
+                }
+                Err(error) => self.emit_error(error),
             }
         }
     }
@@ -2257,7 +2222,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                         Ok(attachment) => attachments.push(attachment),
                         // One unreadable path does not spoil the rest of a
                         // multi-file paste.
-                        Err(error) => self.notices.error(error),
+                        Err(error) => self.emit_error(error),
                     }
                 }
                 return attachments;
@@ -2270,15 +2235,10 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         match created {
             Ok(attachment) => vec![attachment],
             Err(error) => {
-                self.notices.error(error);
+                self.emit_error(error);
                 Vec::new()
             }
         }
-    }
-
-    /// Attachments a file dialog produced, bound for the composer.
-    pub(crate) fn take_attachments(&mut self) -> Vec<Attachment> {
-        std::mem::take(&mut self.attached)
     }
 
     pub(crate) fn can_submit_prompt(&self) -> bool {
@@ -2386,7 +2346,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                     }
                     self.apply(Action::SetSessionStatus(SessionStatus::Compacting));
                 }
-                Err(error) => self.notices.error(error),
+                Err(error) => self.emit_error(error),
             }
             return;
         }
@@ -2431,7 +2391,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             if let Some(token) = self.sessions.token_for(key) {
                 self.title_eligible.remove(&token);
             }
-            self.notices.error(error.to_string());
+            self.emit_error(error.to_string());
             return;
         }
         let is_active = self.sessions.active_key() == Some(key);
@@ -2713,7 +2673,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                     return;
                 }
                 if let Err(error) = persist_session_title_to_jsonl(Path::new(&path), &title) {
-                    self.notices.error(error.to_string());
+                    self.emit_error(error.to_string());
                     return;
                 }
                 if persist_source
@@ -2883,18 +2843,20 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         match event {
             RuntimeEvent::Agent(value) => self.apply_agent_event(key, value),
             RuntimeEvent::ExtensionUi(value) => {
-                self.prompts
-                    .extend(dialogs::Prompt::from_extension(key, &value));
+                if let Some(prompt) = dialogs::Prompt::from_extension(key, &value) {
+                    self.emit_effect(signals::ApplicationEffect::Prompt(prompt));
+                }
             }
             RuntimeEvent::Interaction(value) => {
-                self.prompts
-                    .extend(dialogs::Prompt::from_interaction(key, &value));
+                if let Some(prompt) = dialogs::Prompt::from_interaction(key, &value) {
+                    self.emit_effect(signals::ApplicationEffect::Prompt(prompt));
+                }
             }
             RuntimeEvent::HookAudit(record) => self.persist_hook_audit(key, record),
             RuntimeEvent::ToolAudit(record) => self.persist_tool_audit(key, record),
             RuntimeEvent::Stderr(message) => {
                 if is_active && !message.trim().is_empty() {
-                    self.notices.error(message);
+                    self.emit_error(message);
                 }
             }
             RuntimeEvent::Exited { generation, code } => {
@@ -2911,7 +2873,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 self.sessions.remove(key);
                 // Nothing is left to answer, and a dialog still up would ask the
                 // reader to unblock a process that has gone.
-                self.closed.push(key.to_owned());
+                self.emit_effect(signals::ApplicationEffect::SessionClosed(key.to_owned()));
                 self.apply(Action::SessionRunning {
                     path: key.to_owned(),
                     running: false,
@@ -2924,7 +2886,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             }
             RuntimeEvent::Error(error) => {
                 if is_active {
-                    self.notices.error(error);
+                    self.emit_error(error);
                 }
             }
             RuntimeEvent::RpcResponse(_) => {}
@@ -2964,7 +2926,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             };
             if let Err(error) = store.append_hook_audit(&entry) {
                 self.hook_host.requeue_audits(audits[index..].to_vec());
-                self.notices.error(error.to_string());
+                self.emit_error(error.to_string());
                 return;
             }
         }
@@ -3002,7 +2964,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             revision: record.revision,
             created_at_ms: now_ms(),
         }) {
-            self.notices.error(error.to_string());
+            self.emit_error(error.to_string());
         } else if self.state().selected_project == Some(project.id) {
             self.refresh_hook_audit(&project.path);
         }
@@ -3035,7 +2997,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             duration_ms: record.duration_ms,
             created_at_ms: now_ms(),
         }) {
-            self.notices.error(error.to_string());
+            self.emit_error(error.to_string());
         }
     }
 
@@ -3282,7 +3244,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 .map(|_| ()),
         };
         if let Err(error) = result {
-            self.notices.error(error.to_string());
+            self.emit_error(error.to_string());
         }
     }
 }
@@ -3485,6 +3447,36 @@ done
         assert!(hotkeys(Language::SimplifiedChinese).contains("Enter: 发送"));
     }
 
+    struct EffectProbe {
+        receiver: crossbeam_channel::Receiver<ApplicationEffect>,
+        _subscription: pi_whim_signal::Subscription,
+    }
+
+    impl EffectProbe {
+        fn new(app: &PiWhimApplication<FakeRuntime>) -> Self {
+            let (sender, receiver) = crossbeam_channel::unbounded();
+            let subscription = app.application_effects().subscribe_fn(move |effect| {
+                let _ = sender.send(effect);
+            });
+            app.activate_effect_delivery();
+            receiver.try_iter().for_each(drop);
+            Self {
+                receiver,
+                _subscription: subscription,
+            }
+        }
+
+        fn notices(&self) -> Vec<pi_whim_engine::notice::Notice> {
+            self.receiver
+                .try_iter()
+                .filter_map(|effect| match effect {
+                    ApplicationEffect::Notice(notice) => Some(notice),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
     fn test_application(
         directory: &TempDir,
         runtime: FakeRuntime,
@@ -3499,11 +3491,6 @@ done
             secrets: MacosKeychainStore::default(),
             runtime_factory: Box::new(move || factory_runtime.clone()),
             sessions: SessionPool::new(),
-            prompts: Vec::new(),
-            closed: Vec::new(),
-            attached: Vec::new(),
-            clipboard: None,
-            picker: None,
             capability_resolver: ModelCapabilityResolver::new(
                 &pi_whim_catalog::SharedCatalog::default(),
                 false,
@@ -3516,7 +3503,6 @@ done
             pending_hook_reloads: HashSet::new(),
             pending_hook_inputs: HashMap::new(),
             attachment_store: AttachmentStore::open(directory.path().join("attachments")).unwrap(),
-            notices: notice::Outbox::new(),
             control_updates: crossbeam_channel::unbounded(),
             one_shot_ai: None,
             one_shot_generation: 0,
@@ -3957,11 +3943,13 @@ done
         app.apply(Action::SetSessionStatus(SessionStatus::Ready));
 
         assert!(!app.can_submit_prompt());
+        let effects = EffectProbe::new(&app);
         app.submit_prompt("keep this draft".into(), Vec::new(), SubmitMode::Prompt);
 
         assert!(app.state().conversation.is_empty());
         assert!(
-            app.take_notices()
+            effects
+                .notices()
                 .iter()
                 .any(|notice| notice.message.contains("No active session"))
         );
@@ -4691,6 +4679,7 @@ done
             },
         );
 
+        let effects = EffectProbe::new(&app);
         app.settle_one_shot_completions(vec![OneShotCompletion {
             request_id,
             generation: 7,
@@ -4702,7 +4691,8 @@ done
             command.get("type").and_then(Value::as_str) == Some("set_session_name")
         }));
         assert!(
-            app.take_notices()
+            effects
+                .notices()
                 .iter()
                 .any(|notice| notice.message.contains("timed out"))
         );
@@ -4730,6 +4720,7 @@ done
             },
         );
 
+        let effects = EffectProbe::new(&app);
         app.settle_one_shot_completions(vec![OneShotCompletion {
             request_id,
             generation: 8,
@@ -4741,7 +4732,8 @@ done
             command.get("type").and_then(Value::as_str) == Some("set_session_name")
         }));
         assert!(
-            app.take_notices()
+            effects
+                .notices()
                 .iter()
                 .any(|notice| notice.message.contains("current title"))
         );
@@ -4770,6 +4762,7 @@ done
             },
         );
 
+        let effects = EffectProbe::new(&app);
         app.settle_one_shot_completions(vec![OneShotCompletion {
             request_id,
             generation: 9,
@@ -4781,7 +4774,7 @@ done
             command.get("type").and_then(Value::as_str) == Some("set_session_name")
                 && command.get("name").and_then(Value::as_str) == Some("Fallback title")
         }));
-        assert!(app.take_notices().is_empty());
+        assert!(effects.notices().is_empty());
     }
 
     #[test]
