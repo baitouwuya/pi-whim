@@ -37,8 +37,10 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use pi_whim_catalog::ModelCapabilityResolver;
-use pi_whim_engine::changes::{ChangeSet, CommitContext, CommitError, CommitSource};
-use pi_whim_engine::commands::{AppCommand, CommandDiagnostic, CommandLifecycle, ShellPaste};
+use pi_whim_engine::changes::{ChangeSet, CommitContext, CommitError, CommitScope, CommitSource};
+use pi_whim_engine::commands::{
+    AppCommand, CommandDiagnostic, CommandEnvelope, CommandLifecycle, ShellPaste,
+};
 use pi_whim_engine::mailbox::Delivery;
 use pi_whim_engine::mailbox::SessionToken;
 use pi_whim_engine::pool::{PendingPrompt, SessionPool, SessionRuntime, is_draft};
@@ -328,10 +330,50 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         self.signals.command_lifecycle()
     }
 
-    /// Emit a typed command lifecycle stage without exposing the emitter.
+    /// Select the shared project Hook controller for one authenticated envelope.
+    #[allow(dead_code, reason = "reserved for the Host command pipeline")]
+    pub(crate) fn command_hook_controller(
+        &self,
+        envelope: &CommandEnvelope<AppCommand>,
+    ) -> Option<hooks::CommandHookController> {
+        envelope
+            .project_id()
+            .and_then(|project_id| self.command_hook_controller_for_project(project_id))
+    }
+
+    /// Emit a typed command lifecycle stage, then best-effort external Observe.
     #[allow(dead_code, reason = "reserved for the typed command pipeline")]
     pub(crate) fn emit_command_lifecycle(&self, lifecycle: CommandLifecycle) {
-        self.signals.emit_command_lifecycle(lifecycle);
+        self.signals.emit_command_lifecycle(lifecycle.clone());
+        if let Some(project_id) = lifecycle.project_id()
+            && let Some(controller) = self.command_hook_controller_for_project(project_id)
+        {
+            controller.observe_lifecycle(&lifecycle);
+        }
+    }
+
+    fn command_hook_controller_for_project(
+        &self,
+        project_id: ProjectId,
+    ) -> Option<hooks::CommandHookController> {
+        let project = self.find_project(project_id)?;
+        self.hook_host.controller(Path::new(&project.path))
+    }
+
+    fn observe_change_set(&self, change_set: &ChangeSet) {
+        let project_id = match change_set.scope {
+            CommitScope::Session(identity) => identity.project_id,
+            // Global commits have no project identity of their own. Route them
+            // through the currently selected project's shared scope when one
+            // exists; with no selection there is no project Hook scope to use.
+            CommitScope::Global => self.state().selected_project,
+        };
+        let Some(project_id) = project_id else {
+            return;
+        };
+        if let Some(controller) = self.command_hook_controller_for_project(project_id) {
+            controller.observe_change_set(change_set);
+        }
     }
 
     /// Change the domain state through a one-action internal-effect commit.
@@ -349,7 +391,10 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     {
         let result = self.engine.apply_batch(actions, context);
         match self.signals.publish_commit(result) {
-            Ok(change_set) => Some(change_set),
+            Ok(change_set) => {
+                self.observe_change_set(&change_set);
+                Some(change_set)
+            }
             Err(error) => {
                 self.report_commit_error(error);
                 None
@@ -3281,11 +3326,104 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    #[cfg(target_os = "macos")]
+    use std::{collections::BTreeMap, os::unix::fs::PermissionsExt};
+
     use pi_whim_core::ConversationItem;
     use pi_whim_engine::{changes::StateTopic, session::is_large_paste};
+    #[cfg(target_os = "macos")]
+    use pi_whim_hook_host::{
+        ApprovedHookManifest, EventRegistry, HookAuditOutcome, HookHostManager, HookManifest,
+        HookScopeKey,
+    };
     use pi_whim_runtime::FakeRuntime;
+    #[cfg(target_os = "macos")]
+    use pi_whim_runtime::RuntimeHookScope;
     use serde_json::json;
     use tempfile::TempDir;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn global_commit_observes_the_selected_project_scope() -> Result<(), String> {
+        let _guard = hooks::hook_test_lock()?;
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let project = project("selected", directory.path());
+        let mut app = test_application(&directory, FakeRuntime::default());
+        app.apply(Action::ProjectsLoaded(vec![project.clone()]));
+        app.apply(Action::SelectProject(project.id));
+
+        let script = directory.path().join("state-observe.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+IFS= read -r hello || exit 2
+hello_id=$(printf '%s\n' "$hello" | sed -n 's/.*"hello_id":"\([^"]*\)".*/\1/p')
+printf '{"type":"ready","hook_id":"state-observe","event":"pi.state.committed","kind":"observe","hello_id":"%s"}\n' "$hello_id"
+while IFS= read -r request; do
+  request_id=$(printf '%s\n' "$request" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+  printf '{"type":"response","request_id":"%s","hook_id":"state-observe","event":"pi.state.committed","response":{"kind":"observe","accepted":true}}\n' "$request_id"
+done
+"#,
+        )
+        .map_err(|error| error.to_string())?;
+        let mut permissions = fs::metadata(&script)
+            .map_err(|error| error.to_string())?
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).map_err(|error| error.to_string())?;
+
+        let manifest = HookManifest::parse_json(
+            &json!({
+                "version": 2,
+                "hooks": [{
+                    "id": "state-observe",
+                    "event": "pi.state.committed",
+                    "kind": "observe",
+                    "command": [script],
+                    "fields": [
+                        "revision", "topics", "action_count", "coalesced",
+                        "scope", "commit_source", "project_id"
+                    ]
+                }]
+            })
+            .to_string(),
+        )
+        .map_err(|error| error.to_string())?
+        .with_revision("state-r1");
+        let fingerprints = BTreeMap::from([(
+            "state-observe".to_owned(),
+            hook_manifest_fingerprint(&fs::read(&script).map_err(|error| error.to_string())?),
+        )]);
+        let approved = ApprovedHookManifest::new(manifest, "state-r1", fingerprints)
+            .map_err(|error| error.to_string())?;
+        let manager = HookHostManager::new_with_registry(EventRegistry::default(), approved)
+            .map_err(|error| error.to_string())?;
+        let key = HookScopeKey::project(directory.path(), "state-r1")
+            .map_err(|error| error.to_string())?;
+        let scope = manager
+            .open_scope(key, None)
+            .map_err(|error| error.to_string())?;
+        let expected_scope_id = scope.scope_id();
+        app.hook_host.retain_scope_for_test(
+            directory.path(),
+            RuntimeHookScope::new(manager.clone(), scope),
+        );
+        let (audit_sender, audit_receiver) = crossbeam_channel::unbounded();
+        let _subscription = manager.audit_signal().subscribe_fn(move |event| {
+            let _ = audit_sender.send(event);
+        });
+
+        app.apply(Action::SetLanguage(Language::SimplifiedChinese));
+
+        let audit = audit_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|error| error.to_string())?;
+        assert_eq!(audit.event, "pi.state.committed");
+        assert_eq!(audit.outcome, HookAuditOutcome::Observed);
+        assert_eq!(audit.scope_id, expected_scope_id);
+        assert!(audit_receiver.try_recv().is_err());
+        Ok(())
+    }
 
     #[test]
     fn the_session_info_body_translates_its_labels_and_keeps_its_figures() {

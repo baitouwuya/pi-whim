@@ -9,12 +9,32 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use pi_whim_core::HookConfig;
 use pi_whim_hook_host::{
     ApprovedHookManifest, EventRegistry, HookAuditEvent, HookAuditOutcome, HookHostHealth,
-    HookHostManager, HookManifest, HookScopeKey,
+    HookHostManager, HookInvocationContext, HookManifest, HookScopeKey,
 };
 use pi_whim_persistence::hook_manifest_fingerprint;
 use pi_whim_runtime::RuntimeHookScope;
 
 const EMPTY_GLOBAL_REVISION: &str = "v1:global-empty";
+
+#[cfg(test)]
+static HOOK_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub(super) fn hook_test_lock() -> Result<std::sync::MutexGuard<'static, ()>, String> {
+    HOOK_TEST_LOCK.lock().map_err(|error| error.to_string())
+}
+
+#[allow(
+    dead_code,
+    reason = "the Host will call the typed command controller in the next integration task"
+)]
+mod commands;
+
+#[allow(
+    unused_imports,
+    reason = "the public error is consumed with the controller by the next Host task"
+)]
+pub(crate) use commands::{CommandHookController, CommandHookError};
 
 #[derive(Clone, Debug)]
 pub(super) struct LoadedHooks {
@@ -62,6 +82,7 @@ struct ManagerOwner {
 pub(super) struct ApplicationHookHost {
     owners: HashMap<String, ManagerOwner>,
     scope_projects: HashMap<String, String>,
+    latest_scopes: HashMap<String, RuntimeHookScope>,
     audit_sender: Sender<HookAuditEvent>,
     audit_receiver: Receiver<HookAuditEvent>,
     pending_unmapped_audits: VecDeque<HookAuditEvent>,
@@ -74,6 +95,7 @@ impl std::fmt::Debug for ApplicationHookHost {
             .debug_struct("ApplicationHookHost")
             .field("manager_count", &self.owners.len())
             .field("scope_count", &self.scope_projects.len())
+            .field("latest_project_count", &self.latest_scopes.len())
             .finish()
     }
 }
@@ -84,6 +106,7 @@ impl Default for ApplicationHookHost {
         Self {
             owners: HashMap::new(),
             scope_projects: HashMap::new(),
+            latest_scopes: HashMap::new(),
             audit_sender,
             audit_receiver,
             pending_unmapped_audits: VecDeque::new(),
@@ -99,7 +122,9 @@ impl ApplicationHookHost {
         global: &HookConfig,
         project: Option<&HookConfig>,
     ) -> Result<Option<RuntimeHookScope>, String> {
+        let project_key = project_path.to_string_lossy().into_owned();
         if global.hooks.is_empty() && project.is_none_or(|config| config.hooks.is_empty()) {
+            self.latest_scopes.remove(&project_key);
             return Ok(None);
         }
 
@@ -145,11 +170,39 @@ impl ApplicationHookHost {
         let scope = manager
             .open_scope(key, project_manifest)
             .map_err(|error| error.to_string())?;
-        self.scope_projects.insert(
-            scope.scope_id(),
-            project_path.to_string_lossy().into_owned(),
-        );
-        Ok(Some(RuntimeHookScope::new(manager, scope)))
+        self.scope_projects
+            .insert(scope.scope_id(), project_key.clone());
+        let runtime_scope = RuntimeHookScope::new(manager, scope);
+        self.latest_scopes
+            .insert(project_key, runtime_scope.clone());
+        Ok(Some(runtime_scope))
+    }
+
+    pub(super) fn controller(&self, project_path: &Path) -> Option<CommandHookController> {
+        let project_key = project_path.to_string_lossy();
+        let runtime_scope = self.latest_scopes.get(project_key.as_ref())?;
+        let scope = runtime_scope.scope();
+        let key = scope.key();
+        let project_root = key.project_root?.to_string_lossy().into_owned();
+        let context =
+            HookInvocationContext::project(scope.scope_id(), key.manifest_revision, project_root);
+        Some(CommandHookController::new(
+            scope,
+            context,
+            self.audit_sender.clone(),
+        ))
+    }
+
+    #[cfg(test)]
+    pub(super) fn retain_scope_for_test(
+        &mut self,
+        project_path: &Path,
+        runtime_scope: RuntimeHookScope,
+    ) {
+        let project_key = project_path.to_string_lossy().into_owned();
+        self.scope_projects
+            .insert(runtime_scope.scope_id(), project_key.clone());
+        self.latest_scopes.insert(project_key, runtime_scope);
     }
 
     pub(super) fn drain_audits(&mut self) -> Vec<AppHookAudit> {
@@ -247,7 +300,7 @@ fn audit_outcome_name(outcome: HookAuditOutcome) -> &'static str {
 mod tests {
     use super::*;
     use pi_whim_core::{HookDefinition, HookEvent, HookKind, HookMatcher};
-    use pi_whim_hook_host::{HookGateDecision, HookInvocationContext, HookPayload};
+    use pi_whim_hook_host::{HookGateDecision, HookPayload};
     use serde_json::json;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -314,6 +367,7 @@ mod tests {
 
     #[test]
     fn same_project_and_revision_reuse_scope() -> Result<(), String> {
+        let _guard = hook_test_lock()?;
         let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
         let mut host = ApplicationHookHost::default();
         let global = HookConfig::default();
@@ -329,12 +383,18 @@ mod tests {
             .resolve_scope(directory.path(), &global, Some(&project))?
             .ok_or_else(|| "expected second scope".to_owned())?;
         assert_eq!(first.scope_id(), second.scope_id());
+        let controller = host
+            .controller(directory.path())
+            .ok_or_else(|| "expected shared command controller".to_owned())?;
+        assert_eq!(controller.scope_id(), first.scope_id());
+        assert_eq!(host.latest_scopes.len(), 1);
         assert_eq!(host.owners.len(), 1);
         Ok(())
     }
 
     #[test]
     fn project_revision_changes_scope_but_reuses_global_owner() -> Result<(), String> {
+        let _guard = hook_test_lock()?;
         let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
         let mut host = ApplicationHookHost::default();
         let global = HookConfig::default();
@@ -354,12 +414,18 @@ mod tests {
             )?
             .ok_or_else(|| "expected second scope".to_owned())?;
         assert_ne!(first.scope_id(), second.scope_id());
+        let controller = host
+            .controller(directory.path())
+            .ok_or_else(|| "expected latest command controller".to_owned())?;
+        assert_eq!(controller.scope_id(), second.scope_id());
+        assert_eq!(host.latest_scopes.len(), 1);
         assert_eq!(host.owners.len(), 1);
         Ok(())
     }
 
     #[test]
     fn project_manifest_is_not_promoted_to_global() -> Result<(), String> {
+        let _guard = hook_test_lock()?;
         let project_a = tempfile::tempdir().map_err(|error| error.to_string())?;
         let project_b = tempfile::tempdir().map_err(|error| error.to_string())?;
         let mut host = ApplicationHookHost::default();
@@ -388,6 +454,7 @@ mod tests {
 
     #[test]
     fn one_manager_subscription_emits_one_external_audit() -> Result<(), String> {
+        let _guard = hook_test_lock()?;
         let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
         let mut host = ApplicationHookHost::default();
         let global = HookConfig::default();
@@ -413,6 +480,7 @@ mod tests {
 
     #[test]
     fn scope_failure_leaves_legacy_config_available() -> Result<(), String> {
+        let _guard = hook_test_lock()?;
         let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
         let project_file = directory.path().join("not-a-project-directory");
         fs::write(&project_file, b"not a directory").map_err(|error| error.to_string())?;
@@ -434,6 +502,7 @@ mod tests {
 
     #[test]
     fn no_hooks_do_not_create_a_manager_or_scope() -> Result<(), String> {
+        let _guard = hook_test_lock()?;
         let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
         let mut host = ApplicationHookHost::default();
         assert!(
