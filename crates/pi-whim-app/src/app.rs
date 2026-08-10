@@ -6,6 +6,7 @@
 //! touching any of it.
 
 mod hooks;
+mod signals;
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -36,7 +37,8 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use pi_whim_catalog::ModelCapabilityResolver;
-use pi_whim_engine::commands::{AppCommand, ShellPaste};
+use pi_whim_engine::changes::{ChangeSet, CommitContext, CommitError, CommitSource};
+use pi_whim_engine::commands::{AppCommand, CommandDiagnostic, CommandLifecycle, ShellPaste};
 use pi_whim_engine::mailbox::Delivery;
 use pi_whim_engine::mailbox::SessionToken;
 use pi_whim_engine::pool::{PendingPrompt, SessionPool, SessionRuntime, is_draft};
@@ -52,6 +54,7 @@ use pi_whim_engine::session::{
 use pi_whim_engine::slash_commands::SlashCommand;
 use pi_whim_engine::state::EngineState;
 use pi_whim_engine::{controls, dialogs, events, launch, notice};
+use pi_whim_signal::Signal;
 
 /// A file picker the host should open, and what to do with the answer.
 ///
@@ -72,6 +75,7 @@ pub(crate) enum Picker {
 
 pub struct PiWhimApplication<R: AgentRuntime = PiRpcRuntime> {
     engine: EngineState,
+    signals: signals::ApplicationSignals,
     store: Option<SqliteStore>,
     secrets: MacosKeychainStore,
     runtime_factory: Box<dyn Fn() -> R + Send>,
@@ -181,6 +185,8 @@ const MAX_EXPECTED_SESSION_TITLE_NAMES: usize = 8;
 impl Default for PiWhimApplication<PiRpcRuntime> {
     fn default() -> Self {
         let mut engine = EngineState::new();
+        let signals = signals::ApplicationSignals::default();
+        let mut initial_actions = Vec::new();
         let capability_resolver = ModelCapabilityResolver::default();
         let store = SqliteStore::open_default()
             .map_err(|error| error.to_string())
@@ -192,10 +198,10 @@ impl Default for PiWhimApplication<PiRpcRuntime> {
                 .iter()
                 .map(|project| project.id)
                 .collect::<Vec<_>>();
-            let _ = engine.apply(Action::ProjectsLoaded(projects));
+            initial_actions.push(Action::ProjectsLoaded(projects));
             for project_id in project_ids {
                 if let Ok(sessions) = store.list_sessions(project_id) {
-                    let _ = engine.apply(Action::SessionsLoaded {
+                    initial_actions.push(Action::SessionsLoaded {
                         project_id,
                         sessions,
                     });
@@ -205,13 +211,13 @@ impl Default for PiWhimApplication<PiRpcRuntime> {
         if let Some(store) = store.as_ref()
             && let Ok(preferences) = store.load_preferences()
         {
-            let _ = engine.apply(Action::SetLanguage(preferences.language));
-            let _ = engine.apply(Action::SetBashPolicy(preferences.bash_policy));
-            let _ = engine.apply(Action::SetBashBlockedPatterns(
+            initial_actions.push(Action::SetLanguage(preferences.language));
+            initial_actions.push(Action::SetBashPolicy(preferences.bash_policy));
+            initial_actions.push(Action::SetBashBlockedPatterns(
                 preferences.bash_blocked_patterns,
             ));
-            let _ = engine.apply(Action::SetAgentTeamConfig(preferences.agent_team_config));
-            let _ = engine.apply(Action::SetOneShotAiConfig(preferences.one_shot_ai_config));
+            initial_actions.push(Action::SetAgentTeamConfig(preferences.agent_team_config));
+            initial_actions.push(Action::SetOneShotAiConfig(preferences.one_shot_ai_config));
         }
         let mut search_engine_ids = Vec::new();
         if let Some(store) = store.as_ref()
@@ -222,7 +228,7 @@ impl Default for PiWhimApplication<PiRpcRuntime> {
                 .filter(|profile| profile.kind.requires_api_key())
                 .map(|profile| profile.id)
                 .collect();
-            let _ = engine.apply(Action::SearchEngineProfilesLoaded(profiles));
+            initial_actions.push(Action::SearchEngineProfilesLoaded(profiles));
         }
         let mut provider_ids = Vec::new();
         if let Some(store) = store.as_ref()
@@ -233,10 +239,17 @@ impl Default for PiWhimApplication<PiRpcRuntime> {
                 let _ = store.save_provider_profile(profile);
             }
             provider_ids = profiles.iter().map(|profile| profile.id).collect();
-            let _ = engine.apply(Action::ProviderProfilesLoaded(profiles));
+            initial_actions.push(Action::ProviderProfilesLoaded(profiles));
         }
+        let initial_commit_error = signals
+            .publish_commit(engine.apply_batch(
+                initial_actions,
+                CommitContext::global(CommitSource::PersistenceLoad),
+            ))
+            .err();
         let mut application = Self {
             engine,
+            signals,
             store,
             secrets: MacosKeychainStore::default(),
             runtime_factory: Box::new(PiRpcRuntime::default),
@@ -267,6 +280,9 @@ impl Default for PiWhimApplication<PiRpcRuntime> {
             title_eligible: HashSet::new(),
             title_attempted: HashSet::new(),
         };
+        if let Some(error) = initial_commit_error {
+            application.report_commit_error(error);
+        }
         // Probing the keychain can block for a long time and this runs before
         // the window opens, so profiles start with their stored status and a
         // worker corrects them.
@@ -300,11 +316,50 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         self.notices.error(message);
     }
 
-    /// Change the domain state through the reducer.
+    /// Subscribe to committed domain changes without access to the emitter.
+    #[allow(dead_code, reason = "reserved for the Host/GPUI signal bridge")]
+    pub(crate) fn change_sets(&self) -> Signal<ChangeSet> {
+        self.signals.change_sets()
+    }
+
+    /// Subscribe to metadata-only command lifecycle stages.
+    #[allow(dead_code, reason = "reserved for the Host/GPUI signal bridge")]
+    pub(crate) fn command_lifecycle(&self) -> Signal<CommandLifecycle> {
+        self.signals.command_lifecycle()
+    }
+
+    /// Emit a typed command lifecycle stage without exposing the emitter.
+    #[allow(dead_code, reason = "reserved for the typed command pipeline")]
+    pub(crate) fn emit_command_lifecycle(&self, lifecycle: CommandLifecycle) {
+        self.signals.emit_command_lifecycle(lifecycle);
+    }
+
+    /// Change the domain state through a one-action internal-effect commit.
     fn apply(&mut self, action: Action) {
-        // The view effect is dropped: it exists for a caller that renders, and
-        // the shell derives what it needs from the snapshot it is handed next.
-        let _ = self.engine.apply(action);
+        let _ = self.apply_batch(
+            std::iter::once(action),
+            CommitContext::global(CommitSource::InternalEffect),
+        );
+    }
+
+    /// Commit an action batch and synchronously publish its typed change set.
+    fn apply_batch<I>(&mut self, actions: I, context: CommitContext) -> Option<ChangeSet>
+    where
+        I: IntoIterator<Item = Action>,
+    {
+        let result = self.engine.apply_batch(actions, context);
+        match self.signals.publish_commit(result) {
+            Ok(change_set) => Some(change_set),
+            Err(error) => {
+                self.report_commit_error(error);
+                None
+            }
+        }
+    }
+
+    fn report_commit_error(&mut self, error: CommitError) {
+        let diagnostic = CommandDiagnostic::new(format!("state commit failed: {error}"));
+        self.notices.error(diagnostic.as_str().to_owned());
     }
 
     /// The merged stream of every pooled session's events.
@@ -3224,8 +3279,10 @@ fn applescript_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
     use pi_whim_core::ConversationItem;
-    use pi_whim_engine::session::is_large_paste;
+    use pi_whim_engine::{changes::StateTopic, session::is_large_paste};
     use pi_whim_runtime::FakeRuntime;
     use serde_json::json;
     use tempfile::TempDir;
@@ -3280,6 +3337,7 @@ mod tests {
         let factory_runtime = runtime;
         PiWhimApplication {
             engine: EngineState::new(),
+            signals: signals::ApplicationSignals::default(),
             store: Some(SqliteStore::open(directory.path().join("test.sqlite")).unwrap()),
             secrets: MacosKeychainStore::default(),
             runtime_factory: Box::new(move || factory_runtime.clone()),
@@ -3313,6 +3371,59 @@ mod tests {
             title_eligible: HashSet::new(),
             title_attempted: HashSet::new(),
         }
+    }
+
+    #[test]
+    fn single_action_commit_emits_internal_effect_change_set() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = test_application(&directory, FakeRuntime::default());
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let _subscription = app.change_sets().subscribe_fn(move |change_set| {
+            let _ = sender.send(change_set);
+        });
+
+        app.apply(Action::SetLanguage(Language::SimplifiedChinese));
+
+        let change_set = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the committed action publishes a change set");
+        assert_eq!(change_set.revision.get(), 1);
+        assert_eq!(change_set.source, CommitSource::InternalEffect);
+        assert_eq!(change_set.changed_topics, vec![StateTopic::Preferences]);
+        assert_eq!(change_set.action_count, 1);
+    }
+
+    #[test]
+    fn action_batch_commits_once_and_emits_one_change_set() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = test_application(&directory, FakeRuntime::default());
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let _subscription = app.change_sets().subscribe_fn(move |change_set| {
+            let _ = sender.send(change_set);
+        });
+
+        let returned = app
+            .apply_batch(
+                [
+                    Action::SetLanguage(Language::SimplifiedChinese),
+                    Action::ClearConversation,
+                ],
+                CommitContext::global(CommitSource::Test),
+            )
+            .expect("the reducer batch commits");
+
+        let observed = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the committed batch publishes a change set");
+        assert_eq!(observed, returned);
+        assert_eq!(observed.revision.get(), 1);
+        assert_eq!(observed.source, CommitSource::Test);
+        assert_eq!(
+            observed.changed_topics,
+            vec![StateTopic::Preferences, StateTopic::Conversation]
+        );
+        assert_eq!(observed.action_count, 2);
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]

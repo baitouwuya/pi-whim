@@ -23,6 +23,7 @@ pi-whim-hook-host = { path = "../pi-whim-hook-host" }
 pi-whim-one-shot-ai = { path = "../pi-whim-one-shot-ai" }
 pi-whim-persistence = { path = "../pi-whim-persistence" }
 pi-whim-runtime = { path = "../pi-whim-runtime" }
+pi-whim-signal = { path = "../pi-whim-signal" }
 pi-whim-theme = { path = "../pi-whim-theme" }
 serde.workspace = true
 serde_json.workspace = true

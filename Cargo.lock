@@ -4672,6 +4672,7 @@ dependencies = [
  "pi-whim-one-shot-ai",
  "pi-whim-persistence",
  "pi-whim-runtime",
+ "pi-whim-signal",
  "pi-whim-theme",
  "serde",
  "serde_json",
