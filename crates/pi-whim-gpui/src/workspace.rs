@@ -4,6 +4,13 @@
 //! the space the conversation and sidebar will fill. Those two, along with the
 //! settings page, land as their own modules.
 
+mod state;
+
+pub use state::{
+    ConversationProjection, NavigationProjection, RuntimeProjection, SettingsProjection,
+    WorkspaceStateSelections,
+};
+
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
@@ -16,7 +23,7 @@ use gpui_component::{
     theme::{Theme as ComponentTheme, ThemeMode as ComponentMode},
 };
 use pi_whim_core::{
-    AppState, Attachment, ProjectId, ProviderId, SessionStatus, SubmitMode,
+    AppState, Attachment, ProjectId, ProviderId, SessionId, SessionStatus, SubmitMode,
     strings::text as translate,
 };
 use pi_whim_engine::notice::Outbox;
@@ -95,11 +102,10 @@ const PROMPT_MARGIN: f32 = 10.0;
 pub struct Workspace {
     preference: ThemePreference,
     tokens: Tokens,
-    /// What is on screen.
+    /// Incremental compatibility cache assembled from feature projections.
     ///
-    /// A projection, not the truth: the host owns the reducer and hands whole
-    /// snapshots to [`Workspace::set_state`]. A second reducer here could
-    /// disagree with the one the agent's events go through.
+    /// The application remains the reducer owner. No complete state snapshot
+    /// crosses the Host boundary; each projection replaces only its own fields.
     state: AppState,
     sidebar: Entity<Sidebar>,
     conversation: Entity<Conversation>,
@@ -122,6 +128,9 @@ pub struct Workspace {
     notices: Outbox,
     /// The failure banner the reader dismissed, until the status changes.
     dismissed_error: Option<String>,
+    /// Last session applied to the conversation feature, independent of the
+    /// navigation projection's delivery order.
+    conversation_session: Option<SessionId>,
     /// Projects whose sessions are listed. View-local: which projects a reader
     /// has open says nothing about the session.
     expanded_projects: BTreeSet<ProjectId>,
@@ -274,6 +283,7 @@ impl Workspace {
             showing_settings: false,
             notices: Outbox::new(),
             dismissed_error: None,
+            conversation_session: None,
             expanded_projects: BTreeSet::new(),
             app_commands,
             app_command_emitter,
@@ -433,7 +443,7 @@ impl Workspace {
                 cx,
             ),
         }
-        self.sync_views(window, cx);
+        self.sync_sidebar(window, cx);
         cx.notify();
     }
 
@@ -653,13 +663,13 @@ impl Workspace {
     /// same way the sidebar's do.
     fn handle_controls_event(&mut self, event: ControlsEvent, cx: &mut Context<Self>) {
         // No `cx.notify()` at the end: every arm here is a request, and `request`
-        // notifies. The picker keeps showing the old value until the snapshot
+        // notifies. The picker keeps showing the old value until the projection
         // arrives, which is the point.
         match event {
             ControlsEvent::SetModel(model) => {
                 // The host records the choice as pending — a switch waits for the
                 // next prompt so the prior model compacts the history first — and
-                // the picker shows it when that snapshot comes back.
+                // the picker shows it when that projection comes back.
                 self.emit_app_command(AppCommand::SetModel(model), cx);
             }
             ControlsEvent::SetPermissionLevel(level) => {
@@ -674,7 +684,7 @@ impl Workspace {
     /// Act on what the settings page reported.
     ///
     /// Everything that changes domain state leaves as a request: the host applies
-    /// it and the snapshot comes back, so a preference cannot end up showing as
+    /// it and the projection comes back, so a preference cannot end up showing as
     /// set while the write that stores it failed. The provider and search-engine
     /// halves queue too, because a draft is not domain state until it is stored
     /// and read back.
@@ -940,11 +950,7 @@ impl Workspace {
         });
     }
 
-    /// Refresh the panes after state changed.
-    fn sync_views(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.sync_sidebar(window, cx);
-        self.sync_conversation(cx);
-
+    fn refresh_runtime_controls(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let tokens = self.tokens;
         let busy = matches!(
             self.state.session_status,
@@ -963,15 +969,13 @@ impl Workspace {
             composer.set_ready(ready, cx);
         });
 
-        // The controls compare this snapshot with the values already applied.
-        // That lets an open model menu preserve its search and scroll position
-        // across unrelated transcript/status snapshots.
+        // Controls compare the projected compatibility cache with their applied
+        // values so unrelated commits do not reset an open picker.
         let state = self.state.clone();
         self.controls.update(cx, |controls, cx| {
             controls.set_tokens(tokens, cx);
             controls.sync(&state, window, cx);
         });
-
         self.prompts.update(cx, |prompts, cx| {
             prompts.set_tokens(tokens, cx);
             prompts.set_language(language, cx);
@@ -980,10 +984,22 @@ impl Workspace {
             rename.set_tokens(tokens, cx);
             rename.set_language(language, window, cx);
         });
+    }
+
+    fn refresh_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let state = self.state.clone();
+        let tokens = self.tokens;
         self.settings.update(cx, |settings, cx| {
             settings.set_tokens(tokens, cx);
             settings.sync(&state, window, cx);
         });
+    }
+
+    fn refresh_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_sidebar(window, cx);
+        self.sync_conversation(cx);
+        self.refresh_runtime_controls(window, cx);
+        self.refresh_settings(window, cx);
     }
 
     /// Whether the settings page is showing instead of the chat panes.
@@ -1065,23 +1081,28 @@ impl Workspace {
         &self.state
     }
 
-    /// Show `state` instead of what is on screen now.
-    ///
-    /// The whole snapshot rather than a diff: `sync_views` already hands each
-    /// view its slice wholesale, so there is nothing to save by sending less.
-    /// This is how the shell learns about anything it did not do itself — an
-    /// agent's reply, a session it asked to be activated — without keeping a
-    /// second reducer that could disagree with the one that owns the state.
-    pub fn set_state(&mut self, state: AppState, window: &mut Window, cx: &mut Context<Self>) {
-        // What the conversation caches per message — reveal progress, which tool
-        // cards are open — is keyed by message id, so it has to go when the
-        // messages it describes do. A changed session counts as much as an
-        // emptied conversation: switching clears and reloads in one step, so the
-        // empty moment in between never arrives as its own snapshot.
-        let previous = &self.state;
-        let switched = previous.selected_session != state.selected_session;
-        let cleared = state.conversation.is_empty() && !previous.conversation.is_empty();
-        let status_changed = previous.session_status != state.session_status;
+    /// Apply the navigation/sidebar slice replayed from committed state.
+    pub fn apply_navigation_projection(
+        &mut self,
+        projection: NavigationProjection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        projection.apply_to(&mut self.state);
+        self.sync_sidebar(window, cx);
+        cx.notify();
+    }
+
+    /// Apply the visible conversation, queue, and session-runtime slice.
+    pub fn apply_conversation_projection(
+        &mut self,
+        projection: ConversationProjection,
+        cx: &mut Context<Self>,
+    ) {
+        let next_session = projection.selected_session();
+        let switched = self.conversation_session != next_session;
+        let cleared = projection.conversation_is_empty() && !self.state.conversation.is_empty();
+        let status_changed = &self.state.session_status != projection.session_status();
         if switched || cleared {
             self.conversation
                 .update(cx, |conversation, cx| conversation.clear(cx));
@@ -1089,8 +1110,33 @@ impl Workspace {
         if status_changed {
             self.dismissed_error = None;
         }
-        self.state = state;
-        self.sync_views(window, cx);
+        projection.apply_to(&mut self.state);
+        self.conversation_session = next_session;
+        self.sync_conversation(cx);
+        cx.notify();
+    }
+
+    /// Apply runtime controls and composer/chrome status.
+    pub fn apply_runtime_projection(
+        &mut self,
+        projection: RuntimeProjection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        projection.apply_to(&mut self.state);
+        self.refresh_runtime_controls(window, cx);
+        cx.notify();
+    }
+
+    /// Apply preferences, providers, search, Hooks, and AGENTS.md-related state.
+    pub fn apply_settings_projection(
+        &mut self,
+        projection: SettingsProjection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        projection.apply_to(&mut self.state);
+        self.refresh_settings(window, cx);
         cx.notify();
     }
 
@@ -1105,7 +1151,7 @@ impl Workspace {
         self.preference = ThemePreference::Fixed(next);
         self.tokens = Tokens::new(next);
         crate::theme::reapply(next, Some(window), cx);
-        self.sync_views(window, cx);
+        self.refresh_theme(window, cx);
         cx.notify();
     }
 
@@ -1126,7 +1172,7 @@ impl Workspace {
         }
         self.tokens = Tokens::new(system);
         crate::theme::reapply(system, Some(window), cx);
-        self.sync_views(window, cx);
+        self.refresh_theme(window, cx);
         cx.notify();
     }
 
@@ -1255,7 +1301,7 @@ fn shell_paste(paste: Paste) -> Option<ShellPaste> {
 /// Returns `None` for the provider and search-engine events, which are drafts
 /// rather than preferences and need the settings view rather than a table.
 ///
-/// The host applies each of these and the snapshot comes back, so the control
+/// The host applies each of these and the projection comes back, so the control
 /// shows what was actually stored rather than what was clicked. The two the agent
 /// owns — auto-compaction and the queue modes — could never have been guessed
 /// locally anyway: they arrive through `RuntimeControlsUpdated` and the agent is
@@ -1545,7 +1591,7 @@ mod tests {
 
     #[test]
     fn a_stored_preference_is_persisted_rather_than_assumed() {
-        // The host writes it and the snapshot comes back, so the control cannot
+        // The host writes it and the projection comes back, so the control cannot
         // show a policy as set while the write that stores it failed.
         let command =
             preference_change(&SettingsEvent::SetBashPolicy(BashPolicy::Deny)).expect("a change");
@@ -1633,6 +1679,18 @@ mod tests {
         }
     }
 
+    fn apply_state(
+        workspace: &mut Workspace,
+        state: AppState,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        workspace.apply_navigation_projection(NavigationProjection::from_state(&state), window, cx);
+        workspace.apply_conversation_projection(ConversationProjection::from_state(&state), cx);
+        workspace.apply_runtime_projection(RuntimeProjection::from_state(&state), window, cx);
+        workspace.apply_settings_projection(SettingsProjection::from_state(&state), window, cx);
+    }
+
     #[gpui::test]
     async fn the_palette_runs_a_command_from_the_keyboard(cx: &mut gpui::TestAppContext) {
         // The keys are captured on the workspace's own element while the composer
@@ -1643,7 +1701,7 @@ mod tests {
 
         shell
             .update(cx, |workspace, window, cx| {
-                workspace.set_state(state_with_a_project(), window, cx);
+                apply_state(workspace, state_with_a_project(), window, cx);
                 workspace.handle_composer_event(ComposerEvent::TextChanged("/".to_owned()), cx);
 
                 let open = workspace.palette.read(cx).is_open();
@@ -1671,7 +1729,7 @@ mod tests {
 
         shell
             .update(cx, |workspace, window, cx| {
-                workspace.set_state(state_with_a_project(), window, cx);
+                apply_state(workspace, state_with_a_project(), window, cx);
                 workspace.handle_composer_event(ComposerEvent::TextChanged("/ex".to_owned()), cx);
                 assert!(workspace.palette.read(cx).is_open());
 
@@ -1755,7 +1813,7 @@ mod tests {
     async fn a_submitted_prompt_is_sent_and_not_shown_locally(cx: &mut gpui::TestAppContext) {
         // The application puts the prompt in the conversation as it sends it.
         // Showing it here as well would render it twice: once from the local copy
-        // and again from the snapshot that comes back.
+        // and again from the projection that comes back.
         let shell = shell(cx);
 
         shell
@@ -1807,7 +1865,8 @@ mod tests {
         shell
             .update(cx, |workspace, window, cx| {
                 let commands = signal_probe(workspace.app_commands());
-                workspace.set_state(
+                apply_state(
+                    workspace,
                     AppState {
                         session_status: SessionStatus::Streaming,
                         ..AppState::default()
@@ -1903,7 +1962,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn a_snapshot_replaces_what_is_shown(cx: &mut gpui::TestAppContext) {
+    async fn feature_projections_replace_what_is_shown(cx: &mut gpui::TestAppContext) {
         // The host owns the reducer, so this is how the shell learns about
         // anything it did not do itself.
         let shell = shell(cx);
@@ -1916,7 +1975,7 @@ mod tests {
                     session_status: SessionStatus::Streaming,
                     ..AppState::default()
                 };
-                workspace.set_state(state, window, cx);
+                apply_state(workspace, state, window, cx);
 
                 assert_eq!(workspace.state().selected_project, Some(project_id));
                 assert_eq!(workspace.state().session_status, SessionStatus::Streaming);
@@ -1946,7 +2005,8 @@ mod tests {
 
         shell
             .update(cx, |workspace, window, cx| {
-                workspace.set_state(
+                apply_state(
+                    workspace,
                     AppState {
                         selected_session: Some(stable_session_id("/tmp/first.jsonl")),
                         conversation: vec![message("m1")],
@@ -1961,7 +2021,8 @@ mod tests {
                     conversation.toggle_thinking("m1", 0, cx);
                 });
 
-                workspace.set_state(
+                apply_state(
+                    workspace,
                     AppState {
                         selected_session: Some(stable_session_id("/tmp/second.jsonl")),
                         conversation: vec![message("m1")],
@@ -2019,7 +2080,8 @@ mod tests {
         let shell = shell(cx);
         shell
             .update(cx, |workspace, window, cx| {
-                workspace.set_state(
+                apply_state(
+                    workspace,
                     AppState {
                         session_status: SessionStatus::Streaming,
                         ..AppState::default()
@@ -2098,7 +2160,8 @@ mod tests {
         shell
             .update(cx, |workspace, window, cx| {
                 let commands = signal_probe(workspace.app_commands());
-                workspace.set_state(
+                apply_state(
+                    workspace,
                     AppState {
                         session_status: SessionStatus::Ready,
                         ..AppState::default()

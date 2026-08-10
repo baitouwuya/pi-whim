@@ -2,7 +2,7 @@
 //!
 //! Split from [`crate::app`] because it is the only part that names a UI: typed
 //! app and shell command signals flow into the orchestration here, and state
-//! snapshots flow back to the view.
+//! ChangeSet-driven feature projections flow back to the view.
 //!
 //! There is no frame loop here. The egui build polled every session's channel and
 //! every control refresh once a frame, whether or not anything had arrived, and
@@ -14,11 +14,17 @@ use std::{collections::VecDeque, convert::Infallible, path::Path};
 
 use gpui::{ClipboardItem, Context, Entity, IntoElement, PathPromptOptions, Render, Task, Window};
 use pi_whim_core::{Attachment, SubmitMode};
-use pi_whim_engine::commands::{
-    AppCommand, CommandControlPolicy, CommandDiagnostic, CommandEnvelope, CommandLifecycle,
-    CommandStage, ShellCommand,
+use pi_whim_engine::{
+    ChangeSet,
+    commands::{
+        AppCommand, CommandControlPolicy, CommandDiagnostic, CommandEnvelope, CommandLifecycle,
+        CommandStage, ShellCommand,
+    },
 };
-use pi_whim_gpui::{SignalBridge, Workspace, pump};
+use pi_whim_gpui::{
+    ConversationProjection, NavigationProjection, RuntimeProjection, SettingsProjection,
+    SignalBridge, StateSignalBridge, Workspace, WorkspaceStateSelections, pump,
+};
 use pi_whim_one_shot_ai::MAX_ONE_SHOT_INPUT_BYTES;
 use pi_whim_persistence::session_title_context_from_jsonl;
 use pi_whim_runtime::{AgentRuntime, test_search_engine};
@@ -32,6 +38,10 @@ fn command_values<T>(events: Vec<SignalEvent<T, Infallible>>) -> impl Iterator<I
         SignalEvent::Error(error) => match error {},
         SignalEvent::Complete => None,
     })
+}
+
+fn latest_state_value<T>(events: Vec<SignalEvent<T, Infallible>>) -> Option<T> {
+    command_values(events).last()
 }
 
 #[derive(Clone, PartialEq)]
@@ -162,11 +172,22 @@ pub struct Host<R: AgentRuntime + 'static> {
     /// so owning them here is what stops every pump when the window goes away.
     #[allow(dead_code, reason = "held for cancellation, not for reading")]
     pumps: Vec<Task<()>>,
-    /// Retains the Workspace signal subscriptions for the Host lifetime.
+    /// Retains command and state subscriptions for the Host lifetime.
     #[allow(dead_code, reason = "held for signal subscription lifetime")]
     app_command_bridge: SignalBridge<AppCommand, Infallible>,
     #[allow(dead_code, reason = "held for signal subscription lifetime")]
     shell_command_bridge: SignalBridge<ShellCommand, Infallible>,
+    #[allow(dead_code, reason = "held for signal subscription lifetime")]
+    change_set_bridge: SignalBridge<ChangeSet, Infallible>,
+    state_selections: WorkspaceStateSelections,
+    #[allow(dead_code, reason = "held for state signal subscription lifetime")]
+    navigation_bridge: StateSignalBridge<NavigationProjection, Infallible>,
+    #[allow(dead_code, reason = "held for state signal subscription lifetime")]
+    conversation_bridge: StateSignalBridge<ConversationProjection, Infallible>,
+    #[allow(dead_code, reason = "held for state signal subscription lifetime")]
+    runtime_bridge: StateSignalBridge<RuntimeProjection, Infallible>,
+    #[allow(dead_code, reason = "held for state signal subscription lifetime")]
+    settings_bridge: StateSignalBridge<SettingsProjection, Infallible>,
     /// Gate/Transform commands waiting for the single background control slot.
     command_controls: OrderedControlQueue<QueuedCommandControl>,
     /// Metadata-only lifecycle observes, ordered but never awaited by handlers.
@@ -181,10 +202,20 @@ impl<R: AgentRuntime + 'static> Host<R> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        // Subscribe before the first snapshot reaches the shell so no UI command
+        // Subscribe before the first projection replay reaches the shell so no UI command
         // can be emitted between construction and Host ownership.
         let app_command_bridge = SignalBridge::new(&shell.read(cx).app_commands());
         let shell_command_bridge = SignalBridge::new(&shell.read(cx).shell_commands());
+        let state_selections = WorkspaceStateSelections::new(application.state());
+        let navigation_bridge = StateSignalBridge::new(&state_selections.navigation_signal())
+            .expect("navigation state bridge worker must start");
+        let conversation_bridge = StateSignalBridge::new(&state_selections.conversation_signal())
+            .expect("conversation state bridge worker must start");
+        let runtime_bridge = StateSignalBridge::new(&state_selections.runtime_signal())
+            .expect("runtime state bridge worker must start");
+        let settings_bridge = StateSignalBridge::new(&state_selections.settings_signal())
+            .expect("settings state bridge worker must start");
+        let change_set_bridge = SignalBridge::new(&application.change_sets());
 
         let pumps = vec![
             app_command_bridge.spawn(window, cx, |host, batch, window, cx| {
@@ -194,7 +225,7 @@ impl<R: AgentRuntime + 'static> Host<R> {
                     host.handle_app_command(command, window, cx);
                 }
                 if handled {
-                    host.publish(window, cx);
+                    host.flush_effects(window, cx);
                 }
             }),
             shell_command_bridge.spawn(window, cx, |host, batch, window, cx| {
@@ -204,7 +235,41 @@ impl<R: AgentRuntime + 'static> Host<R> {
                     host.handle_shell(command, window, cx);
                 }
                 if handled {
-                    host.publish(window, cx);
+                    host.flush_effects(window, cx);
+                }
+            }),
+            change_set_bridge.spawn(window, cx, |host, batch, _window, _cx| {
+                for change_set in command_values(batch) {
+                    host.state_selections
+                        .publish(&change_set, host.application.state());
+                }
+            }),
+            navigation_bridge.spawn(window, cx, |host, batch, window, cx| {
+                if let Some(projection) = latest_state_value(batch) {
+                    host.shell.update(cx, |shell, cx| {
+                        shell.apply_navigation_projection(projection, window, cx);
+                    });
+                }
+            }),
+            conversation_bridge.spawn(window, cx, |host, batch, _window, cx| {
+                if let Some(projection) = latest_state_value(batch) {
+                    host.shell.update(cx, |shell, cx| {
+                        shell.apply_conversation_projection(projection, cx);
+                    });
+                }
+            }),
+            runtime_bridge.spawn(window, cx, |host, batch, window, cx| {
+                if let Some(projection) = latest_state_value(batch) {
+                    host.shell.update(cx, |shell, cx| {
+                        shell.apply_runtime_projection(projection, window, cx);
+                    });
+                }
+            }),
+            settings_bridge.spawn(window, cx, |host, batch, window, cx| {
+                if let Some(projection) = latest_state_value(batch) {
+                    host.shell.update(cx, |shell, cx| {
+                        shell.apply_settings_projection(projection, window, cx);
+                    });
                 }
             }),
             pump::spawn(
@@ -213,7 +278,7 @@ impl<R: AgentRuntime + 'static> Host<R> {
                 cx,
                 |host, batch, window, cx| {
                     host.application.handle_deliveries(batch);
-                    host.publish(window, cx);
+                    host.flush_effects(window, cx);
                 },
             ),
             pump::spawn(
@@ -224,7 +289,7 @@ impl<R: AgentRuntime + 'static> Host<R> {
                     for (key, actions) in batch {
                         host.application.settle_controls(key, actions);
                     }
-                    host.publish(window, cx);
+                    host.flush_effects(window, cx);
                 },
             ),
             pump::spawn(
@@ -236,7 +301,7 @@ impl<R: AgentRuntime + 'static> Host<R> {
                         host.application
                             .settle_one_shot_install(generation, resolved);
                     }
-                    host.publish(window, cx);
+                    host.flush_effects(window, cx);
                 },
             ),
             pump::spawn(
@@ -245,7 +310,7 @@ impl<R: AgentRuntime + 'static> Host<R> {
                 cx,
                 |host, batch, window, cx| {
                     host.application.settle_one_shot_completions(batch);
-                    host.publish(window, cx);
+                    host.flush_effects(window, cx);
                 },
             ),
             // Fires once, when the models.dev catalog lands. The egui build asked
@@ -257,7 +322,7 @@ impl<R: AgentRuntime + 'static> Host<R> {
                 cx,
                 |host, _, window, cx| {
                     host.application.absorb_capability_catalog();
-                    host.publish(window, cx);
+                    host.flush_effects(window, cx);
                 },
             ),
         ];
@@ -268,20 +333,24 @@ impl<R: AgentRuntime + 'static> Host<R> {
             pumps,
             app_command_bridge,
             shell_command_bridge,
+            change_set_bridge,
+            state_selections,
+            navigation_bridge,
+            conversation_bridge,
+            runtime_bridge,
+            settings_bridge,
             command_controls: OrderedControlQueue::default(),
             lifecycle_observes: OrderedControlQueue::default(),
         };
-        host.publish(window, cx);
+        host.flush_effects(window, cx);
         host
     }
 
-    /// Show what the reducer now holds.
+    /// Deliver framework-bound effect outboxes after orchestration work.
     ///
-    /// Called after anything that could have applied an action. A snapshot per
-    /// batch rather than per action: a streaming turn applies several for one
-    /// visible change, and the shell's `set_state` compares before syncing.
-    fn publish(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let state = self.application.state().clone();
+    /// Committed domain state travels independently through ChangeSet-driven
+    /// feature projections; this method intentionally transports no AppState.
+    fn flush_effects(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let notices = self.application.take_notices();
         let prompts = self.application.take_prompts();
         let closed = self.application.take_closed_sessions();
@@ -297,7 +366,6 @@ impl<R: AgentRuntime + 'static> Host<R> {
             self.open_picker(picker, window, cx);
         }
         self.shell.update(cx, |shell, cx| {
-            shell.set_state(state, window, cx);
             for key in closed {
                 shell.forget_session(&key, cx);
             }
@@ -444,7 +512,7 @@ impl<R: AgentRuntime + 'static> Host<R> {
                 host.command_controls.finish_current();
                 host.finish_command_control(completion, lifecycle, prompt_draft, window, cx);
                 host.start_next_command_control(window, cx);
-                host.publish(window, cx);
+                host.flush_effects(window, cx);
             });
         })
         .detach();
@@ -566,7 +634,7 @@ impl<R: AgentRuntime + 'static> Host<R> {
                     let _ = host.update_in(cx, |host, window, cx| {
                         host.application
                             .start_smart_session_rename(project_id, path, title, context);
-                        host.publish(window, cx);
+                        host.flush_effects(window, cx);
                     });
                 })
                 .detach();
@@ -626,7 +694,7 @@ impl<R: AgentRuntime + 'static> Host<R> {
                                         profile_id, editor, result, cx,
                                     );
                                 });
-                                host.publish(window, cx);
+                                host.flush_effects(window, cx);
                             });
                         })
                         .detach();
@@ -695,7 +763,7 @@ impl<R: AgentRuntime + 'static> Host<R> {
             };
             let _ = host.update_in(cx, |host, window, cx| {
                 host.application.picked(picker, paths);
-                host.publish(window, cx);
+                host.flush_effects(window, cx);
             });
         })
         .detach();

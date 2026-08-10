@@ -11,15 +11,17 @@ use pi_whim_core::{
     Project, QueueMode, SessionStatus, SessionSummary, ThinkingLevel, stable_session_id,
 };
 use pi_whim_engine::dialogs::Prompt;
-use pi_whim_gpui::Workspace;
+use pi_whim_gpui::{
+    ConversationProjection, NavigationProjection, RuntimeProjection, SettingsProjection, Workspace,
+};
 use pi_whim_theme::ThemePreference;
 use uuid::Uuid;
 
 /// Populate the shell with a short conversation, so the preview shows the
 /// layout rather than an empty window.
 ///
-/// The state is built here and handed over whole, the same way the host does it:
-/// the shell has no reducer of its own to feed actions to.
+/// The preview state is split into the same typed feature projections the Host
+/// replays from committed changes; the shell still has no reducer of its own.
 fn seed(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
     let mut state = AppState::default();
     let project = Project {
@@ -148,7 +150,10 @@ fn seed(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspa
         attachments: Vec::new(),
     }));
 
-    workspace.set_state(state, window, cx);
+    workspace.apply_navigation_projection(NavigationProjection::from_state(&state), window, cx);
+    workspace.apply_conversation_projection(ConversationProjection::from_state(&state), cx);
+    workspace.apply_runtime_projection(RuntimeProjection::from_state(&state), window, cx);
+    workspace.apply_settings_projection(SettingsProjection::from_state(&state), window, cx);
 }
 
 fn main() {
