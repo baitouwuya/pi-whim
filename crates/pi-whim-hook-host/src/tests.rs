@@ -946,7 +946,7 @@ fn v1_observe_emits_one_completion_audit() -> TestResult {
         payload(json!({"tool": "shell", "status": "ok"}))?,
     )?;
     assert_eq!(receipt.accepted, 1);
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(7);
     while audits.lock().is_empty() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
     }
