@@ -1,8 +1,8 @@
 //! The window, and the wiring between it and the orchestration.
 //!
-//! Split from [`crate::app`] because it is the only part that names a UI: the
-//! orchestration reaches the view through `state()` / `apply()` and a queue of
-//! requests, and this is where those two ends meet.
+//! Split from [`crate::app`] because it is the only part that names a UI: typed
+//! app and shell command signals flow into the orchestration here, and state
+//! snapshots flow back to the view.
 //!
 //! There is no frame loop here. The egui build polled every session's channel and
 //! every control refresh once a frame, whether or not anything had arrived, and
@@ -10,154 +10,28 @@
 //! do the waking: [`pi_whim_gpui::pump`] blocks on a background thread and returns
 //! to the main thread with each batch, so an idle app costs nothing.
 
-use std::{collections::VecDeque, path::Path};
+use std::{collections::VecDeque, convert::Infallible, path::Path};
 
 use gpui::{ClipboardItem, Context, Entity, IntoElement, PathPromptOptions, Render, Task, Window};
 use pi_whim_core::{Attachment, SubmitMode};
 use pi_whim_engine::commands::{
     AppCommand, CommandControlPolicy, CommandDiagnostic, CommandEnvelope, CommandLifecycle,
-    CommandStage, ShellCommand, ShellPaste,
+    CommandStage, ShellCommand,
 };
-use pi_whim_gpui::{Request, RequestsRaised, Workspace, chat::Paste, pump};
+use pi_whim_gpui::{SignalBridge, Workspace, pump};
 use pi_whim_one_shot_ai::MAX_ONE_SHOT_INPUT_BYTES;
 use pi_whim_persistence::session_title_context_from_jsonl;
 use pi_whim_runtime::{AgentRuntime, test_search_engine};
+use pi_whim_signal::SignalEvent;
 
 use crate::app::{CommandHookController, CommandHookError, PiWhimApplication, Picker};
 
-enum RequestRoute {
-    App(AppCommand),
-    Shell(ShellCommand),
-    SubmitPrompt {
-        content: String,
-        attachments: Vec<Attachment>,
-        mode: SubmitMode,
-    },
-    InsertPasteHandledByComposer,
-}
-
-fn adapt_request(request: Request) -> RequestRoute {
-    match request {
-        Request::AddProject => RequestRoute::Shell(ShellCommand::AddProject),
-        Request::NewSession(project_id) => RequestRoute::App(AppCommand::NewSession(project_id)),
-        Request::OpenProject(project_id) => RequestRoute::App(AppCommand::OpenProject(project_id)),
-        Request::SetModel(model) => RequestRoute::App(AppCommand::SetModel(model)),
-        Request::SetThinkingLevel(level) => RequestRoute::App(AppCommand::SetThinkingLevel(level)),
-        Request::SetQueueModes {
-            steering,
-            follow_up,
-        } => RequestRoute::App(AppCommand::SetQueueModes {
-            steering,
-            follow_up,
-        }),
-        Request::RunCommand(command) => RequestRoute::App(AppCommand::RunSlashCommand(command)),
-        Request::RevealProject(project_id) => {
-            RequestRoute::Shell(ShellCommand::RevealProject(project_id))
-        }
-        Request::RemoveProject(project_id) => {
-            RequestRoute::App(AppCommand::RemoveProject(project_id))
-        }
-        Request::RenameSession { path, title } => {
-            RequestRoute::App(AppCommand::RenameSession { path, title })
-        }
-        Request::SmartRenameSession {
-            project_id,
-            path,
-            title,
-        } => RequestRoute::Shell(ShellCommand::SmartRenameSession {
-            project_id,
-            path,
-            title,
-        }),
-        Request::CloneSession => RequestRoute::App(AppCommand::CloneSession),
-        Request::CopyToClipboard(text) => RequestRoute::Shell(ShellCommand::CopyToClipboard(text)),
-        Request::DeleteSession(path) => RequestRoute::App(AppCommand::DeleteSession(path)),
-        Request::AnswerPrompt(answer) => RequestRoute::App(AppCommand::AnswerPrompt(answer)),
-        Request::AttachPaste(paste) => match shell_paste(paste) {
-            Some(paste) => RequestRoute::Shell(ShellCommand::AttachPaste(paste)),
-            None => RequestRoute::InsertPasteHandledByComposer,
-        },
-        Request::PickAttachments => RequestRoute::Shell(ShellCommand::PickAttachments),
-        Request::DiscardAttachment(path) => RequestRoute::App(AppCommand::DiscardAttachment(path)),
-        Request::SubmitPrompt {
-            content,
-            attachments,
-            mode,
-        } => RequestRoute::SubmitPrompt {
-            content,
-            attachments,
-            mode,
-        },
-        Request::ActivateSession { project_id, path } => {
-            RequestRoute::App(AppCommand::ActivateSession { project_id, path })
-        }
-        Request::Stop => RequestRoute::App(AppCommand::Stop),
-        Request::ClearQueue => RequestRoute::App(AppCommand::ClearQueue),
-        Request::SetLanguage(language) => RequestRoute::App(AppCommand::SetLanguage(language)),
-        Request::SetBashPolicy(policy) => RequestRoute::App(AppCommand::SetBashPolicy(policy)),
-        Request::SetBlockedPatterns(patterns) => {
-            RequestRoute::App(AppCommand::SetBlockedPatterns(patterns))
-        }
-        Request::SetPermissionLevel(level) => {
-            RequestRoute::App(AppCommand::SetPermissionLevel(level))
-        }
-        Request::SetAgentTeamConfig(config) => {
-            RequestRoute::App(AppCommand::SetAgentTeamConfig(config))
-        }
-        Request::ApproveProjectHooks { fingerprint } => {
-            RequestRoute::App(AppCommand::ApproveProjectHooks { fingerprint })
-        }
-        Request::RevokeProjectHooks => RequestRoute::App(AppCommand::RevokeProjectHooks),
-        Request::SetOneShotAiConfig(config) => {
-            RequestRoute::App(AppCommand::SetOneShotAiConfig(config))
-        }
-        Request::SetAutoCompaction(enabled) => {
-            RequestRoute::App(AppCommand::SetAutoCompaction(enabled))
-        }
-        Request::SaveProvider { profile, api_key } => {
-            RequestRoute::Shell(ShellCommand::SaveProvider { profile, api_key })
-        }
-        Request::DeleteProvider(profile_id) => {
-            RequestRoute::App(AppCommand::DeleteProvider(profile_id))
-        }
-        Request::SaveSearchEngines(profiles) => {
-            RequestRoute::App(AppCommand::SaveSearchEngines(profiles))
-        }
-        Request::SaveSearchEngine { profile, api_key } => {
-            RequestRoute::Shell(ShellCommand::SaveSearchEngine { profile, api_key })
-        }
-        Request::TestSearchEngine {
-            profile,
-            api_key,
-            editor,
-        } => RequestRoute::Shell(ShellCommand::TestSearchEngine {
-            profile,
-            api_key,
-            editor,
-        }),
-        Request::DiscoverProviderModels {
-            profile_id,
-            provider_name,
-            base_url,
-            protocol,
-            api_key,
-        } => RequestRoute::Shell(ShellCommand::DiscoverProviderModels {
-            profile_id,
-            provider_name,
-            base_url,
-            protocol,
-            api_key,
-        }),
-    }
-}
-
-fn shell_paste(paste: Paste) -> Option<ShellPaste> {
-    match paste {
-        Paste::Insert => None,
-        Paste::Files(paths) => Some(ShellPaste::Files(paths)),
-        Paste::Image { extension, bytes } => Some(ShellPaste::Image { extension, bytes }),
-        Paste::LongText(text) => Some(ShellPaste::LongText(text)),
-    }
+fn command_values<T>(events: Vec<SignalEvent<T, Infallible>>) -> impl Iterator<Item = T> {
+    events.into_iter().filter_map(|event| match event {
+        SignalEvent::Next(command) => Some(command),
+        SignalEvent::Error(error) => match error {},
+        SignalEvent::Complete => None,
+    })
 }
 
 #[derive(Clone, PartialEq)]
@@ -165,6 +39,31 @@ struct PromptDraft {
     content: String,
     attachments: Vec<Attachment>,
     mode: SubmitMode,
+}
+
+fn preserve_prompt_draft(command: AppCommand) -> (AppCommand, Option<PromptDraft>) {
+    match command {
+        AppCommand::SubmitPrompt {
+            content,
+            attachments,
+            mode,
+        } => {
+            let draft = PromptDraft {
+                content,
+                attachments,
+                mode,
+            };
+            (
+                AppCommand::SubmitPrompt {
+                    content: draft.content.clone(),
+                    attachments: draft.attachments.clone(),
+                    mode: draft.mode,
+                },
+                Some(draft),
+            )
+        }
+        command => (command, None),
+    }
 }
 
 struct QueuedCommandControl {
@@ -251,9 +150,9 @@ fn prompt_route_is_current(
 
 /// The window's view, and what it drives.
 ///
-/// One entity holding both, rather than the application observing the shell: the
-/// requests go one way and the state snapshots come back, and a single owner is
-/// what keeps the order of those two unambiguous.
+/// One entity owns both typed command signal bridges and the state projection.
+/// Each app or shell signal preserves its own FIFO order; safety app commands use
+/// the existing bypass path, without promising ordering across the two lanes.
 pub struct Host<R: AgentRuntime + 'static> {
     application: PiWhimApplication<R>,
     shell: Entity<Workspace>,
@@ -263,6 +162,11 @@ pub struct Host<R: AgentRuntime + 'static> {
     /// so owning them here is what stops every pump when the window goes away.
     #[allow(dead_code, reason = "held for cancellation, not for reading")]
     pumps: Vec<Task<()>>,
+    /// Retains the Workspace signal subscriptions for the Host lifetime.
+    #[allow(dead_code, reason = "held for signal subscription lifetime")]
+    app_command_bridge: SignalBridge<AppCommand, Infallible>,
+    #[allow(dead_code, reason = "held for signal subscription lifetime")]
+    shell_command_bridge: SignalBridge<ShellCommand, Infallible>,
     /// Gate/Transform commands waiting for the single background control slot.
     command_controls: OrderedControlQueue<QueuedCommandControl>,
     /// Metadata-only lifecycle observes, ordered but never awaited by handlers.
@@ -277,14 +181,32 @@ impl<R: AgentRuntime + 'static> Host<R> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        // Subscribed before the first push, so a request raised while the state is
-        // still being seeded is not lost.
-        cx.subscribe_in(&shell, window, |host, _, _: &RequestsRaised, window, cx| {
-            host.drain(window, cx);
-        })
-        .detach();
+        // Subscribe before the first snapshot reaches the shell so no UI command
+        // can be emitted between construction and Host ownership.
+        let app_command_bridge = SignalBridge::new(&shell.read(cx).app_commands());
+        let shell_command_bridge = SignalBridge::new(&shell.read(cx).shell_commands());
 
         let pumps = vec![
+            app_command_bridge.spawn(window, cx, |host, batch, window, cx| {
+                let mut handled = false;
+                for command in command_values(batch) {
+                    handled = true;
+                    host.handle_app_command(command, window, cx);
+                }
+                if handled {
+                    host.publish(window, cx);
+                }
+            }),
+            shell_command_bridge.spawn(window, cx, |host, batch, window, cx| {
+                let mut handled = false;
+                for command in command_values(batch) {
+                    handled = true;
+                    host.handle_shell(command, window, cx);
+                }
+                if handled {
+                    host.publish(window, cx);
+                }
+            }),
             pump::spawn(
                 application.session_events(),
                 window,
@@ -344,6 +266,8 @@ impl<R: AgentRuntime + 'static> Host<R> {
             application,
             shell,
             pumps,
+            app_command_bridge,
+            shell_command_bridge,
             command_controls: OrderedControlQueue::default(),
             lifecycle_observes: OrderedControlQueue::default(),
         };
@@ -393,73 +317,35 @@ impl<R: AgentRuntime + 'static> Host<R> {
                 }
             }
         });
-        // The shell may have raised requests while being told any of that — a
-        // cleared draft, a dismissed prompt — so drain before yielding.
-        self.drain_once(window, cx);
     }
 
-    /// Carry out everything the shell has asked for, then show the result.
-    fn drain(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.drain_once(window, cx);
-        self.publish(window, cx);
-    }
+    /// Carry out one typed domain command from the Workspace signal.
+    fn handle_app_command(
+        &mut self,
+        command: AppCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (command, prompt_draft) = preserve_prompt_draft(command);
+        if let Some(draft) = prompt_draft {
+            let envelope = self.application.ui_command_envelope(command);
+            let lifecycle = CommandLifecycle::submitted(&envelope);
+            self.emit_command_lifecycle(lifecycle.clone(), window, cx);
 
-    /// Carry out what has been asked for without publishing.
-    ///
-    /// Separate from [`Self::drain`] so `publish` can use it without recursing:
-    /// handling a request can produce another, and a request that publishes which
-    /// drains which publishes would not terminate.
-    fn drain_once(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let requests = self.shell.update(cx, |shell, _| shell.take_requests());
-        for request in requests {
-            self.handle(request, window, cx);
-        }
-    }
-
-    /// Carry out one request.
-    ///
-    /// Most go straight to the orchestration, which owns the store, the pool, and
-    /// the keychain. The few that stay here are the ones whose answer is a change
-    /// to the view rather than to the domain.
-    fn handle(&mut self, request: Request, window: &mut Window, cx: &mut Context<Self>) {
-        match adapt_request(request) {
-            RequestRoute::App(command) => {
-                self.submit_app_command(command, None, window, cx);
+            // The composer cleared only after its readiness check. Recheck
+            // before Hook control and restore the exact original draft if
+            // the signal delivery lost its session.
+            if !prompt_route_is_current(
+                envelope.project_id(),
+                self.application.state().selected_project,
+                self.application.can_submit_prompt(),
+            ) {
+                self.fail_submission(lifecycle, draft, window, cx);
+            } else {
+                self.dispatch_envelope(envelope, lifecycle, Some(draft), window, cx);
             }
-            RequestRoute::Shell(command) => self.handle_shell(command, window, cx),
-            RequestRoute::SubmitPrompt {
-                content,
-                attachments,
-                mode,
-            } => {
-                let draft = PromptDraft {
-                    content,
-                    attachments,
-                    mode,
-                };
-                let command = AppCommand::SubmitPrompt {
-                    content: draft.content.clone(),
-                    attachments: draft.attachments.clone(),
-                    mode: draft.mode,
-                };
-                let envelope = self.application.ui_command_envelope(command);
-                let lifecycle = CommandLifecycle::submitted(&envelope);
-                self.emit_command_lifecycle(lifecycle.clone(), window, cx);
-
-                // The composer cleared only after its readiness check. Recheck
-                // before Hook control and restore the exact original draft if
-                // the queued request lost its session.
-                if !prompt_route_is_current(
-                    envelope.project_id(),
-                    self.application.state().selected_project,
-                    self.application.can_submit_prompt(),
-                ) {
-                    self.fail_submission(lifecycle, draft, window, cx);
-                } else {
-                    self.dispatch_envelope(envelope, lifecycle, Some(draft), window, cx);
-                }
-            }
-            RequestRoute::InsertPasteHandledByComposer => {}
+        } else {
+            self.submit_app_command(command, None, window, cx);
         }
     }
 
@@ -830,55 +716,51 @@ impl<R: AgentRuntime + 'static> Render for Host<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pi_whim_core::{AttachmentKind, ProviderProfile, ProviderProtocol, SubmitMode};
-    use pi_whim_engine::{commands::CommandControlPolicy, slash_commands::SlashCommand};
+    use pi_whim_core::{AttachmentKind, SubmitMode};
     use uuid::Uuid;
 
     #[test]
-    fn domain_adapter_preserves_typed_and_safety_commands() {
-        for request in [
-            Request::Stop,
-            Request::ClearQueue,
-            Request::RevokeProjectHooks,
-        ] {
-            let RequestRoute::App(command) = adapt_request(request) else {
-                panic!("safety request must map to AppCommand");
-            };
-            assert!(command.is_safety_command());
-            assert_eq!(command.control_policy(), CommandControlPolicy::Bypass);
-        }
+    fn command_signal_values_preserve_fifo_and_ignore_completion() {
+        let commands: Vec<_> = command_values(vec![
+            SignalEvent::Next(AppCommand::Stop),
+            SignalEvent::Next(AppCommand::ClearQueue),
+            SignalEvent::Complete,
+        ])
+        .collect();
 
-        let RequestRoute::App(AppCommand::RunSlashCommand(command)) =
-            adapt_request(Request::RunCommand(SlashCommand::ShowHotkeys))
-        else {
-            panic!("slash command must map to RunSlashCommand");
-        };
-        assert_eq!(command, SlashCommand::ShowHotkeys);
+        assert_eq!(commands, vec![AppCommand::Stop, AppCommand::ClearQueue]);
     }
 
     #[test]
-    fn submit_prompt_adapter_preserves_draft_for_host_readiness_check() {
+    fn typed_prompt_signal_preserves_original_draft_for_recovery() {
         let attachment = Attachment {
             name: "notes.txt".into(),
             path: "/tmp/notes.txt".into(),
             kind: AttachmentKind::File,
             generated_by_app: false,
         };
-        let RequestRoute::SubmitPrompt {
-            content,
-            attachments,
-            mode,
-        } = adapt_request(Request::SubmitPrompt {
+        let (command, draft) = preserve_prompt_draft(AppCommand::SubmitPrompt {
             content: "keep this exact draft".into(),
             attachments: vec![attachment.clone()],
             mode: SubmitMode::FollowUp,
-        })
+        });
+        let Some(draft) = draft else {
+            panic!("typed prompt must retain the Host recovery draft");
+        };
+        let AppCommand::SubmitPrompt {
+            content,
+            attachments,
+            mode,
+        } = command
         else {
-            panic!("submit prompt must retain the host readiness seam");
+            panic!("typed prompt variant must be preserved");
         };
         assert_eq!(content, "keep this exact draft");
-        assert_eq!(attachments, vec![attachment]);
+        assert_eq!(attachments, vec![attachment.clone()]);
         assert_eq!(mode, SubmitMode::FollowUp);
+        assert_eq!(draft.content, "keep this exact draft");
+        assert_eq!(draft.attachments, vec![attachment]);
+        assert_eq!(draft.mode, SubmitMode::FollowUp);
     }
 
     #[test]
@@ -943,61 +825,5 @@ mod tests {
             false
         ));
         assert!(!prompt_route_is_current(None, Some(expected), true));
-    }
-
-    #[test]
-    fn shell_paste_conversion_is_lossless_and_debug_is_redacted() {
-        let bytes = vec![0, 1, 2, 254, 255];
-        let image = shell_paste(Paste::Image {
-            extension: "png".into(),
-            bytes: bytes.clone(),
-        });
-        assert_eq!(
-            image,
-            Some(ShellPaste::Image {
-                extension: "png".into(),
-                bytes,
-            })
-        );
-        assert_eq!(
-            shell_paste(Paste::Files(vec!["/tmp/a".into(), "/tmp/b".into()])),
-            Some(ShellPaste::Files(vec!["/tmp/a".into(), "/tmp/b".into()]))
-        );
-        assert_eq!(
-            shell_paste(Paste::LongText("paste-secret-99c1".into())),
-            Some(ShellPaste::LongText("paste-secret-99c1".into()))
-        );
-        assert_eq!(shell_paste(Paste::Insert), None);
-
-        let command = ShellCommand::SaveProvider {
-            profile: ProviderProfile {
-                id: Uuid::nil(),
-                name: "provider".into(),
-                base_url: "https://private.invalid".into(),
-                protocol: ProviderProtocol::OpenAiCompletions,
-                models: Vec::new(),
-                updated_at_ms: 0,
-                has_api_key: true,
-            },
-            api_key: Some("api-key-secret-70af".into()),
-        };
-        let debug = format!("{command:?}");
-        assert!(debug.contains("shell.provider.save"));
-        assert!(!debug.contains("api-key-secret-70af"));
-        assert!(!debug.contains("private.invalid"));
-
-        let clipboard = ShellCommand::CopyToClipboard("clipboard-secret-51de".into());
-        assert!(!format!("{clipboard:?}").contains("clipboard-secret-51de"));
-        assert!(
-            !format!("{:?}", ShellPaste::LongText("paste-secret-99c1".into()))
-                .contains("paste-secret-99c1")
-        );
-        assert!(
-            !format!(
-                "{:?}",
-                ShellPaste::Files(vec!["/private/secret.txt".into()])
-            )
-            .contains("/private/secret.txt")
-        );
     }
 }

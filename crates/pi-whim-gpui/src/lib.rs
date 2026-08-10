@@ -22,7 +22,7 @@ pub mod theme;
 mod workspace;
 
 pub use signal_bridge::{SignalBridge, StateSignalBridge};
-pub use workspace::{Request, RequestsRaised, Workspace};
+pub use workspace::Workspace;
 
 use gpui::{App, Bounds, WindowBounds, WindowOptions, px, size};
 use pi_whim_theme::ThemePreference;

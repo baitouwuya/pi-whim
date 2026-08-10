@@ -8,22 +8,25 @@ use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AppContext, Context, Entity, EventEmitter, InteractiveElement, IntoElement, ParentElement,
-    Render, Styled, Window, div, prelude::FluentBuilder, px,
+    AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render, Styled,
+    Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::{
     input::{Enter, IndentInline, MoveDown, MoveUp},
     theme::{Theme as ComponentTheme, ThemeMode as ComponentMode},
 };
 use pi_whim_core::{
-    AgentPermissionLevel, AgentTeamConfig, AppState, Attachment, BashPolicy, Language, ModelOption,
-    OneShotAiConfig, ProjectId, ProviderId, ProviderProfile, ProviderProtocol, QueueMode,
-    SearchEngineProfile, SessionStatus, SubmitMode, ThinkingLevel, strings::text as translate,
+    AppState, Attachment, ProjectId, ProviderId, SessionStatus, SubmitMode,
+    strings::text as translate,
 };
-use pi_whim_engine::dialogs::{Answer, Prompt};
 use pi_whim_engine::notice::Outbox;
 use pi_whim_engine::session::now_ms;
 use pi_whim_engine::slash_commands::{self, SlashCommand};
+use pi_whim_engine::{
+    commands::{AppCommand, ShellCommand, ShellPaste},
+    dialogs::Prompt,
+};
+use pi_whim_signal::{Signal, SignalEmitter};
 use pi_whim_theme::{ThemeMode, ThemePreference, Tokens, text};
 
 use crate::{
@@ -85,156 +88,10 @@ fn escape_plan(busy: bool, composer_focused: bool, has_draft: bool, double: bool
 const PROMPT_GAP: f32 = 16.0;
 const PROMPT_MARGIN: f32 = 10.0;
 
-/// Something the shell cannot do itself, queued for whoever owns the backend.
+/// The application shell emits framework-independent typed commands.
 ///
-/// Adding a project opens a folder picker and writes to the store; starting a
-/// session launches a Pi process. Both live behind `AgentRuntime`, which this
-/// crate deliberately does not depend on, so the views record the request and the
-/// app drains it. This is the same pull model the egui build used for `UiIntent`,
-/// kept only for the actions that genuinely cross the boundary.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Request {
-    /// Ask for a folder, and add it as a project.
-    AddProject,
-    /// Start a fresh session in a project.
-    NewSession(ProjectId),
-    /// Show a project and make sure it has a running session.
-    ///
-    /// Separate from [`Request::NewSession`] because opening reuses whatever is
-    /// already there — only an empty project gets a new process.
-    OpenProject(ProjectId),
-    /// Switch which model answers. The host defers this until the next prompt so
-    /// the prior model compacts the history first.
-    SetModel(ModelOption),
-    SetThinkingLevel(ThinkingLevel),
-    SetQueueModes {
-        steering: QueueMode,
-        follow_up: QueueMode,
-    },
-    /// Run a slash command. Every one of these needs the store, the clipboard, or
-    /// an RPC, so the shell does not try to interpret them.
-    RunCommand(SlashCommand),
-    /// Show a project's folder in Finder.
-    RevealProject(ProjectId),
-    /// Forget a project. Its sessions stop; the folder on disk is left alone.
-    RemoveProject(ProjectId),
-    /// Store a new title for the session at `path`.
-    RenameSession {
-        path: String,
-        title: String,
-    },
-    /// Read a session transcript off the UI thread and generate a replacement title.
-    SmartRenameSession {
-        project_id: ProjectId,
-        path: String,
-        title: String,
-    },
-    /// Copy the visible session's transcript into a new one.
-    CloneSession,
-    /// Put text on the clipboard.
-    ///
-    /// Kept as a request rather than written here: gpui can write the clipboard,
-    /// but what goes on it — a session id, the last reply — is decided beside the
-    /// data, and the host is where that is.
-    CopyToClipboard(String),
-    /// Move a session's transcript to the trash.
-    DeleteSession(String),
-    /// Send a decision back to the agent that asked for it.
-    AnswerPrompt(Answer),
-    /// Turn a paste into an attachment. Copied files need canonicalizing and
-    /// pasted bytes need writing, both of which need the attachment store.
-    AttachPaste(Paste),
-    /// Ask for things on disk to attach — files, folders, or both.
-    ///
-    /// The picker is the platform's, and opening one needs the window, so this
-    /// crosses the boundary rather than happening where a view is rendered.
-    PickAttachments,
-    /// Delete an attachment the app wrote, now that the draft has dropped it.
-    ///
-    /// Only for the generated ones — a pasted image, a long paste saved to a file.
-    /// A file the reader attached from disk is theirs, and removing it from the
-    /// draft must not remove it from their computer.
-    DiscardAttachment(String),
-    /// Send the drafted prompt to the agent.
-    ///
-    /// The application owns both the optimistic transcript entry and the RPC so
-    /// the visible message cannot diverge from the accepted submission.
-    SubmitPrompt {
-        content: String,
-        attachments: Vec<Attachment>,
-        mode: SubmitMode,
-    },
-    /// Bind the conversation to an already-pooled session.
-    ///
-    /// Selecting one is the shell's, but the process behind it is the host's: the
-    /// pool decides which is visible and the transcript has to be re-read.
-    ActivateSession {
-        project_id: ProjectId,
-        path: String,
-    },
-    /// Interrupt the turn in flight.
-    Stop,
-    /// Drop every queued steering and follow-up message.
-    ClearQueue,
-
-    // The settings page's requests. Preferences are stored as well as applied,
-    // and some of them are process launch flags, so each of these is a change the
-    // host makes rather than one the shell can make and report.
-    SetLanguage(Language),
-    SetBashPolicy(BashPolicy),
-    SetBlockedPatterns(Vec<String>),
-    /// Change the default permission for agents spawned from live sessions.
-    ///
-    /// Kept separate from `SetAgentTeamConfig`: this setting can be applied to
-    /// running supervisors without restarting Pi or disturbing a turn.
-    SetPermissionLevel(AgentPermissionLevel),
-    SetAgentTeamConfig(AgentTeamConfig),
-    ApproveProjectHooks {
-        fingerprint: String,
-    },
-    RevokeProjectHooks,
-    SetOneShotAiConfig(OneShotAiConfig),
-    SetAutoCompaction(bool),
-    /// Store a provider, and its key if one was typed.
-    SaveProvider {
-        profile: ProviderProfile,
-        api_key: Option<String>,
-    },
-    DeleteProvider(ProviderId),
-    /// Store the whole search-engine list, which is how a reorder and a delete
-    /// are saved too.
-    SaveSearchEngines(Vec<SearchEngineProfile>),
-    /// Store one search engine and its newly typed credential, if any.
-    SaveSearchEngine {
-        profile: SearchEngineProfile,
-        api_key: Option<String>,
-    },
-    /// Check that a configured search adapter returns valid results.
-    TestSearchEngine {
-        profile: SearchEngineProfile,
-        api_key: Option<String>,
-        /// Whether the result belongs in the open editor or a stored list row.
-        editor: bool,
-    },
-    /// Ask a provider which models it has.
-    DiscoverProviderModels {
-        profile_id: Option<ProviderId>,
-        provider_name: String,
-        base_url: String,
-        protocol: ProviderProtocol,
-        api_key: Option<String>,
-    },
-}
-
-/// The shell reporting that it has something for the host to carry out.
-///
-/// A bare signal rather than the request itself: it is already on a queue the
-/// host drains, and carrying it in the event as well would give two paths to the
-/// same work. Notification is not enough on its own — the host answers by handing
-/// back a snapshot, which notifies again, and an observer would loop.
-pub struct RequestsRaised;
-
-/// The application shell.
+/// Domain commands and platform/credential commands use separate reliable
+/// signals so only [`AppCommand`] can enter application Hook control.
 pub struct Workspace {
     preference: ThemePreference,
     tokens: Tokens,
@@ -268,13 +125,13 @@ pub struct Workspace {
     /// Projects whose sessions are listed. View-local: which projects a reader
     /// has open says nothing about the session.
     expanded_projects: BTreeSet<ProjectId>,
-    /// Requests waiting for the backend owner to drain.
-    requests: Vec<Request>,
+    app_commands: Signal<AppCommand>,
+    app_command_emitter: SignalEmitter<AppCommand>,
+    shell_commands: Signal<ShellCommand>,
+    shell_command_emitter: SignalEmitter<ShellCommand>,
     /// When Escape last interrupted a turn, for telling one press from two.
     last_escape: Option<Instant>,
 }
-
-impl EventEmitter<RequestsRaised> for Workspace {}
 
 impl Workspace {
     pub fn new(preference: ThemePreference, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -325,10 +182,13 @@ impl Workspace {
                     // The backend owns the transcript and Pi's `fork` request.
                     // Routing through the existing slash command keeps session
                     // re-keying and indexing in one place.
-                    workspace.request(Request::RunCommand(SlashCommand::Fork(id.clone())), cx);
+                    workspace.emit_app_command(
+                        AppCommand::RunSlashCommand(SlashCommand::Fork(id.clone())),
+                        cx,
+                    );
                 }
                 ConversationEvent::ClearQueue => {
-                    workspace.request(Request::ClearQueue, cx);
+                    workspace.emit_app_command(AppCommand::ClearQueue, cx);
                 }
                 ConversationEvent::CopyAssistant(id) => {
                     let text = conversation
@@ -338,7 +198,7 @@ impl Workspace {
                         .find(|message| message.id == *id)
                         .map(|message| message.full_text.clone());
                     if let Some(text) = text {
-                        workspace.request(Request::CopyToClipboard(text), cx);
+                        workspace.emit_shell_command(ShellCommand::CopyToClipboard(text), cx);
                     }
                 }
             }
@@ -369,7 +229,7 @@ impl Workspace {
             let PromptEvent::Answered(answer) = event;
             // Straight through: the shell has no session pool, and an unanswered
             // question leaves the agent that asked it blocked.
-            workspace.request(Request::AnswerPrompt(answer.clone()), cx);
+            workspace.emit_app_command(AppCommand::AnswerPrompt(answer.clone()), cx);
             // The composer takes its place back once nothing is left to ask.
             if !workspace.prompts.read(cx).is_asking() {
                 workspace.focus_composer(window, cx);
@@ -380,8 +240,8 @@ impl Workspace {
         let rename = cx.new(|cx| Rename::new(tokens, window, cx));
         cx.subscribe(&rename, |workspace, _, event, cx| {
             let RenameEvent::Renamed { path, title } = event;
-            workspace.request(
-                Request::RenameSession {
+            workspace.emit_app_command(
+                AppCommand::RenameSession {
                     path: path.clone(),
                     title: title.clone(),
                 },
@@ -397,6 +257,8 @@ impl Workspace {
         })
         .detach();
 
+        let (app_commands, app_command_emitter) = Signal::channel();
+        let (shell_commands, shell_command_emitter) = Signal::channel();
         Self {
             preference,
             tokens,
@@ -413,7 +275,10 @@ impl Workspace {
             notices: Outbox::new(),
             dismissed_error: None,
             expanded_projects: BTreeSet::new(),
-            requests: Vec::new(),
+            app_commands,
+            app_command_emitter,
+            shell_commands,
+            shell_command_emitter,
             last_escape: None,
         }
     }
@@ -460,15 +325,27 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Queue something for the host, and tell it there is something to take.
-    ///
-    /// Every request goes through here so the signal cannot be forgotten at one
-    /// call site out of twenty-six — a queued request the host is never told about
-    /// waits until the next unrelated one arrives.
-    fn request(&mut self, request: Request, cx: &mut Context<Self>) {
-        self.requests.push(request);
-        cx.emit(RequestsRaised);
-        cx.notify();
+    /// Subscribe to reliable application-domain commands.
+    pub fn app_commands(&self) -> Signal<AppCommand> {
+        self.app_commands.clone()
+    }
+
+    /// Subscribe to reliable platform and credential-bearing commands.
+    pub fn shell_commands(&self) -> Signal<ShellCommand> {
+        self.shell_commands.clone()
+    }
+
+    fn emit_app_command(&self, command: AppCommand, _cx: &mut Context<Self>) {
+        let _ = self.app_command_emitter.emit(command);
+    }
+
+    fn emit_shell_command(&self, command: ShellCommand, _cx: &mut Context<Self>) {
+        let _ = self.shell_command_emitter.emit(command);
+    }
+
+    /// Drive the same typed path as a UI action from a debug probe.
+    pub fn debug_app_command(&self, command: AppCommand) {
+        let _ = self.app_command_emitter.emit(command);
     }
 
     /// Put a rejected submission back into the prompt instead of losing it.
@@ -484,13 +361,6 @@ impl Workspace {
         });
     }
 
-    /// Take the requests the views have raised since the last drain.
-    ///
-    /// The app calls this; the shell does not know how they are carried out.
-    pub fn take_requests(&mut self) -> Vec<Request> {
-        std::mem::take(&mut self.requests)
-    }
-
     /// Act on what the sidebar reported, and refresh its rows.
     fn handle_sidebar_event(
         &mut self,
@@ -502,16 +372,16 @@ impl Workspace {
             // Both of these need the backend: one opens a folder picker and
             // stores a project, the other launches a Pi session. Neither is
             // reachable until the shell is connected, so they are recorded as
-            // requests rather than silently doing nothing.
-            SidebarEvent::AddProject => self.request(Request::AddProject, cx),
-            SidebarEvent::NewSession(id) => self.request(Request::NewSession(id), cx),
+            // typed commands rather than silently doing nothing.
+            SidebarEvent::AddProject => self.emit_shell_command(ShellCommand::AddProject, cx),
+            SidebarEvent::NewSession(id) => self.emit_app_command(AppCommand::NewSession(id), cx),
             SidebarEvent::ToggleProject(id) | SidebarEvent::OpenProject(id) => {
                 // Whether the rows are listed is view-local, so it is decided
                 // here; which project is selected is not, so it is asked for.
                 // Both from one click, because a header that expanded without
                 // selecting would leave the conversation on another project.
                 toggle_expanded(&mut self.expanded_projects, id);
-                self.request(Request::OpenProject(id), cx);
+                self.emit_app_command(AppCommand::OpenProject(id), cx);
             }
             SidebarEvent::OpenSession {
                 project_id,
@@ -521,8 +391,8 @@ impl Workspace {
                 // session is visible and the transcript has to be re-read, so a
                 // local select would move the sidebar while the conversation kept
                 // showing the previous session.
-                self.request(
-                    Request::ActivateSession {
+                self.emit_app_command(
+                    AppCommand::ActivateSession {
                         project_id,
                         path: pi_path,
                     },
@@ -532,13 +402,19 @@ impl Workspace {
             // The rest of the row menu is the backend's: Finder, the store, the
             // clipboard, and the trash all sit behind the boundary this crate
             // does not cross.
-            SidebarEvent::RevealProject(id) => self.request(Request::RevealProject(id), cx),
-            SidebarEvent::RemoveProject(id) => self.request(Request::RemoveProject(id), cx),
-            SidebarEvent::CloneSession => self.request(Request::CloneSession, cx),
-            SidebarEvent::CopySessionId(id) => {
-                self.request(Request::CopyToClipboard(id.to_string()), cx)
+            SidebarEvent::RevealProject(id) => {
+                self.emit_shell_command(ShellCommand::RevealProject(id), cx)
             }
-            SidebarEvent::DeleteSession(path) => self.request(Request::DeleteSession(path), cx),
+            SidebarEvent::RemoveProject(id) => {
+                self.emit_app_command(AppCommand::RemoveProject(id), cx)
+            }
+            SidebarEvent::CloneSession => self.emit_app_command(AppCommand::CloneSession, cx),
+            SidebarEvent::CopySessionId(id) => {
+                self.emit_shell_command(ShellCommand::CopyToClipboard(id.to_string()), cx)
+            }
+            SidebarEvent::DeleteSession(path) => {
+                self.emit_app_command(AppCommand::DeleteSession(path), cx)
+            }
             SidebarEvent::RenameSession { pi_path, title } => {
                 self.rename.update(cx, |rename, cx| {
                     rename.open(pi_path, &title, window, cx);
@@ -548,8 +424,8 @@ impl Workspace {
                 project_id,
                 pi_path,
                 title,
-            } => self.request(
-                Request::SmartRenameSession {
+            } => self.emit_shell_command(
+                ShellCommand::SmartRenameSession {
                     project_id,
                     path: pi_path,
                     title,
@@ -563,9 +439,9 @@ impl Workspace {
 
     /// Act on what the composer reported.
     ///
-    /// A submitted prompt crosses the boundary as one request. The application
-    /// adds the optimistic transcript entry and sends it to Pi only after the
-    /// active session is revalidated.
+    /// A submitted prompt crosses the boundary as one typed app command, retaining
+    /// its original content, attachments, and mode for rejection recovery. The
+    /// application sends it to Pi only after the active session is revalidated.
     fn handle_composer_event(&mut self, event: ComposerEvent, cx: &mut Context<Self>) {
         match event {
             ComposerEvent::Submit {
@@ -576,8 +452,8 @@ impl Workspace {
                 // Composer::add_attachment already keeps paths unique, so the
                 // list arrives deduplicated. The application owns transcript
                 // insertion so the sent and shown messages cannot diverge.
-                self.request(
-                    Request::SubmitPrompt {
+                self.emit_app_command(
+                    AppCommand::SubmitPrompt {
                         content,
                         attachments,
                         mode,
@@ -589,7 +465,7 @@ impl Workspace {
                 // Requested, not applied: the status has to follow what the agent
                 // actually did. Setting it Ready here would show a stopped session
                 // while the process kept streaming.
-                self.request(Request::Stop, cx);
+                self.emit_app_command(AppCommand::Stop, cx);
             }
             ComposerEvent::RemoveAttachment(path) => {
                 // The draft is view-local, so the row goes now. The file behind it
@@ -605,7 +481,7 @@ impl Workspace {
                     composer.remove_attachment(&path, cx);
                 });
                 if generated {
-                    self.request(Request::DiscardAttachment(path), cx);
+                    self.emit_app_command(AppCommand::DiscardAttachment(path), cx);
                 }
             }
             ComposerEvent::TextChanged(text) => {
@@ -620,10 +496,12 @@ impl Workspace {
                 // Straight through: the copied files have to be canonicalized and
                 // the pasted bytes written somewhere Pi can read them, and both
                 // need the store.
-                self.request(Request::AttachPaste(paste), cx);
+                if let Some(paste) = shell_paste(paste) {
+                    self.emit_shell_command(ShellCommand::AttachPaste(paste), cx);
+                }
             }
             ComposerEvent::PickAttachments => {
-                self.request(Request::PickAttachments, cx);
+                self.emit_shell_command(ShellCommand::PickAttachments, cx);
             }
         }
     }
@@ -658,7 +536,7 @@ impl Workspace {
                 self.composer.update(cx, |composer, cx| {
                     composer.set_text(&restored, window, cx);
                 });
-                self.request(Request::RunCommand(command), cx);
+                self.emit_app_command(AppCommand::RunSlashCommand(command), cx);
             }
         }
         cx.notify();
@@ -738,9 +616,9 @@ impl Workspace {
 
         // Interrupt either way; what else happens is what sets one press apart
         // from two.
-        self.request(Request::Stop, cx);
+        self.emit_app_command(AppCommand::Stop, cx);
         if plan == EscapePlan::TerminateAll {
-            self.request(Request::ClearQueue, cx);
+            self.emit_app_command(AppCommand::ClearQueue, cx);
         } else {
             let draft = self.composer.read(cx).text(cx);
             let attachments = self.composer.read(cx).attachments().to_vec();
@@ -755,8 +633,8 @@ impl Workspace {
                         composer.remove_attachment(&path, cx);
                     }
                 });
-                self.request(
-                    Request::SubmitPrompt {
+                self.emit_app_command(
+                    AppCommand::SubmitPrompt {
                         content: draft,
                         attachments,
                         mode: SubmitMode::FollowUp,
@@ -782,13 +660,13 @@ impl Workspace {
                 // The host records the choice as pending — a switch waits for the
                 // next prompt so the prior model compacts the history first — and
                 // the picker shows it when that snapshot comes back.
-                self.request(Request::SetModel(model), cx);
+                self.emit_app_command(AppCommand::SetModel(model), cx);
             }
             ControlsEvent::SetPermissionLevel(level) => {
-                self.request(Request::SetPermissionLevel(level), cx);
+                self.emit_app_command(AppCommand::SetPermissionLevel(level), cx);
             }
             ControlsEvent::SetThinkingLevel(level) => {
-                self.request(Request::SetThinkingLevel(level), cx);
+                self.emit_app_command(AppCommand::SetThinkingLevel(level), cx);
             }
         }
     }
@@ -810,7 +688,7 @@ impl Workspace {
         // needs is decided by one function rather than by six near-identical
         // arms — and that function is assertable without a window.
         if let Some(request) = preference_change(&event) {
-            self.request(request, cx);
+            self.emit_app_command(request, cx);
             return;
         }
 
@@ -845,7 +723,7 @@ impl Workspace {
             }
             SettingsEvent::SaveBackgroundAiTask => {
                 let config = self.settings.read(cx).background_ai_config_with_draft();
-                self.request(Request::SetOneShotAiConfig(config), cx);
+                self.emit_app_command(AppCommand::SetOneShotAiConfig(config), cx);
                 self.settings.update(cx, |settings, cx| {
                     settings.close_background_ai_task_editor(window, cx);
                 });
@@ -880,8 +758,8 @@ impl Workspace {
             }
             SettingsEvent::DiscoverModels => {
                 let draft = self.settings.read(cx).provider_draft().clone();
-                self.request(
-                    Request::DiscoverProviderModels {
+                self.emit_shell_command(
+                    ShellCommand::DiscoverProviderModels {
                         profile_id: draft.id,
                         provider_name: draft.name.trim().to_owned(),
                         base_url: draft.base_url.trim().to_owned(),
@@ -895,8 +773,8 @@ impl Workspace {
             }
             SettingsEvent::SaveProvider => {
                 let draft = self.settings.read(cx).provider_draft().clone();
-                self.request(
-                    Request::SaveProvider {
+                self.emit_shell_command(
+                    ShellCommand::SaveProvider {
                         profile: draft.to_profile(now_ms()),
                         api_key: draft.typed_api_key(),
                     },
@@ -904,7 +782,7 @@ impl Workspace {
                 );
             }
             SettingsEvent::DeleteProvider(id) => {
-                self.request(Request::DeleteProvider(id), cx);
+                self.emit_app_command(AppCommand::DeleteProvider(id), cx);
                 self.settings
                     .update(cx, |settings, cx| settings.new_provider(window, cx));
             }
@@ -950,7 +828,7 @@ impl Workspace {
                 });
             }
             SettingsEvent::SaveSearchEngines(profiles) => {
-                self.request(Request::SaveSearchEngines(profiles), cx);
+                self.emit_app_command(AppCommand::SaveSearchEngines(profiles), cx);
             }
             SettingsEvent::SaveSearchEngine => {
                 let draft = self.settings.read(cx).search_engine_draft().clone();
@@ -964,8 +842,8 @@ impl Workspace {
                             .map(|profile| profile.position)
                     })
                     .unwrap_or(self.state.search_engine_profiles.len() as u32);
-                self.request(
-                    Request::SaveSearchEngine {
+                self.emit_shell_command(
+                    ShellCommand::SaveSearchEngine {
                         profile: draft.to_profile(position),
                         api_key: draft.typed_api_key(),
                     },
@@ -981,8 +859,8 @@ impl Workspace {
                 self.settings.update(cx, |settings, cx| {
                     settings.start_search_engine_test(profile.id, true, cx);
                 });
-                self.request(
-                    Request::TestSearchEngine {
+                self.emit_shell_command(
+                    ShellCommand::TestSearchEngine {
                         profile,
                         api_key: draft.typed_api_key(),
                         editor: true,
@@ -994,8 +872,8 @@ impl Workspace {
                 self.settings.update(cx, |settings, cx| {
                     settings.start_search_engine_test(profile.id, false, cx);
                 });
-                self.request(
-                    Request::TestSearchEngine {
+                self.emit_shell_command(
+                    ShellCommand::TestSearchEngine {
                         profile: profile.clone(),
                         api_key: None,
                         editor: false,
@@ -1005,14 +883,14 @@ impl Workspace {
             }
             SettingsEvent::RemoveSearchEngine(index) => {
                 let profiles = self.settings.read(cx).search_engines_without(index);
-                self.request(Request::SaveSearchEngines(profiles), cx);
+                self.emit_app_command(AppCommand::SaveSearchEngines(profiles), cx);
                 self.settings.update(cx, |settings, cx| {
                     settings.clear_search_engine_draft(window, cx);
                 });
             }
             SettingsEvent::MoveSearchEngine { index, delta } => {
                 let profiles = self.settings.read(cx).search_engines_moved(index, delta);
-                self.request(Request::SaveSearchEngines(profiles), cx);
+                self.emit_app_command(AppCommand::SaveSearchEngines(profiles), cx);
             }
 
             // Handled above by `preference_change`, which returned `Some` for
@@ -1125,7 +1003,7 @@ impl Workspace {
 
     /// Stage a file on the prompt draft.
     ///
-    /// How the host answers [`Request::AttachPaste`] and the attach command: both
+    /// How the host answers a pasted attachment and the attach command: both
     /// end in a file the store has written or canonicalized, and the draft that
     /// carries it to the next prompt is the composer's.
     pub fn attach(&mut self, attachment: Attachment, cx: &mut Context<Self>) {
@@ -1299,7 +1177,7 @@ impl Workspace {
 
         let queue_status = QueueStatus::from_state(&self.state, tokens).map(|status| {
             status.on_clear(cx.listener(|workspace, _, _, cx| {
-                workspace.request(Request::ClearQueue, cx);
+                workspace.emit_app_command(AppCommand::ClearQueue, cx);
             }))
         });
 
@@ -1363,7 +1241,16 @@ impl Workspace {
     }
 }
 
-/// The backend request a preference change needs, if `event` is one.
+fn shell_paste(paste: Paste) -> Option<ShellPaste> {
+    match paste {
+        Paste::Insert => None,
+        Paste::Files(paths) => Some(ShellPaste::Files(paths)),
+        Paste::Image { extension, bytes } => Some(ShellPaste::Image { extension, bytes }),
+        Paste::LongText(text) => Some(ShellPaste::LongText(text)),
+    }
+}
+
+/// The application command a preference change needs, if `event` is one.
 ///
 /// Returns `None` for the provider and search-engine events, which are drafts
 /// rather than preferences and need the settings view rather than a table.
@@ -1373,29 +1260,31 @@ impl Workspace {
 /// owns — auto-compaction and the queue modes — could never have been guessed
 /// locally anyway: they arrive through `RuntimeControlsUpdated` and the agent is
 /// free to refuse.
-fn preference_change(event: &SettingsEvent) -> Option<Request> {
+fn preference_change(event: &SettingsEvent) -> Option<AppCommand> {
     match event {
-        SettingsEvent::SetLanguage(language) => Some(Request::SetLanguage(*language)),
-        SettingsEvent::SetAutoCompaction(enabled) => Some(Request::SetAutoCompaction(*enabled)),
-        SettingsEvent::SetBashPolicy(policy) => Some(Request::SetBashPolicy(*policy)),
+        SettingsEvent::SetLanguage(language) => Some(AppCommand::SetLanguage(*language)),
+        SettingsEvent::SetAutoCompaction(enabled) => Some(AppCommand::SetAutoCompaction(*enabled)),
+        SettingsEvent::SetBashPolicy(policy) => Some(AppCommand::SetBashPolicy(*policy)),
         SettingsEvent::SetBlockedPatterns(patterns) => {
-            Some(Request::SetBlockedPatterns(patterns.clone()))
+            Some(AppCommand::SetBlockedPatterns(patterns.clone()))
         }
         SettingsEvent::SetAgentTeamConfig(config) => {
-            Some(Request::SetAgentTeamConfig(config.clone()))
+            Some(AppCommand::SetAgentTeamConfig(config.clone()))
         }
-        SettingsEvent::ApproveProjectHooks { fingerprint } => Some(Request::ApproveProjectHooks {
-            fingerprint: fingerprint.clone(),
-        }),
-        SettingsEvent::RevokeProjectHooks => Some(Request::RevokeProjectHooks),
+        SettingsEvent::ApproveProjectHooks { fingerprint } => {
+            Some(AppCommand::ApproveProjectHooks {
+                fingerprint: fingerprint.clone(),
+            })
+        }
+        SettingsEvent::RevokeProjectHooks => Some(AppCommand::RevokeProjectHooks),
         SettingsEvent::SetOneShotAiConfig(config) => {
-            Some(Request::SetOneShotAiConfig(config.clone()))
+            Some(AppCommand::SetOneShotAiConfig(config.clone()))
         }
         // The controls bar sends the same request from beside the prompt.
         SettingsEvent::SetQueueModes {
             steering,
             follow_up,
-        } => Some(Request::SetQueueModes {
+        } => Some(AppCommand::SetQueueModes {
             steering: *steering,
             follow_up: *follow_up,
         }),
@@ -1450,7 +1339,10 @@ impl Render for Workspace {
                         .on_copy(
                             translate("copy-error", language),
                             cx.listener(move |workspace, _, _, cx| {
-                                workspace.request(Request::CopyToClipboard(copy.clone()), cx);
+                                workspace.emit_shell_command(
+                                    ShellCommand::CopyToClipboard(copy.clone()),
+                                    cx,
+                                );
                             }),
                         )
                         .on_dismiss(
@@ -1581,12 +1473,63 @@ impl Render for Workspace {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, rc::Rc};
-
     use gpui::{KeyDownEvent, Keystroke};
-    use pi_whim_core::{ConversationItem, ConversationRole, stable_session_id};
+    use pi_whim_core::{
+        BashPolicy, ConversationItem, ConversationRole, ModelOption, OneShotAiConfig, QueueMode,
+        SearchEngineProfile, stable_session_id,
+    };
+    use pi_whim_signal::Subscription;
 
     use super::*;
+
+    struct SignalProbe<T> {
+        receiver: crossbeam_channel::Receiver<T>,
+        _subscription: Subscription,
+    }
+
+    impl<T> SignalProbe<T> {
+        fn take(&self) -> Vec<T> {
+            self.receiver.try_iter().collect()
+        }
+    }
+
+    fn signal_probe<T>(signal: Signal<T>) -> SignalProbe<T>
+    where
+        T: Clone + Send + Sync + 'static,
+    {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let subscription = signal.subscribe_fn(move |command| {
+            let _ = sender.send(command);
+        });
+        SignalProbe {
+            receiver,
+            _subscription: subscription,
+        }
+    }
+
+    #[test]
+    fn paste_conversion_is_lossless_and_insert_stays_composer_local() {
+        let bytes = vec![0, 1, 2, 254, 255];
+        assert_eq!(
+            shell_paste(Paste::Image {
+                extension: "png".into(),
+                bytes: bytes.clone(),
+            }),
+            Some(ShellPaste::Image {
+                extension: "png".into(),
+                bytes,
+            })
+        );
+        assert_eq!(
+            shell_paste(Paste::Files(vec!["/tmp/a".into(), "/tmp/b".into()])),
+            Some(ShellPaste::Files(vec!["/tmp/a".into(), "/tmp/b".into()]))
+        );
+        assert_eq!(
+            shell_paste(Paste::LongText("private paste".into())),
+            Some(ShellPaste::LongText("private paste".into()))
+        );
+        assert_eq!(shell_paste(Paste::Insert), None);
+    }
 
     #[test]
     fn toggling_a_project_flips_it_and_back() {
@@ -1604,9 +1547,9 @@ mod tests {
     fn a_stored_preference_is_persisted_rather_than_assumed() {
         // The host writes it and the snapshot comes back, so the control cannot
         // show a policy as set while the write that stores it failed.
-        let request =
+        let command =
             preference_change(&SettingsEvent::SetBashPolicy(BashPolicy::Deny)).expect("a change");
-        assert_eq!(request, Request::SetBashPolicy(BashPolicy::Deny));
+        assert_eq!(command, AppCommand::SetBashPolicy(BashPolicy::Deny));
     }
 
     #[test]
@@ -1627,24 +1570,24 @@ mod tests {
 
         assert_eq!(
             preference_change(&SettingsEvent::SetOneShotAiConfig(config.clone())),
-            Some(Request::SetOneShotAiConfig(config))
+            Some(AppCommand::SetOneShotAiConfig(config))
         );
     }
 
     #[test]
     fn the_agents_own_settings_go_to_the_agent() {
         // Auto-compaction and the queue modes are the agent's to confirm, so these
-        // are requests rather than writes to the store.
+        // are commands rather than writes to the store.
         assert_eq!(
             preference_change(&SettingsEvent::SetAutoCompaction(true)),
-            Some(Request::SetAutoCompaction(true))
+            Some(AppCommand::SetAutoCompaction(true))
         );
         assert_eq!(
             preference_change(&SettingsEvent::SetQueueModes {
                 steering: QueueMode::All,
                 follow_up: QueueMode::OneAtATime,
             }),
-            Some(Request::SetQueueModes {
+            Some(AppCommand::SetQueueModes {
                 steering: QueueMode::All,
                 follow_up: QueueMode::OneAtATime,
             })
@@ -1765,37 +1708,20 @@ mod tests {
         cx.add_window(|window, cx| Workspace::new(preference, window, cx))
     }
 
-    struct RequestProbe;
-
     #[gpui::test]
-    async fn testing_web_search_wakes_the_request_host(cx: &mut gpui::TestAppContext) {
+    async fn testing_web_search_emits_one_typed_shell_command(cx: &mut gpui::TestAppContext) {
         let shell = shell(cx);
-        let workspace = shell
-            .update(cx, |_, _, cx| cx.entity())
-            .expect("the workspace window is open");
-        let raised = Rc::new(Cell::new(0));
-        let observed = raised.clone();
-        let _probe = cx.update(|cx| {
-            cx.new(|cx| {
-                cx.subscribe(&workspace, move |_, _, _: &RequestsRaised, _| {
-                    observed.set(observed.get() + 1);
-                })
-                .detach();
-                RequestProbe
-            })
-        });
 
         shell
             .update(cx, |workspace, window, cx| {
+                let commands = signal_probe(workspace.shell_commands());
                 workspace.handle_settings_event(SettingsEvent::TestSearchEngine, window, cx);
                 assert!(matches!(
-                    workspace.take_requests().as_slice(),
-                    [Request::TestSearchEngine { editor: true, .. }]
+                    commands.take().as_slice(),
+                    [ShellCommand::TestSearchEngine { editor: true, .. }]
                 ));
             })
             .expect("the workspace window is open");
-
-        assert_eq!(raised.get(), 1);
     }
 
     #[gpui::test]
@@ -1806,6 +1732,7 @@ mod tests {
 
         shell
             .update(cx, |workspace, window, cx| {
+                let commands = signal_probe(workspace.shell_commands());
                 workspace.handle_settings_event(
                     SettingsEvent::QuickTestSearchEngine(profile),
                     window,
@@ -1813,8 +1740,8 @@ mod tests {
                 );
 
                 assert!(matches!(
-                    workspace.take_requests().as_slice(),
-                    [Request::TestSearchEngine {
+                    commands.take().as_slice(),
+                    [ShellCommand::TestSearchEngine {
                         profile,
                         api_key: None,
                         editor: false,
@@ -1833,6 +1760,7 @@ mod tests {
 
         shell
             .update(cx, |workspace, _, cx| {
+                let commands = signal_probe(workspace.app_commands());
                 workspace.handle_composer_event(
                     ComposerEvent::Submit {
                         content: "what changed?".to_owned(),
@@ -1844,8 +1772,8 @@ mod tests {
 
                 assert!(workspace.state().conversation.is_empty());
                 assert!(matches!(
-                    workspace.take_requests().as_slice(),
-                    [Request::SubmitPrompt { content, .. }] if content == "what changed?"
+                    commands.take().as_slice(),
+                    [AppCommand::SubmitPrompt { content, .. }] if content == "what changed?"
                 ));
             })
             .expect("the window is open");
@@ -1860,9 +1788,10 @@ mod tests {
 
         shell
             .update(cx, |workspace, _, cx| {
+                let commands = signal_probe(workspace.shell_commands());
                 workspace.handle_composer_event(ComposerEvent::PickAttachments, cx);
 
-                assert_eq!(workspace.take_requests(), vec![Request::PickAttachments]);
+                assert_eq!(commands.take(), vec![ShellCommand::PickAttachments]);
             })
             .expect("the window is open");
     }
@@ -1877,6 +1806,7 @@ mod tests {
 
         shell
             .update(cx, |workspace, window, cx| {
+                let commands = signal_probe(workspace.app_commands());
                 workspace.set_state(
                     AppState {
                         session_status: SessionStatus::Streaming,
@@ -1889,7 +1819,7 @@ mod tests {
                 workspace.handle_composer_event(ComposerEvent::Stop, cx);
 
                 assert_eq!(workspace.state().session_status, SessionStatus::Streaming);
-                assert_eq!(workspace.take_requests(), vec![Request::Stop]);
+                assert_eq!(commands.take(), vec![AppCommand::Stop]);
             })
             .expect("the window is open");
     }
@@ -1909,10 +1839,11 @@ mod tests {
 
         shell
             .update(cx, |workspace, _, cx| {
+                let commands = signal_probe(workspace.app_commands());
                 workspace.handle_controls_event(ControlsEvent::SetModel(model.clone()), cx);
 
                 assert!(workspace.state().pending_model.is_none());
-                assert_eq!(workspace.take_requests(), vec![Request::SetModel(model)]);
+                assert_eq!(commands.take(), vec![AppCommand::SetModel(model)]);
             })
             .expect("the window is open");
     }
@@ -1928,6 +1859,7 @@ mod tests {
 
         shell
             .update(cx, |workspace, window, cx| {
+                let commands = signal_probe(workspace.app_commands());
                 workspace.handle_sidebar_event(
                     SidebarEvent::OpenSession {
                         project_id,
@@ -1939,8 +1871,8 @@ mod tests {
 
                 assert_eq!(workspace.state().selected_project, None);
                 assert_eq!(
-                    workspace.take_requests(),
-                    vec![Request::ActivateSession {
+                    commands.take(),
+                    vec![AppCommand::ActivateSession {
                         project_id,
                         path: "/tmp/s.jsonl".to_owned(),
                     }]
@@ -1961,13 +1893,11 @@ mod tests {
 
         shell
             .update(cx, |workspace, window, cx| {
+                let commands = signal_probe(workspace.app_commands());
                 workspace.handle_sidebar_event(SidebarEvent::OpenProject(project_id), window, cx);
 
                 assert!(workspace.expanded_projects.contains(&project_id));
-                assert_eq!(
-                    workspace.take_requests(),
-                    vec![Request::OpenProject(project_id)]
-                );
+                assert_eq!(commands.take(), vec![AppCommand::OpenProject(project_id)]);
             })
             .expect("the window is open");
     }
@@ -2110,17 +2040,18 @@ mod tests {
 
         shell
             .update(cx, |workspace, window, cx| {
+                let commands = signal_probe(workspace.app_commands());
                 workspace.composer.update(cx, |composer, cx| {
                     composer.set_text("hold that thought", window, cx);
                 });
                 workspace.run_escape_plan(true, true, true, window, cx);
 
-                let requests = workspace.take_requests();
+                let requests = commands.take();
                 assert_eq!(requests.len(), 2);
-                assert_eq!(requests[0], Request::Stop);
+                assert_eq!(requests[0], AppCommand::Stop);
                 assert!(matches!(
                     &requests[1],
-                    Request::SubmitPrompt { content, mode: SubmitMode::FollowUp, .. }
+                    AppCommand::SubmitPrompt { content, mode: SubmitMode::FollowUp, .. }
                         if content == "hold that thought"
                 ));
                 assert_eq!(workspace.composer.read(cx).text(cx), "");
@@ -2134,8 +2065,9 @@ mod tests {
 
         shell
             .update(cx, |workspace, window, cx| {
+                let commands = signal_probe(workspace.app_commands());
                 workspace.run_escape_plan(true, true, false, window, cx);
-                assert_eq!(workspace.take_requests(), vec![Request::Stop]);
+                assert_eq!(commands.take(), vec![AppCommand::Stop]);
             })
             .expect("the window is open");
     }
@@ -2146,14 +2078,15 @@ mod tests {
 
         shell
             .update(cx, |workspace, window, cx| {
+                let commands = signal_probe(workspace.app_commands());
                 workspace.run_escape_plan(true, true, false, window, cx);
                 workspace.run_escape_plan(true, true, false, window, cx);
 
-                let requests = workspace.take_requests();
+                let requests = commands.take();
                 assert_eq!(requests.len(), 3);
-                assert_eq!(requests[0], Request::Stop);
-                assert_eq!(requests[1], Request::Stop);
-                assert_eq!(requests[2], Request::ClearQueue);
+                assert_eq!(requests[0], AppCommand::Stop);
+                assert_eq!(requests[1], AppCommand::Stop);
+                assert_eq!(requests[2], AppCommand::ClearQueue);
             })
             .expect("the window is open");
     }
@@ -2164,6 +2097,7 @@ mod tests {
 
         shell
             .update(cx, |workspace, window, cx| {
+                let commands = signal_probe(workspace.app_commands());
                 workspace.set_state(
                     AppState {
                         session_status: SessionStatus::Ready,
@@ -2174,7 +2108,7 @@ mod tests {
                 );
                 workspace.run_escape_plan(false, true, true, window, cx);
 
-                assert!(workspace.take_requests().is_empty());
+                assert!(commands.take().is_empty());
             })
             .expect("the window is open");
     }
