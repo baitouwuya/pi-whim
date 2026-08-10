@@ -4790,6 +4790,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pi-whim-signal"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+]
+
+[[package]]
 name = "pi-whim-theme"
 version = "0.1.0"
 
