@@ -183,6 +183,381 @@ fn manifest_v1_and_v2_are_strict_and_v2_fields_are_exact() -> TestResult {
 }
 
 #[test]
+fn ui_v2_event_matrix_is_exact_and_has_no_legacy_aliases() -> TestResult {
+    let registry = EventRegistry::default();
+    let submitting = registry
+        .spec("pi.ui.command.submitting")
+        .expect("the UI submitting event is registered");
+    assert!(submitting.project_visible);
+    assert!(submitting.aliases.is_empty());
+    assert_eq!(
+        submitting.kinds.keys().copied().collect::<Vec<_>>(),
+        vec![HookKind::Gate, HookKind::Transform]
+    );
+    assert_eq!(
+        submitting
+            .fields
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec![
+            "arguments",
+            "command_id",
+            "command_name",
+            "project_id",
+            "source"
+        ]
+    );
+    assert_eq!(
+        submitting
+            .fields
+            .iter()
+            .filter_map(|(name, field)| field.transformable.then_some(name.as_str()))
+            .collect::<Vec<_>>(),
+        vec!["arguments"]
+    );
+    assert_eq!(
+        submitting
+            .matcher_keys
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["command_name", "project_id", "source"]
+    );
+    assert_eq!(
+        submitting.fields["command_id"].data_class,
+        HookDataClass::PublicString
+    );
+    assert_eq!(
+        submitting.fields["project_id"].data_class,
+        HookDataClass::ProjectMetadata
+    );
+    assert_eq!(
+        submitting.fields["arguments"].data_class,
+        HookDataClass::UserContent
+    );
+
+    let lifecycle = registry
+        .spec("pi.ui.command.lifecycle")
+        .expect("the UI lifecycle event is registered");
+    assert!(lifecycle.project_visible);
+    assert!(lifecycle.aliases.is_empty());
+    assert_eq!(
+        lifecycle.kinds.keys().copied().collect::<Vec<_>>(),
+        vec![HookKind::Observe]
+    );
+    assert_eq!(
+        lifecycle
+            .fields
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec![
+            "command_id",
+            "command_name",
+            "diagnostic",
+            "project_id",
+            "source",
+            "stage"
+        ]
+    );
+    assert!(lifecycle.fields.values().all(|field| !field.transformable));
+    assert_eq!(
+        lifecycle
+            .matcher_keys
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["command_name", "project_id", "source", "stage"]
+    );
+
+    let committed = registry
+        .spec("pi.state.committed")
+        .expect("the state commit event is registered");
+    assert!(committed.project_visible);
+    assert!(committed.aliases.is_empty());
+    assert_eq!(
+        committed.kinds.keys().copied().collect::<Vec<_>>(),
+        vec![HookKind::Observe]
+    );
+    assert_eq!(
+        committed
+            .fields
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec![
+            "action_count",
+            "coalesced",
+            "commit_source",
+            "project_id",
+            "revision",
+            "scope",
+            "topics"
+        ]
+    );
+    assert!(committed.fields.values().all(|field| !field.transformable));
+    assert_eq!(
+        committed
+            .matcher_keys
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["commit_source", "project_id", "scope"]
+    );
+
+    for event in [
+        "ui_command_submitting",
+        "ui_command_lifecycle",
+        "state_committed",
+        "pi.ui.render",
+        "pi.ui.layout",
+        "pi.ui.frame",
+        "pi.render",
+        "pi.layout",
+        "pi.frame",
+    ] {
+        assert!(registry.spec(event).is_none(), "unexpected event {event}");
+    }
+    Ok(())
+}
+
+#[test]
+fn ui_v2_manifests_accept_only_the_registered_kind_and_fields() -> TestResult {
+    let valid = manifest(json!({
+        "version": 2,
+        "hooks": [
+            {
+                "id": "command-gate",
+                "event": "pi.ui.command.submitting",
+                "kind": "gate",
+                "command": ["/bin/true"],
+                "fields": ["command_id", "command_name", "source", "project_id", "arguments"],
+                "matcher": {"command_name": "prompt.submit", "source": "ui", "project_id": "project-1"}
+            },
+            {
+                "id": "command-transform",
+                "event": "pi.ui.command.submitting",
+                "kind": "transform",
+                "command": ["/bin/true"],
+                "fields": ["command_id", "command_name", "source", "project_id", "arguments"]
+            },
+            {
+                "id": "command-lifecycle",
+                "event": "pi.ui.command.lifecycle",
+                "kind": "observe",
+                "command": ["/bin/true"],
+                "fields": ["command_id", "command_name", "source", "project_id", "stage", "diagnostic"],
+                "matcher": {"command_name": "prompt.submit", "source": "ui", "project_id": "project-1", "stage": "submitted"}
+            },
+            {
+                "id": "state-commit",
+                "event": "pi.state.committed",
+                "kind": "observe",
+                "command": ["/bin/true"],
+                "fields": ["revision", "topics", "action_count", "coalesced", "scope", "commit_source", "project_id"],
+                "matcher": {"scope": "global", "commit_source": "user_command", "project_id": "project-1"}
+            }
+        ]
+    }))?;
+    assert_eq!(valid.hooks.len(), 4);
+
+    for (event, kind) in [
+        ("pi.ui.command.submitting", "observe"),
+        ("pi.ui.command.lifecycle", "gate"),
+        ("pi.ui.command.lifecycle", "transform"),
+        ("pi.state.committed", "gate"),
+        ("pi.state.committed", "transform"),
+    ] {
+        let invalid = manifest(json!({
+            "version": 2,
+            "hooks": [{
+                "id": "wrong-kind",
+                "event": event,
+                "kind": kind,
+                "command": ["/bin/true"],
+                "fields": []
+            }]
+        }));
+        assert!(matches!(invalid, Err(HookHostError::DisallowedKind { .. })));
+    }
+
+    for field in ["payload", "clipboard", "session_path"] {
+        let invalid = manifest(json!({
+            "version": 2,
+            "hooks": [{
+                "id": "unauthorized-field",
+                "event": "pi.ui.command.submitting",
+                "kind": "gate",
+                "command": ["/bin/true"],
+                "fields": [field]
+            }]
+        }));
+        assert!(matches!(
+            invalid,
+            Err(HookHostError::UnauthorizedField { .. })
+        ));
+    }
+    for field in ["api_key", "endpoint", "token", "secret"] {
+        assert!(
+            manifest(json!({
+                "version": 2,
+                "hooks": [{
+                    "id": "forbidden-field",
+                    "event": "pi.ui.command.submitting",
+                    "kind": "gate",
+                    "command": ["/bin/true"],
+                    "fields": [field]
+                }]
+            }))
+            .is_err()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn ui_command_transform_can_change_only_arguments() -> TestResult {
+    let registry = EventRegistry::default();
+    let manifest = manifest(json!({
+        "version": 2,
+        "hooks": [{
+            "id": "command-transform",
+            "event": "pi.ui.command.submitting",
+            "kind": "transform",
+            "command": ["/bin/true"],
+            "fields": ["command_id", "command_name", "source", "project_id", "arguments"]
+        }]
+    }))?;
+    let definition = &manifest.hooks[0];
+    let previous = registry.filter_payload(
+        2,
+        definition,
+        true,
+        &json!({
+            "command_id": "command-1",
+            "command_name": "prompt.submit",
+            "source": "ui",
+            "project_id": "project-1",
+            "arguments": {"content": "before"},
+            "payload": "must-not-export",
+            "clipboard": "must-not-export",
+            "api_key": "must-not-export"
+        }),
+    )?;
+    assert_eq!(
+        previous.as_value().as_object().map(|object| object.len()),
+        Some(5)
+    );
+    assert!(previous.as_value().get("payload").is_none());
+    assert!(previous.as_value().get("clipboard").is_none());
+    assert!(previous.as_value().get("api_key").is_none());
+
+    let transformed = registry.apply_transform(
+        2,
+        definition,
+        true,
+        &previous,
+        &json!({"payload": {"arguments": {"content": "after"}}}),
+    )?;
+    assert_eq!(transformed.as_value()["command_id"], json!("command-1"));
+    assert_eq!(
+        transformed.as_value()["command_name"],
+        json!("prompt.submit")
+    );
+    assert_eq!(transformed.as_value()["source"], json!("ui"));
+    assert_eq!(transformed.as_value()["project_id"], json!("project-1"));
+    assert_eq!(
+        transformed.as_value()["arguments"],
+        json!({"content": "after"})
+    );
+
+    for (field, value) in [
+        ("command_id", json!("command-2")),
+        ("command_name", json!("project.remove")),
+        ("source", json!("hook_replay")),
+        ("project_id", json!("project-2")),
+    ] {
+        let mut output = serde_json::Map::new();
+        output.insert(field.to_owned(), value);
+        let result = registry.apply_transform(
+            2,
+            definition,
+            true,
+            &previous,
+            &json!({"payload": Value::Object(output)}),
+        );
+        assert!(matches!(result, Err(HookHostError::InvalidInvocation(_))));
+    }
+    for field in ["payload", "clipboard", "session_path"] {
+        let mut output = serde_json::Map::new();
+        output.insert(field.to_owned(), json!("forbidden"));
+        let result = registry.apply_transform(
+            2,
+            definition,
+            true,
+            &previous,
+            &json!({"payload": Value::Object(output)}),
+        );
+        assert!(matches!(
+            result,
+            Err(HookHostError::UnauthorizedField { .. })
+        ));
+    }
+    let nested_secret = registry.apply_transform(
+        2,
+        definition,
+        true,
+        &previous,
+        &json!({"payload": {"arguments": {"api_key": "never-export"}}}),
+    );
+    assert!(matches!(
+        nested_secret,
+        Err(HookHostError::ForbiddenField { .. })
+    ));
+    Ok(())
+}
+
+#[test]
+fn legacy_agent_aliases_remain_valid_for_v1_manifests() -> TestResult {
+    for (index, (event, kind)) in [
+        ("supervisor_started", "observe"),
+        ("supervisor_stopping", "observe"),
+        ("session_published", "observe"),
+        ("session_expired", "observe"),
+        ("tool_completed", "observe"),
+        ("tool_denied", "observe"),
+        ("agent_started", "observe"),
+        ("agent_finished", "observe"),
+        ("message_delivered", "observe"),
+        ("interaction_created", "observe"),
+        ("interaction_resolved", "observe"),
+        ("team_reset", "observe"),
+        ("tool_dispatching", "gate"),
+        ("agent_spawning", "gate"),
+        ("message_sending", "gate"),
+        ("permission_resolving", "gate"),
+        ("agent_launching", "gate"),
+        ("interaction_resolving", "transform"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let parsed = manifest(json!({
+            "version": 1,
+            "hooks": [{
+                "id": format!("legacy-{index}"),
+                "event": event,
+                "kind": kind,
+                "command": ["/bin/true"]
+            }]
+        }))?;
+        assert_eq!(parsed.hooks[0].event, event);
+    }
+    Ok(())
+}
+
+#[test]
 fn registry_rejects_forbidden_nested_and_project_hidden_fields() -> TestResult {
     assert!(matches!(
         HookFieldSpec::new("endpoint_url", HookDataClass::PublicString, false, true),

@@ -640,7 +640,71 @@ fn default_event_specs() -> Vec<HookEventSpec> {
         &[HookKind::Transform],
         &all_matchers,
     ));
+    result.extend(ui_event_specs());
     result
+}
+
+fn ui_event_specs() -> [HookEventSpec; 3] {
+    [
+        typed_spec(
+            "pi.ui.command.submitting",
+            &[HookKind::Gate, HookKind::Transform],
+            &["command_name", "source", "project_id"],
+            &[
+                field("command_id", HookDataClass::PublicString, false),
+                field("command_name", HookDataClass::PublicString, false),
+                field("source", HookDataClass::PublicString, false),
+                field("project_id", HookDataClass::ProjectMetadata, false),
+                field("arguments", HookDataClass::UserContent, true),
+            ],
+        ),
+        typed_spec(
+            "pi.ui.command.lifecycle",
+            &[HookKind::Observe],
+            &["command_name", "source", "project_id", "stage"],
+            &[
+                field("command_id", HookDataClass::PublicString, false),
+                field("command_name", HookDataClass::PublicString, false),
+                field("source", HookDataClass::PublicString, false),
+                field("project_id", HookDataClass::ProjectMetadata, false),
+                field("stage", HookDataClass::PublicString, false),
+                field("diagnostic", HookDataClass::PublicString, false),
+            ],
+        ),
+        typed_spec(
+            "pi.state.committed",
+            &[HookKind::Observe],
+            &["commit_source", "project_id", "scope"],
+            &[
+                field("revision", HookDataClass::Number, false),
+                field("topics", HookDataClass::Array, false),
+                field("action_count", HookDataClass::Number, false),
+                field("coalesced", HookDataClass::Boolean, false),
+                field("scope", HookDataClass::PublicString, false),
+                field("commit_source", HookDataClass::PublicString, false),
+                field("project_id", HookDataClass::ProjectMetadata, false),
+            ],
+        ),
+    ]
+}
+
+fn typed_spec(
+    event: &str,
+    kinds: &[HookKind],
+    matcher_keys: &[&str],
+    fields: &[HookFieldSpec],
+) -> HookEventSpec {
+    let mut spec = HookEventSpec::new(event);
+    for kind in kinds {
+        spec = spec.with_kind(*kind, HookKindSpec::new(*kind));
+    }
+    for key in matcher_keys {
+        spec = spec.with_matcher_key(*key);
+    }
+    for field in fields {
+        spec = spec.with_field(field.clone());
+    }
+    spec
 }
 
 fn default_spec(
