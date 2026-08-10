@@ -101,6 +101,19 @@ fn manifest_v1_and_v2_are_strict_and_v2_fields_are_exact() -> TestResult {
     }))?;
     assert_eq!(v1.version, 1);
     assert_eq!(v1.hooks[0].event, "tool_dispatching");
+    let registry = EventRegistry::default();
+    assert_eq!(
+        registry.canonical_event(&v1.hooks[0].event).as_deref(),
+        Some("pi.tool.dispatching")
+    );
+    let v1_fields = registry
+        .effective_fields(v1.version, &v1.hooks[0], true)?
+        .into_iter()
+        .map(|field| field.name)
+        .collect::<Vec<_>>();
+    assert!(v1_fields.contains(&"tool".to_owned()));
+    assert!(v1_fields.contains(&"arguments".to_owned()));
+    assert!(v1_fields.len() > 2);
 
     for invalid in [
         json!({"version": 1, "hooks": [], "unknown": true}),

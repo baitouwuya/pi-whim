@@ -129,6 +129,19 @@ pub fn render_execution(
 
 fn project_hook_rows(state: &AppState, tokens: Tokens, emit: Emit) -> Vec<AnyElement> {
     let mut rows = vec![project_hooks_row(state, tokens, emit)];
+    let grants = match &state.project_hook_status {
+        ProjectHookStatus::ApprovalRequired { grants, .. }
+        | ProjectHookStatus::Approved { grants, .. } => grants.as_slice(),
+        ProjectHookStatus::NotPresent | ProjectHookStatus::Invalid(_) => &[],
+    };
+    rows.extend(grants.iter().map(|grant| {
+        form::row(
+            compact_display(&grant.hook_id, 28),
+            Some(&grant_details(grant)),
+            tokens,
+            div().into_any_element(),
+        )
+    }));
     rows.extend(state.hook_audit.iter().take(5).map(|entry| {
         let revision = entry.revision.get(..19).unwrap_or(&entry.revision);
         let truncation = if entry.output_truncated {
@@ -162,9 +175,11 @@ fn project_hooks_row(state: &AppState, tokens: Tokens, emit: Emit) -> AnyElement
         ),
         ProjectHookStatus::ApprovalRequired {
             fingerprint,
-            hook_count,
+            grants_hash,
+            grants,
         } => {
             let fingerprint_for_click = fingerprint.clone();
+            let grants_hash_for_click = grants_hash.clone();
             let emit_for_click = emit.clone();
             let button = Button::new("approve-project-hooks")
                 .primary()
@@ -174,6 +189,7 @@ fn project_hooks_row(state: &AppState, tokens: Tokens, emit: Emit) -> AnyElement
                     emit_for_click(
                         SettingsEvent::ApproveProjectHooks {
                             fingerprint: fingerprint_for_click.clone(),
+                            grants_hash: grants_hash_for_click.clone(),
                         },
                         window,
                         cx,
@@ -181,16 +197,19 @@ fn project_hooks_row(state: &AppState, tokens: Tokens, emit: Emit) -> AnyElement
                 });
             (
                 format!(
-                    "{}: {hook_count} ({})",
+                    "{}: {} ({} / {})",
                     tr(state, "project-hooks-approval"),
-                    fingerprint.get(..12).unwrap_or(fingerprint)
+                    grants.len(),
+                    fingerprint.get(..12).unwrap_or(fingerprint),
+                    grants_hash.get(..12).unwrap_or(grants_hash)
                 ),
                 Some(button.into_any_element()),
             )
         }
         ProjectHookStatus::Approved {
             fingerprint,
-            hook_count,
+            grants_hash,
+            grants,
         } => {
             let button = Button::new("revoke-project-hooks")
                 .small()
@@ -200,9 +219,11 @@ fn project_hooks_row(state: &AppState, tokens: Tokens, emit: Emit) -> AnyElement
                 });
             (
                 format!(
-                    "{}: {hook_count} ({})",
+                    "{}: {} ({} / {})",
                     tr(state, "project-hooks-approved"),
-                    fingerprint.get(..12).unwrap_or(fingerprint)
+                    grants.len(),
+                    fingerprint.get(..12).unwrap_or(fingerprint),
+                    grants_hash.get(..12).unwrap_or(grants_hash)
                 ),
                 Some(button.into_any_element()),
             )
@@ -213,6 +234,31 @@ fn project_hooks_row(state: &AppState, tokens: Tokens, emit: Emit) -> AnyElement
         Some(&status),
         tokens,
         action.unwrap_or_else(|| div().into_any_element()),
+    )
+}
+
+fn grant_details(grant: &pi_whim_core::HookGrantDescriptor) -> String {
+    let fields = if grant.fields.is_empty() {
+        "-".to_owned()
+    } else {
+        grant.fields.join(",")
+    };
+    let matcher = serde_json::to_string(&grant.matcher).unwrap_or_else(|_| "{}".into());
+    format!(
+        "{} / {:?} / fields=[{}] / matcher={} / delivery={:?}:{} / restart={}:{}-{} / sha256={}",
+        grant.event,
+        grant.kind,
+        fields,
+        matcher,
+        grant.delivery.mode,
+        grant.delivery.capacity,
+        grant.restart.max_restarts,
+        grant.restart.initial_backoff_ms,
+        grant.restart.max_backoff_ms,
+        grant
+            .entrypoint_sha256
+            .get(..12)
+            .unwrap_or(&grant.entrypoint_sha256)
     )
 }
 
@@ -397,6 +443,46 @@ pub fn format_blocked_patterns(patterns: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_hook_grant_details_show_every_authority_dimension() {
+        let grant = pi_whim_core::HookGrantDescriptor {
+            hook_id: "policy".into(),
+            event: "pi.ui.command.submitting".into(),
+            kind: pi_whim_core::HookGrantKind::Transform,
+            fields: vec!["arguments".into()],
+            matcher: pi_whim_core::HookGrantMatcher {
+                tools: Vec::new(),
+                agent_levels: Vec::new(),
+                metadata: std::collections::BTreeMap::from([(
+                    "source".into(),
+                    serde_json::json!("ui"),
+                )]),
+            },
+            delivery: pi_whim_core::HookGrantDelivery {
+                mode: pi_whim_core::HookGrantDeliveryMode::RequestResponse,
+                capacity: 1,
+            },
+            restart: pi_whim_core::HookGrantRestart {
+                max_restarts: 2,
+                initial_backoff_ms: 250,
+                max_backoff_ms: 1_000,
+            },
+            entrypoint_sha256: "0123456789abcdef".into(),
+        };
+        let details = grant_details(&grant);
+        for expected in [
+            "pi.ui.command.submitting",
+            "Transform",
+            "arguments",
+            "source",
+            "RequestResponse:1",
+            "restart=2:250-1000",
+            "0123456789ab",
+        ] {
+            assert!(details.contains(expected), "missing {expected}: {details}");
+        }
+    }
 
     #[test]
     fn patterns_are_one_per_line() {

@@ -177,6 +177,21 @@ impl EventRegistry {
         manifest.validate(self)
     }
 
+    /// Returns the exact fields authorized for one validated definition.
+    ///
+    /// V1 definitions and definitions without an explicit field list expand to
+    /// the registry's complete authorized field set. Project visibility is
+    /// enforced before any metadata is returned.
+    pub fn effective_fields(
+        &self,
+        version: u32,
+        definition: &HookDefinition,
+        project_scoped: bool,
+    ) -> HookHostResult<Vec<HookFieldSpec>> {
+        self.validate_definition(version, definition)?;
+        self.authorize_fields(version, definition, project_scoped)
+    }
+
     pub(crate) fn validate_definition(
         &self,
         version: u32,

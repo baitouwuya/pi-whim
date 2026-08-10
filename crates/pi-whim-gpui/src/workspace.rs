@@ -1317,11 +1317,13 @@ fn preference_change(event: &SettingsEvent) -> Option<AppCommand> {
         SettingsEvent::SetAgentTeamConfig(config) => {
             Some(AppCommand::SetAgentTeamConfig(config.clone()))
         }
-        SettingsEvent::ApproveProjectHooks { fingerprint } => {
-            Some(AppCommand::ApproveProjectHooks {
-                fingerprint: fingerprint.clone(),
-            })
-        }
+        SettingsEvent::ApproveProjectHooks {
+            fingerprint,
+            grants_hash,
+        } => Some(AppCommand::ApproveProjectHooks {
+            fingerprint: fingerprint.clone(),
+            grants_hash: grants_hash.clone(),
+        }),
         SettingsEvent::RevokeProjectHooks => Some(AppCommand::RevokeProjectHooks),
         SettingsEvent::SetOneShotAiConfig(config) => {
             Some(AppCommand::SetOneShotAiConfig(config.clone()))
@@ -1596,6 +1598,20 @@ mod tests {
         let command =
             preference_change(&SettingsEvent::SetBashPolicy(BashPolicy::Deny)).expect("a change");
         assert_eq!(command, AppCommand::SetBashPolicy(BashPolicy::Deny));
+    }
+
+    #[test]
+    fn hook_approval_forwards_manifest_and_exact_grants_hashes() {
+        assert_eq!(
+            preference_change(&SettingsEvent::ApproveProjectHooks {
+                fingerprint: "manifest-hash".into(),
+                grants_hash: "grants-hash".into(),
+            }),
+            Some(AppCommand::ApproveProjectHooks {
+                fingerprint: "manifest-hash".into(),
+                grants_hash: "grants-hash".into(),
+            })
+        );
     }
 
     #[test]

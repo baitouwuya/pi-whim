@@ -59,6 +59,7 @@ pub enum AppCommand {
     SaveProjectAgentsMd(String),
     ApproveProjectHooks {
         fingerprint: String,
+        grants_hash: String,
     },
     RevokeProjectHooks,
     SetOneShotAiConfig(OneShotAiConfig),
@@ -575,6 +576,7 @@ mod tests {
             AppCommand::SaveProjectAgentsMd("project".into()),
             AppCommand::ApproveProjectHooks {
                 fingerprint: "fingerprint".into(),
+                grants_hash: "grants-hash".into(),
             },
             AppCommand::RevokeProjectHooks,
             AppCommand::SetOneShotAiConfig(OneShotAiConfig::default()),

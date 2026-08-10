@@ -18,11 +18,11 @@ use std::{
 
 use pi_whim_core::{
     Action, AgentPermissionLevel, AppState, Attachment, ConversationItem, ConversationRole,
-    HookAuditRecord, HookAuditSummary, HookConfig, Language, ModelOption, Project,
-    ProjectHookStatus, ProjectId, ProviderId, ProviderProfile, ProviderProtocol, QueueMode,
-    SESSION_TITLE_TASK_KIND, SearchEngineId, SearchEngineProfile, SessionMetrics, SessionStatus,
-    SessionSummary, SubmitMode, ThinkingLevel, ToolAuditRecord, normalize_bash_patterns,
-    normalize_provider_display_name, provider_name_key, stable_session_id, strings,
+    HookAuditRecord, HookAuditSummary, Language, ModelOption, Project, ProjectHookStatus,
+    ProjectId, ProviderId, ProviderProfile, ProviderProtocol, QueueMode, SESSION_TITLE_TASK_KIND,
+    SearchEngineId, SearchEngineProfile, SessionMetrics, SessionStatus, SessionSummary, SubmitMode,
+    ThinkingLevel, ToolAuditRecord, normalize_bash_patterns, normalize_provider_display_name,
+    provider_name_key, stable_session_id, strings,
 };
 use pi_whim_one_shot_ai::{
     OneShotAiService, OneShotCompletion, OneShotErrorKind, OneShotRequestId,
@@ -31,8 +31,8 @@ use pi_whim_one_shot_ai::{
 use pi_whim_persistence::{
     AppPreferences, AttachmentStore, HookAuditEntry, HookRepository, MacosKeychainStore,
     PreferencesRepository, ProjectRepository, ProviderRepository, SearchEngineRepository,
-    SecretStore, SessionRepository, SqliteStore, ToolAuditEntry, hook_configuration_fingerprints,
-    hook_manifest_fingerprint, persist_session_title_to_jsonl, session_summary_from_jsonl,
+    SecretStore, SessionRepository, SqliteStore, ToolAuditEntry, persist_session_title_to_jsonl,
+    session_summary_from_jsonl,
 };
 use pi_whim_runtime::{AgentRuntime, PiRpcRuntime, RuntimeEvent, RuntimeStart};
 use serde_json::{Value, json};
@@ -548,9 +548,10 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             AppCommand::LoadAgentsMdFiles
             | AppCommand::SaveGlobalAgentsMd(_)
             | AppCommand::SaveProjectAgentsMd(_) => {}
-            AppCommand::ApproveProjectHooks { fingerprint } => {
-                self.approve_project_hooks(&fingerprint)
-            }
+            AppCommand::ApproveProjectHooks {
+                fingerprint,
+                grants_hash,
+            } => self.approve_project_hooks(&fingerprint, &grants_hash),
             AppCommand::RevokeProjectHooks => self.revoke_project_hooks(),
             AppCommand::SetAgentTeamConfig(config) => {
                 let config = config.normalized();
@@ -582,7 +583,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         }
     }
 
-    fn approve_project_hooks(&mut self, expected_fingerprint: &str) {
+    fn approve_project_hooks(&mut self, expected_fingerprint: &str, expected_grants_hash: &str) {
         let Some(project) = self
             .state()
             .selected_project
@@ -591,29 +592,33 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             return;
         };
         let path = Path::new(&project.path).join(".pi-whim/hooks.json");
-        let fingerprint = match fs::read(&path).and_then(|source| {
-            let config = serde_json::from_slice::<HookConfig>(&source)
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-            config
-                .validate()
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-            hook_configuration_fingerprints(&source, &config).map(|value| value.combined)
+        let prepared = match fs::read(&path).and_then(|source| {
+            hooks::manifest::prepare_manifest(&source, true, None)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
         }) {
-            Ok(fingerprint) => fingerprint,
+            Ok(prepared) => prepared,
             Err(error) => {
                 self.emit_error(error.to_string());
                 return;
             }
         };
-        if fingerprint != expected_fingerprint {
-            self.emit_error("project hook manifest changed before approval");
-            self.restart_selected_project();
+        if prepared.fingerprint != expected_fingerprint
+            || prepared.grants_hash != expected_grants_hash
+        {
+            self.emit_error("project hook manifest or grants changed before approval");
+            let _ = self.load_hooks(&project.path);
             return;
         }
         let Some(store) = self.store.as_ref() else {
             return;
         };
-        if let Err(error) = store.approve_project_hooks(&project.path, &fingerprint, now_ms()) {
+        let record = pi_whim_persistence::HookProjectTrustRecord {
+            fingerprint: prepared.fingerprint,
+            grants_hash: prepared.grants_hash,
+            grants: prepared.grants,
+            approved_at_ms: now_ms(),
+        };
+        if let Err(error) = store.approve_project_hooks(&project.path, &record) {
             self.emit_error(error.to_string());
             return;
         }
@@ -635,6 +640,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             self.emit_error(error.to_string());
             return;
         }
+        self.hook_host.revoke_project(Path::new(&project.path));
         let _ = self.load_hooks(&project.path);
         self.request_hook_reload(project.id);
     }
@@ -1400,11 +1406,23 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             hooks.project.as_ref(),
         ) {
             Ok(scope) => scope,
-            Err(error) => {
+            Err(error) if !hooks.requires_shared_scope() => {
                 self.emit_error(format!(
-                    "failed to create shared hook scope; using legacy hook runtime: {error}"
+                    "failed to create shared hook scope; using legacy v1 hook runtime: {error}"
                 ));
                 None
+            }
+            Err(error) => {
+                let message = format!(
+                    "failed to create required v2 shared hook scope; session was not started: {error}"
+                );
+                if self.sessions.active_key().is_none() {
+                    self.apply(Action::SetSessionStatus(SessionStatus::Failed(
+                        message.clone(),
+                    )));
+                }
+                self.emit_error(message);
+                return None;
             }
         };
         if let Err(error) = runtime.start(RuntimeStart {
@@ -1455,11 +1473,13 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         let source = match fs::read(&path) {
             Ok(source) => source,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.revoke_project_hook_scope(project_path);
                 self.apply(Action::SetProjectHookStatus(ProjectHookStatus::NotPresent));
                 return hooks::LoadedHooks::global_only(global);
             }
             Err(error) => {
                 let message = format!("failed to read project hook manifest: {error}");
+                self.revoke_project_hook_scope(project_path);
                 self.apply(Action::SetProjectHookStatus(ProjectHookStatus::Invalid(
                     message.clone(),
                 )));
@@ -1467,12 +1487,10 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 return hooks::LoadedHooks::global_only(global);
             }
         };
-        let mut project = match serde_json::from_slice::<HookConfig>(&source)
-            .map_err(|error| error.to_string())
-            .and_then(|config| config.validate().map(|()| config))
-        {
-            Ok(config) => config,
+        let project = match hooks::manifest::prepare_manifest(&source, true, None) {
+            Ok(project) => project,
             Err(error) => {
+                self.revoke_project_hook_scope(project_path);
                 self.apply(Action::SetProjectHookStatus(ProjectHookStatus::Invalid(
                     error.clone(),
                 )));
@@ -1483,60 +1501,48 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 return hooks::LoadedHooks::global_only(global);
             }
         };
-        let fingerprints = match hook_configuration_fingerprints(&source, &project) {
-            Ok(fingerprints) => fingerprints,
-            Err(error) => {
-                let message = format!("failed to fingerprint project hooks: {error}");
-                self.apply(Action::SetProjectHookStatus(ProjectHookStatus::Invalid(
-                    message.clone(),
-                )));
-                self.emit_error(message);
-                return hooks::LoadedHooks::global_only(global);
-            }
-        };
-        let fingerprint = fingerprints.combined;
-        let hook_count = project.hooks.len();
         let trusted = self
             .store
             .as_ref()
-            .and_then(|store| store.trusted_hook_fingerprint(project_path).ok().flatten())
-            .is_some_and(|trusted| trusted == fingerprint);
+            .and_then(|store| store.project_hook_trust(project_path).ok().flatten())
+            .is_some_and(|trusted| {
+                trusted.fingerprint == project.fingerprint
+                    && trusted.grants_hash == project.grants_hash
+                    && trusted.grants == project.grants
+                    && !trusted.grants_hash.is_empty()
+            });
         if !trusted {
+            self.revoke_project_hook_scope(project_path);
             self.apply(Action::SetProjectHookStatus(
                 ProjectHookStatus::ApprovalRequired {
-                    fingerprint,
-                    hook_count,
+                    fingerprint: project.fingerprint.clone(),
+                    grants_hash: project.grants_hash.clone(),
+                    grants: project.grants.clone(),
                 },
             ));
             return hooks::LoadedHooks::global_only(global);
         }
-        for (hook, entrypoint_fingerprint) in project.hooks.iter_mut().zip(fingerprints.entrypoints)
-        {
-            hook.entrypoint_fingerprint = Some(entrypoint_fingerprint);
-        }
-        project.revision = format!("sha256:{fingerprint}");
-        let mut legacy = global.clone();
-        legacy.hooks.extend(project.hooks.clone());
-        if let Err(error) = legacy.validate() {
-            self.apply(Action::SetProjectHookStatus(ProjectHookStatus::Invalid(
-                error.clone(),
-            )));
-            self.emit_error(error);
-            return hooks::LoadedHooks::global_only(HookConfig::default());
-        }
-        legacy.revision = format!(
-            "sha256:{}",
-            hook_manifest_fingerprint(&serde_json::to_vec(&legacy).unwrap_or_default())
-        );
+        let loaded = match hooks::LoadedHooks::approved(global.clone(), project.clone()) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                self.revoke_project_hook_scope(project_path);
+                self.apply(Action::SetProjectHookStatus(ProjectHookStatus::Invalid(
+                    error.clone(),
+                )));
+                self.emit_error(error);
+                return hooks::LoadedHooks::global_only(global);
+            }
+        };
         self.apply(Action::SetProjectHookStatus(ProjectHookStatus::Approved {
-            fingerprint,
-            hook_count,
+            fingerprint: project.fingerprint,
+            grants_hash: project.grants_hash,
+            grants: project.grants,
         }));
-        hooks::LoadedHooks {
-            legacy,
-            global,
-            project: Some(project),
-        }
+        loaded
+    }
+
+    fn revoke_project_hook_scope(&mut self, project_path: &str) {
+        self.hook_host.revoke_project(Path::new(project_path));
     }
 
     fn refresh_hook_audit(&mut self, project_path: &str) {
@@ -1559,44 +1565,30 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         self.apply(Action::SetHookAudit(entries));
     }
 
-    fn load_global_hooks(&mut self) -> HookConfig {
+    fn load_global_hooks(&mut self) -> hooks::manifest::PreparedHookManifest {
         let Some(root) = self
             .hook_config_root_override
             .clone()
             .or_else(|| dirs::config_dir().map(|path| path.join("pi-whim")))
         else {
-            return HookConfig::default();
+            return global_hook_fallback();
         };
         let path = root.join("hooks.json");
-        match fs::read_to_string(&path) {
-            Ok(source) => match serde_json::from_str::<HookConfig>(&source) {
-                Ok(config) => match config.validate() {
-                    Ok(()) => {
-                        let mut config = config;
-                        config.revision =
-                            format!("sha256:{}", hook_manifest_fingerprint(source.as_bytes()));
-                        config
-                    }
-                    Err(error) => {
-                        self.emit_error(format!(
-                            "invalid hook manifest {}: {error}",
-                            path.display()
-                        ));
-                        HookConfig::default()
-                    }
-                },
+        match fs::read(&path) {
+            Ok(source) => match hooks::manifest::prepare_manifest(&source, false, None) {
+                Ok(manifest) => manifest,
                 Err(error) => {
                     self.emit_error(format!("invalid hook manifest {}: {error}", path.display()));
-                    HookConfig::default()
+                    global_hook_fallback()
                 }
             },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => HookConfig::default(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => global_hook_fallback(),
             Err(error) => {
                 self.emit_error(format!(
                     "failed to read hook manifest {}: {error}",
                     path.display()
                 ));
-                HookConfig::default()
+                global_hook_fallback()
             }
         }
     }
@@ -3297,6 +3289,10 @@ fn hotkeys(language: Language) -> String {
     format!("{}\n\n{lines}", say("hotkeys"))
 }
 
+fn global_hook_fallback() -> hooks::manifest::PreparedHookManifest {
+    hooks::manifest::empty_manifest("v1:global-empty")
+}
+
 /// Pi accepts an environment reference here, keeping API keys out of models.json.
 fn applescript_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
@@ -3317,6 +3313,7 @@ mod tests {
         ApprovedHookManifest, EventRegistry, HookAuditOutcome, HookHostManager, HookManifest,
         HookScopeKey,
     };
+    use pi_whim_persistence::hook_manifest_fingerprint;
     use pi_whim_runtime::FakeRuntime;
     #[cfg(target_os = "macos")]
     use pi_whim_runtime::RuntimeHookScope;
@@ -3589,7 +3586,7 @@ done
     }
 
     #[test]
-    fn project_hooks_require_an_exact_manifest_fingerprint() {
+    fn disabled_project_hooks_immediately_revoke_the_retained_scope() {
         let directory = tempfile::tempdir().unwrap();
         let project_path = directory.path().join("project");
         fs::create_dir_all(project_path.join(".pi-whim")).unwrap();
@@ -3611,27 +3608,85 @@ done
         app.apply(Action::SelectProject(project.id));
 
         assert!(app.load_hooks(&project.path).legacy.hooks.is_empty());
-        let fingerprint = match &app.state().project_hook_status {
-            ProjectHookStatus::ApprovalRequired { fingerprint, .. } => fingerprint.clone(),
+        let record = match &app.state().project_hook_status {
+            ProjectHookStatus::ApprovalRequired {
+                fingerprint,
+                grants_hash,
+                grants,
+            } => pi_whim_persistence::HookProjectTrustRecord {
+                fingerprint: fingerprint.clone(),
+                grants_hash: grants_hash.clone(),
+                grants: grants.clone(),
+                approved_at_ms: 1,
+            },
             status => panic!("unexpected status: {status:?}"),
         };
         app.store
             .as_ref()
             .unwrap()
-            .approve_project_hooks(&project.path, &fingerprint, 1)
+            .approve_project_hooks(&project.path, &record)
             .unwrap();
-        assert_eq!(app.load_hooks(&project.path).legacy.hooks.len(), 1);
-        assert!(matches!(
-            app.state().project_hook_status,
-            ProjectHookStatus::Approved { .. }
-        ));
+        let loaded = app.load_hooks(&project.path);
+        assert_eq!(loaded.legacy.hooks.len(), 1);
+        let scope = app
+            .hook_host
+            .resolve_scope(
+                Path::new(&project.path),
+                &loaded.global,
+                loaded.project.as_ref(),
+            )
+            .unwrap()
+            .unwrap();
+        let retained = scope.scope();
+        assert!(app.hook_host.controller(Path::new(&project.path)).is_some());
 
-        fs::write(project_path.join("policy-hook"), "#!/bin/sh\nexit 1\n").unwrap();
-        assert!(app.load_hooks(&project.path).legacy.hooks.is_empty());
+        fs::write(&entrypoint, "#!/bin/sh\nexit 1\n").unwrap();
+        app.approve_project_hooks(&record.fingerprint, &record.grants_hash);
         assert!(matches!(
             app.state().project_hook_status,
             ProjectHookStatus::ApprovalRequired { .. }
         ));
+        assert!(retained.is_revoked());
+        assert!(app.hook_host.controller(Path::new(&project.path)).is_none());
+
+        let changed_record = match &app.state().project_hook_status {
+            ProjectHookStatus::ApprovalRequired {
+                fingerprint,
+                grants_hash,
+                grants,
+            } => pi_whim_persistence::HookProjectTrustRecord {
+                fingerprint: fingerprint.clone(),
+                grants_hash: grants_hash.clone(),
+                grants: grants.clone(),
+                approved_at_ms: 2,
+            },
+            status => panic!("unexpected status: {status:?}"),
+        };
+        app.store
+            .as_ref()
+            .unwrap()
+            .approve_project_hooks(&project.path, &changed_record)
+            .unwrap();
+        let loaded = app.load_hooks(&project.path);
+        let scope = app
+            .hook_host
+            .resolve_scope(
+                Path::new(&project.path),
+                &loaded.global,
+                loaded.project.as_ref(),
+            )
+            .unwrap()
+            .unwrap();
+        let retained = scope.scope();
+
+        fs::remove_file(&manifest_path).unwrap();
+        assert!(app.load_hooks(&project.path).legacy.hooks.is_empty());
+        assert!(matches!(
+            app.state().project_hook_status,
+            ProjectHookStatus::NotPresent
+        ));
+        assert!(retained.is_revoked());
+        assert!(app.hook_host.controller(Path::new(&project.path)).is_none());
     }
 
     #[test]
@@ -3646,9 +3701,19 @@ done
 
         let config_root = directory.path().join("config");
         fs::create_dir_all(&config_root).unwrap();
+        let entrypoint = directory.path().join("global-hook");
+        fs::write(&entrypoint, "#!/bin/sh\nexit 0\n").unwrap();
         fs::write(
             config_root.join("hooks.json"),
-            br#"{"version":1,"hooks":[{"id":"gate","event":"tool_dispatching","command":["/bin/true"]}]}"#,
+            serde_json::to_vec(&json!({
+                "version": 1,
+                "hooks": [{
+                    "id": "gate",
+                    "event": "tool_dispatching",
+                    "command": [entrypoint]
+                }]
+            }))
+            .unwrap(),
         )
         .unwrap();
         app.submit_prompt("held input".into(), Vec::new(), SubmitMode::Prompt);
@@ -3701,13 +3766,24 @@ done
         let mut app = test_application(&directory, runtime);
         start_test_session(&mut app, &directory);
         let project_id = app.state().selected_project.unwrap();
-        let fingerprint = match &app.state().project_hook_status {
-            ProjectHookStatus::ApprovalRequired { fingerprint, .. } => fingerprint.clone(),
+        let (fingerprint, grants_hash) = match &app.state().project_hook_status {
+            ProjectHookStatus::ApprovalRequired {
+                fingerprint,
+                grants_hash,
+                ..
+            } => (fingerprint.clone(), grants_hash.clone()),
             status => panic!("unexpected status: {status:?}"),
         };
         app.apply(Action::SetSessionStatus(SessionStatus::Streaming));
 
-        app.approve_project_hooks(&fingerprint);
+        app.approve_project_hooks(&fingerprint, "stale-grants-hash");
+        assert!(matches!(
+            app.state().project_hook_status,
+            ProjectHookStatus::ApprovalRequired { .. }
+        ));
+        assert_eq!(observer.starts().len(), 1);
+
+        app.approve_project_hooks(&fingerprint, &grants_hash);
         assert_eq!(observer.starts().len(), 1);
         assert!(app.pending_hook_reloads.contains(&project_id));
         assert!(matches!(

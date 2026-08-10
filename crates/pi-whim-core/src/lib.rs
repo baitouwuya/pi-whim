@@ -573,17 +573,75 @@ pub enum HookEvent {
     TeamReset,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Exact, persistence-safe Hook authorization metadata.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HookGrantDescriptor {
+    pub hook_id: String,
+    pub event: String,
+    pub kind: HookGrantKind,
+    pub fields: Vec<String>,
+    pub matcher: HookGrantMatcher,
+    pub delivery: HookGrantDelivery,
+    pub restart: HookGrantRestart,
+    pub entrypoint_sha256: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookGrantKind {
+    Gate,
+    Transform,
+    Observe,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HookGrantMatcher {
+    #[serde(default)]
+    pub tools: Vec<String>,
+    #[serde(default)]
+    pub agent_levels: Vec<u8>,
+    #[serde(default)]
+    pub metadata: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HookGrantDelivery {
+    pub mode: HookGrantDeliveryMode,
+    pub capacity: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookGrantDeliveryMode {
+    RequestResponse,
+    StateLatest,
+    Telemetry,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HookGrantRestart {
+    pub max_restarts: u32,
+    pub initial_backoff_ms: u64,
+    pub max_backoff_ms: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProjectHookStatus {
     #[default]
     NotPresent,
     ApprovalRequired {
         fingerprint: String,
-        hook_count: usize,
+        grants_hash: String,
+        grants: Vec<HookGrantDescriptor>,
     },
     Approved {
         fingerprint: String,
-        hook_count: usize,
+        grants_hash: String,
+        grants: Vec<HookGrantDescriptor>,
     },
     Invalid(String),
 }

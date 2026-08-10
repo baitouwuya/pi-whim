@@ -96,6 +96,7 @@ pub enum SettingsEvent {
     SetAgentTeamConfig(AgentTeamConfig),
     ApproveProjectHooks {
         fingerprint: String,
+        grants_hash: String,
     },
     RevokeProjectHooks,
     SetOneShotAiConfig(OneShotAiConfig),

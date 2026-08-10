@@ -1,20 +1,17 @@
 use std::{
     any::Any,
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{HashMap, VecDeque},
     path::Path,
     sync::{Arc, Mutex},
 };
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use pi_whim_core::HookConfig;
 use pi_whim_hook_host::{
-    ApprovedHookManifest, EventRegistry, HookAuditEvent, HookAuditOutcome, HookHostHealth,
-    HookHostManager, HookInvocationContext, HookManifest, HookScopeKey,
+    EventRegistry, HookAuditEvent, HookAuditOutcome, HookHostHealth, HookHostManager,
+    HookInvocationContext, HookScopeKey,
 };
 use pi_whim_persistence::hook_manifest_fingerprint;
 use pi_whim_runtime::RuntimeHookScope;
-
-const EMPTY_GLOBAL_REVISION: &str = "v1:global-empty";
 
 #[cfg(test)]
 static HOOK_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -29,6 +26,7 @@ pub(super) fn hook_test_lock() -> Result<std::sync::MutexGuard<'static, ()>, Str
     reason = "the Host will call the typed command controller in the next integration task"
 )]
 mod commands;
+pub(super) mod manifest;
 
 #[allow(
     unused_imports,
@@ -38,22 +36,48 @@ pub(crate) use commands::{CommandHookController, CommandHookError};
 
 #[derive(Clone, Debug)]
 pub(super) struct LoadedHooks {
-    pub(super) legacy: HookConfig,
-    pub(super) global: HookConfig,
-    pub(super) project: Option<HookConfig>,
+    pub(super) legacy: pi_whim_core::HookConfig,
+    pub(super) global: manifest::PreparedHookManifest,
+    pub(super) project: Option<manifest::PreparedHookManifest>,
+    revision: String,
 }
 
 impl LoadedHooks {
-    pub(super) fn global_only(global: HookConfig) -> Self {
+    pub(super) fn global_only(global: manifest::PreparedHookManifest) -> Self {
         Self {
-            legacy: global.clone(),
+            legacy: global.legacy.clone(),
+            revision: global.revision().to_owned(),
             global,
             project: None,
         }
     }
 
+    pub(super) fn approved(
+        global: manifest::PreparedHookManifest,
+        project: manifest::PreparedHookManifest,
+    ) -> Result<Self, String> {
+        let revision = combined_revision(&global, Some(&project))?;
+        let mut legacy = global.legacy.clone();
+        legacy.hooks.extend(project.legacy.hooks.clone());
+        legacy.revision = revision.clone();
+        legacy.validate()?;
+        Ok(Self {
+            legacy,
+            global,
+            project: Some(project),
+            revision,
+        })
+    }
+
     pub(super) fn revision(&self) -> &str {
-        &self.legacy.revision
+        &self.revision
+    }
+
+    pub(super) fn requires_shared_scope(&self) -> bool {
+        (!self.global.is_empty() && self.global.approved.manifest.version == 2)
+            || self.project.as_ref().is_some_and(|project| {
+                !project.is_empty() && project.approved.manifest.version == 2
+            })
     }
 }
 
@@ -119,21 +143,22 @@ impl ApplicationHookHost {
     pub(super) fn resolve_scope(
         &mut self,
         project_path: &Path,
-        global: &HookConfig,
-        project: Option<&HookConfig>,
+        global: &manifest::PreparedHookManifest,
+        project: Option<&manifest::PreparedHookManifest>,
     ) -> Result<Option<RuntimeHookScope>, String> {
         let project_key = project_path.to_string_lossy().into_owned();
-        if global.hooks.is_empty() && project.is_none_or(|config| config.hooks.is_empty()) {
+        if global.is_empty() && project.is_none_or(manifest::PreparedHookManifest::is_empty) {
             self.latest_scopes.remove(&project_key);
             return Ok(None);
         }
 
         let global_revision = effective_global_revision(global);
         if !self.owners.contains_key(&global_revision) {
-            let approved_global = approved_manifest(global, &global_revision)?;
-            let manager =
-                HookHostManager::new_with_registry(EventRegistry::default(), approved_global)
-                    .map_err(|error| error.to_string())?;
+            let manager = HookHostManager::new_with_registry(
+                EventRegistry::default(),
+                global.approved.clone(),
+            )
+            .map_err(|error| error.to_string())?;
             let audit_sender = self.audit_sender.clone();
             let audit_subscription = manager.audit_signal().subscribe_fn(move |event| {
                 let _ = audit_sender.send(event);
@@ -159,9 +184,12 @@ impl ApplicationHookHost {
         let scope_revision = combined_revision(global, project)?;
         let key = HookScopeKey::project(project_path, scope_revision.clone())
             .map_err(|error| error.to_string())?;
-        let project_manifest = project
-            .map(|config| approved_manifest(config, &scope_revision))
-            .transpose()?;
+        let project_manifest = project.map(|prepared| {
+            let mut approved = prepared.approved.clone();
+            approved.revision = scope_revision.clone();
+            approved.manifest.revision = scope_revision.clone();
+            approved
+        });
         let manager = self
             .owners
             .get(&global_revision)
@@ -176,6 +204,13 @@ impl ApplicationHookHost {
         self.latest_scopes
             .insert(project_key, runtime_scope.clone());
         Ok(Some(runtime_scope))
+    }
+
+    pub(super) fn revoke_project(&mut self, project_path: &Path) {
+        let project_key = project_path.to_string_lossy();
+        if let Some(runtime_scope) = self.latest_scopes.remove(project_key.as_ref()) {
+            runtime_scope.scope().revoke();
+        }
     }
 
     pub(super) fn controller(&self, project_path: &Path) -> Option<CommandHookController> {
@@ -245,39 +280,18 @@ impl ApplicationHookHost {
     }
 }
 
-fn approved_manifest(config: &HookConfig, revision: &str) -> Result<ApprovedHookManifest, String> {
-    config.validate()?;
-    let fingerprints = config
-        .hooks
-        .iter()
-        .filter_map(|hook| {
-            hook.entrypoint_fingerprint
-                .as_ref()
-                .map(|fingerprint| (hook.id.clone(), fingerprint.clone()))
-        })
-        .collect::<BTreeMap<_, _>>();
-    let json = serde_json::to_string(config).map_err(|error| error.to_string())?;
-    let manifest = HookManifest::parse_json(&json)
-        .and_then(|manifest| {
-            manifest
-                .with_revision(revision)
-                .with_entrypoint_fingerprints(&fingerprints)
-        })
-        .map_err(|error| error.to_string())?;
-    ApprovedHookManifest::new(manifest, revision, fingerprints).map_err(|error| error.to_string())
+fn effective_global_revision(config: &manifest::PreparedHookManifest) -> String {
+    config.revision().to_owned()
 }
 
-fn effective_global_revision(config: &HookConfig) -> String {
-    if config.revision.is_empty() {
-        EMPTY_GLOBAL_REVISION.to_owned()
-    } else {
-        config.revision.clone()
-    }
-}
-
-fn combined_revision(global: &HookConfig, project: Option<&HookConfig>) -> Result<String, String> {
-    let project_revision = project.map(|config| config.revision.as_str()).unwrap_or("");
-    let encoded = serde_json::to_vec(&(effective_global_revision(global), project_revision))
+fn combined_revision(
+    global: &manifest::PreparedHookManifest,
+    project: Option<&manifest::PreparedHookManifest>,
+) -> Result<String, String> {
+    let project_revision = project
+        .map(manifest::PreparedHookManifest::revision)
+        .unwrap_or("");
+    let encoded = serde_json::to_vec(&(global.revision(), project_revision))
         .map_err(|error| error.to_string())?;
     Ok(format!("sha256:{}", hook_manifest_fingerprint(&encoded)))
 }
@@ -323,11 +337,13 @@ mod tests {
         Ok(path.to_string_lossy().into_owned())
     }
 
-    fn gate_config(id: &str, command: String, revision: &str) -> HookConfig {
-        let entrypoint_fingerprint = fs::read(&command)
-            .map(|source| hook_manifest_fingerprint(&source))
-            .ok();
-        HookConfig {
+    fn gate_manifest(
+        id: &str,
+        command: String,
+        revision: &str,
+        project_scoped: bool,
+    ) -> Result<manifest::PreparedHookManifest, String> {
+        let config = pi_whim_core::HookConfig {
             version: 1,
             hooks: vec![HookDefinition {
                 id: id.to_owned(),
@@ -336,10 +352,35 @@ mod tests {
                 command: vec![command],
                 timeout_ms: Some(1_000),
                 matcher: HookMatcher::default(),
-                entrypoint_fingerprint,
+                entrypoint_fingerprint: None,
             }],
-            revision: revision.to_owned(),
-        }
+            revision: String::new(),
+        };
+        let source = serde_json::to_vec(&config).map_err(|error| error.to_string())?;
+        manifest::prepare_manifest(&source, project_scoped, Some(revision))
+    }
+
+    fn v2_command_manifest(
+        id: &str,
+        command: String,
+        revision: &str,
+    ) -> Result<manifest::PreparedHookManifest, String> {
+        let source = serde_json::to_vec(&json!({
+            "version": 2,
+            "hooks": [{
+                "id": id,
+                "event": "pi.ui.command.submitting",
+                "kind": "gate",
+                "command": [command],
+                "fields": ["command_id", "command_name", "source", "project_id", "arguments"]
+            }]
+        }))
+        .map_err(|error| error.to_string())?;
+        manifest::prepare_manifest(&source, true, Some(revision))
+    }
+
+    fn empty_global() -> manifest::PreparedHookManifest {
+        manifest::empty_manifest("v1:global-empty")
     }
 
     fn gate(scope: &RuntimeHookScope) -> Result<HookGateDecision, String> {
@@ -370,12 +411,13 @@ mod tests {
         let _guard = hook_test_lock()?;
         let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
         let mut host = ApplicationHookHost::default();
-        let global = HookConfig::default();
-        let project = gate_config(
+        let global = empty_global();
+        let project = gate_manifest(
             "project",
             script(&directory, "allow.sh", "allow")?,
             "project-r1",
-        );
+            true,
+        )?;
         let first = host
             .resolve_scope(directory.path(), &global, Some(&project))?
             .ok_or_else(|| "expected first scope".to_owned())?;
@@ -393,24 +435,77 @@ mod tests {
     }
 
     #[test]
+    fn v2_project_manifest_is_shared_only() -> Result<(), String> {
+        let _guard = hook_test_lock()?;
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let mut host = ApplicationHookHost::default();
+        let global = empty_global();
+        let project = v2_command_manifest(
+            "project-v2",
+            script(&directory, "resident.sh", "allow")?,
+            "project-v2-r1",
+        )?;
+        let loaded = LoadedHooks::approved(global, project)?;
+
+        assert!(loaded.legacy.hooks.is_empty());
+        assert!(loaded.requires_shared_scope());
+        let scope = host
+            .resolve_scope(directory.path(), &loaded.global, loaded.project.as_ref())?
+            .ok_or_else(|| "expected v2 shared scope".to_owned())?;
+        assert!(!scope.scope().is_revoked());
+        assert!(host.controller(directory.path()).is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn revoking_project_immediately_revokes_shared_scope_and_controller() -> Result<(), String> {
+        let _guard = hook_test_lock()?;
+        let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let mut host = ApplicationHookHost::default();
+        let global = empty_global();
+        let project = gate_manifest(
+            "project",
+            script(&directory, "allow-revoke.sh", "allow")?,
+            "project-r1",
+            true,
+        )?;
+        let scope = host
+            .resolve_scope(directory.path(), &global, Some(&project))?
+            .ok_or_else(|| "expected project scope".to_owned())?;
+        let retained = scope.scope();
+        assert!(host.controller(directory.path()).is_some());
+
+        host.revoke_project(directory.path());
+
+        assert!(retained.is_revoked());
+        assert!(host.controller(directory.path()).is_none());
+        Ok(())
+    }
+
+    #[test]
     fn project_revision_changes_scope_but_reuses_global_owner() -> Result<(), String> {
         let _guard = hook_test_lock()?;
         let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
         let mut host = ApplicationHookHost::default();
-        let global = HookConfig::default();
+        let global = empty_global();
         let command = script(&directory, "allow.sh", "allow")?;
         let first = host
             .resolve_scope(
                 directory.path(),
                 &global,
-                Some(&gate_config("project", command.clone(), "project-r1")),
+                Some(&gate_manifest(
+                    "project",
+                    command.clone(),
+                    "project-r1",
+                    true,
+                )?),
             )?
             .ok_or_else(|| "expected first scope".to_owned())?;
         let second = host
             .resolve_scope(
                 directory.path(),
                 &global,
-                Some(&gate_config("project", command, "project-r2")),
+                Some(&gate_manifest("project", command, "project-r2", true)?),
             )?
             .ok_or_else(|| "expected second scope".to_owned())?;
         assert_ne!(first.scope_id(), second.scope_id());
@@ -429,22 +524,24 @@ mod tests {
         let project_a = tempfile::tempdir().map_err(|error| error.to_string())?;
         let project_b = tempfile::tempdir().map_err(|error| error.to_string())?;
         let mut host = ApplicationHookHost::default();
-        let global = HookConfig::default();
-        let project = gate_config(
+        let global = empty_global();
+        let project = gate_manifest(
             "project-deny",
             script(&project_a, "deny.sh", "deny")?,
             "project-r1",
-        );
+            true,
+        )?;
         let scoped = host
             .resolve_scope(project_a.path(), &global, Some(&project))?
             .ok_or_else(|| "expected project scope".to_owned())?;
         assert!(matches!(gate(&scoped)?, HookGateDecision::Deny { .. }));
 
-        let global_only = gate_config(
+        let global_only = gate_manifest(
             "global-allow",
             script(&project_b, "allow.sh", "allow")?,
             "global-r1",
-        );
+            false,
+        )?;
         let other = host
             .resolve_scope(project_b.path(), &global_only, None)?
             .ok_or_else(|| "expected global scope".to_owned())?;
@@ -457,12 +554,13 @@ mod tests {
         let _guard = hook_test_lock()?;
         let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
         let mut host = ApplicationHookHost::default();
-        let global = HookConfig::default();
-        let project = gate_config(
+        let global = empty_global();
+        let project = gate_manifest(
             "project",
             script(&directory, "allow.sh", "allow")?,
             "project-r1",
-        );
+            true,
+        )?;
         let first = host
             .resolve_scope(directory.path(), &global, Some(&project))?
             .ok_or_else(|| "expected first scope".to_owned())?;
@@ -484,11 +582,12 @@ mod tests {
         let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
         let project_file = directory.path().join("not-a-project-directory");
         fs::write(&project_file, b"not a directory").map_err(|error| error.to_string())?;
-        let global = gate_config(
+        let global = gate_manifest(
             "global",
             script(&directory, "allow.sh", "allow")?,
             "global-r1",
-        );
+            false,
+        )?;
         let loaded = LoadedHooks::global_only(global);
         let expected_legacy = loaded.legacy.clone();
         let mut host = ApplicationHookHost::default();
@@ -506,7 +605,7 @@ mod tests {
         let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
         let mut host = ApplicationHookHost::default();
         assert!(
-            host.resolve_scope(directory.path(), &HookConfig::default(), None)?
+            host.resolve_scope(directory.path(), &empty_global(), None)?
                 .is_none()
         );
         assert!(host.owners.is_empty());

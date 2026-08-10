@@ -16,9 +16,9 @@ use std::{
 
 use keyring::Entry;
 use pi_whim_core::{
-    AgentTeamConfig, BashPolicy, HookConfig, Language, OneShotAiConfig, Project, ProjectId,
-    ProviderId, ProviderModel, ProviderProfile, ProviderProtocol, SearchEngineKind,
-    SearchEngineProfile, SessionId, SessionSummary, normalize_bash_patterns,
+    AgentTeamConfig, BashPolicy, HookConfig, HookGrantDescriptor, Language, OneShotAiConfig,
+    Project, ProjectId, ProviderId, ProviderModel, ProviderProfile, ProviderProtocol,
+    SearchEngineKind, SearchEngineProfile, SessionId, SessionSummary, normalize_bash_patterns,
     normalize_provider_display_name, provider_name_key,
 };
 use rusqlite::{Connection, OptionalExtension, params};
@@ -36,6 +36,8 @@ pub enum PersistenceError {
     Keychain(#[from] keyring::Error),
     #[error("filesystem error: {0}")]
     Io(#[from] io::Error),
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
     #[error("application support directory is unavailable")]
     AppSupportUnavailable,
     #[error("a provider named '{0}' already exists")]
@@ -130,16 +132,23 @@ pub struct ToolAuditEntry {
     pub created_at_ms: i64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HookProjectTrustRecord {
+    pub fingerprint: String,
+    pub grants_hash: String,
+    pub grants: Vec<HookGrantDescriptor>,
+    pub approved_at_ms: i64,
+}
+
 pub trait HookRepository {
-    fn trusted_hook_fingerprint(
+    fn project_hook_trust(
         &self,
         project_path: &str,
-    ) -> Result<Option<String>, PersistenceError>;
+    ) -> Result<Option<HookProjectTrustRecord>, PersistenceError>;
     fn approve_project_hooks(
         &self,
         project_path: &str,
-        fingerprint: &str,
-        approved_at_ms: i64,
+        record: &HookProjectTrustRecord,
     ) -> Result<(), PersistenceError>;
     fn revoke_project_hooks(&self, project_path: &str) -> Result<(), PersistenceError>;
     fn append_hook_audit(&self, entry: &HookAuditEntry) -> Result<(), PersistenceError>;
@@ -291,6 +300,8 @@ impl SqliteStore {
             CREATE TABLE IF NOT EXISTS hook_project_trust (
                 project_path TEXT PRIMARY KEY NOT NULL,
                 fingerprint TEXT NOT NULL,
+                grants_hash TEXT NOT NULL DEFAULT '',
+                grants_json TEXT NOT NULL DEFAULT '',
                 approved_at_ms INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS hook_audit (
@@ -328,6 +339,7 @@ impl SqliteStore {
         self.migrate_agent_team_preferences()?;
         self.migrate_session_title_sources()?;
         self.migrate_hook_audit()?;
+        self.migrate_hook_project_trust()?;
         Ok(())
     }
 
@@ -377,6 +389,27 @@ impl SqliteStore {
         if !columns.iter().any(|column| column == "ai_title") {
             self.connection
                 .execute("ALTER TABLE sessions ADD COLUMN ai_title TEXT", [])?;
+        }
+        Ok(())
+    }
+
+    fn migrate_hook_project_trust(&self) -> Result<(), PersistenceError> {
+        let columns = self
+            .connection
+            .prepare("PRAGMA table_info(hook_project_trust)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !columns.iter().any(|column| column == "grants_hash") {
+            self.connection.execute(
+                "ALTER TABLE hook_project_trust ADD COLUMN grants_hash TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
+        if !columns.iter().any(|column| column == "grants_json") {
+            self.connection.execute(
+                "ALTER TABLE hook_project_trust ADD COLUMN grants_json TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
         }
         Ok(())
     }
@@ -787,32 +820,64 @@ impl CredentialRepository for SqliteStore {
 }
 
 impl HookRepository for SqliteStore {
-    fn trusted_hook_fingerprint(
+    fn project_hook_trust(
         &self,
         project_path: &str,
-    ) -> Result<Option<String>, PersistenceError> {
-        Ok(self
+    ) -> Result<Option<HookProjectTrustRecord>, PersistenceError> {
+        let row = self
             .connection
             .query_row(
-                "SELECT fingerprint FROM hook_project_trust WHERE project_path = ?1",
+                "SELECT fingerprint, grants_hash, grants_json, approved_at_ms
+                 FROM hook_project_trust WHERE project_path = ?1",
                 [project_path],
-                |row| row.get(0),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
             )
-            .optional()?)
+            .optional()?;
+        let Some((fingerprint, grants_hash, grants_json, approved_at_ms)) = row else {
+            return Ok(None);
+        };
+        let grants = if grants_json.is_empty() {
+            Vec::new()
+        } else {
+            serde_json::from_str(&grants_json)?
+        };
+        Ok(Some(HookProjectTrustRecord {
+            fingerprint,
+            grants_hash,
+            grants,
+            approved_at_ms,
+        }))
     }
 
     fn approve_project_hooks(
         &self,
         project_path: &str,
-        fingerprint: &str,
-        approved_at_ms: i64,
+        record: &HookProjectTrustRecord,
     ) -> Result<(), PersistenceError> {
+        let grants_json = serde_json::to_string(&record.grants)?;
         self.connection.execute(
-            "INSERT INTO hook_project_trust (project_path, fingerprint, approved_at_ms)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(project_path) DO UPDATE SET fingerprint = excluded.fingerprint,
+            "INSERT INTO hook_project_trust
+             (project_path, fingerprint, grants_hash, grants_json, approved_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(project_path) DO UPDATE SET
+             fingerprint = excluded.fingerprint,
+             grants_hash = excluded.grants_hash,
+             grants_json = excluded.grants_json,
              approved_at_ms = excluded.approved_at_ms",
-            params![project_path, fingerprint, approved_at_ms],
+            params![
+                project_path,
+                record.fingerprint,
+                record.grants_hash,
+                grants_json,
+                record.approved_at_ms
+            ],
         )?;
         Ok(())
     }
@@ -1543,22 +1608,60 @@ mod tests {
     }
 
     #[test]
-    fn project_hook_trust_is_bound_to_the_manifest_fingerprint() {
+    fn project_hook_trust_round_trips_exact_grants() {
         let directory = tempdir().unwrap();
         let store = SqliteStore::open(directory.path().join("test.sqlite")).unwrap();
-        let fingerprint = hook_manifest_fingerprint(br#"{"version":1,"hooks":[]}"#);
-        assert_eq!(fingerprint.len(), 64);
-        assert_eq!(store.trusted_hook_fingerprint("/project").unwrap(), None);
-
-        store
-            .approve_project_hooks("/project", &fingerprint, 42)
-            .unwrap();
-        assert_eq!(
-            store.trusted_hook_fingerprint("/project").unwrap(),
-            Some(fingerprint)
-        );
+        let record = HookProjectTrustRecord {
+            fingerprint: hook_manifest_fingerprint(br#"{"version":2,"hooks":[]}"#),
+            grants_hash: hook_manifest_fingerprint(b"exact-grants"),
+            grants: vec![HookGrantDescriptor {
+                hook_id: "policy".into(),
+                event: "pi.tool.dispatching".into(),
+                kind: pi_whim_core::HookGrantKind::Gate,
+                fields: vec!["tool".into()],
+                matcher: pi_whim_core::HookGrantMatcher::default(),
+                delivery: pi_whim_core::HookGrantDelivery {
+                    mode: pi_whim_core::HookGrantDeliveryMode::RequestResponse,
+                    capacity: 1,
+                },
+                restart: pi_whim_core::HookGrantRestart {
+                    max_restarts: 3,
+                    initial_backoff_ms: 250,
+                    max_backoff_ms: 5_000,
+                },
+                entrypoint_sha256: hook_manifest_fingerprint(b"entrypoint"),
+            }],
+            approved_at_ms: 42,
+        };
+        assert_eq!(store.project_hook_trust("/project").unwrap(), None);
+        store.approve_project_hooks("/project", &record).unwrap();
+        assert_eq!(store.project_hook_trust("/project").unwrap(), Some(record));
         store.revoke_project_hooks("/project").unwrap();
-        assert_eq!(store.trusted_hook_fingerprint("/project").unwrap(), None);
+        assert_eq!(store.project_hook_trust("/project").unwrap(), None);
+    }
+
+    #[test]
+    fn legacy_fingerprint_only_trust_migrates_as_unapproved_metadata() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("legacy.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE hook_project_trust (
+                    project_path TEXT PRIMARY KEY NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    approved_at_ms INTEGER NOT NULL
+                 );
+                 INSERT INTO hook_project_trust VALUES ('/legacy', 'old-fingerprint', 7);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = SqliteStore::open(path).unwrap();
+        let record = store.project_hook_trust("/legacy").unwrap().unwrap();
+        assert_eq!(record.fingerprint, "old-fingerprint");
+        assert!(record.grants_hash.is_empty());
+        assert!(record.grants.is_empty());
     }
 
     #[test]

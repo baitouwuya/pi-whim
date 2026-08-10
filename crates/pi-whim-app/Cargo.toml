@@ -27,6 +27,7 @@ pi-whim-signal = { path = "../pi-whim-signal" }
 pi-whim-theme = { path = "../pi-whim-theme" }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 ureq.workspace = true
 uuid.workspace = true
 

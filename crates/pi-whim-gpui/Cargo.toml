@@ -15,6 +15,7 @@ pi-whim-core = { path = "../pi-whim-core" }
 pi-whim-engine = { path = "../pi-whim-engine" }
 pi-whim-signal = { path = "../pi-whim-signal" }
 pi-whim-theme = { path = "../pi-whim-theme" }
+serde_json.workspace = true
 
 [dev-dependencies]
 # `test-support` is what gives a headless window to drive views without opening
