@@ -6,6 +6,7 @@
 //! against a fake runtime.
 
 pub mod changes;
+pub mod commands;
 pub mod composer;
 pub mod controls;
 pub mod dialogs;
