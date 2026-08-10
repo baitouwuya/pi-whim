@@ -159,6 +159,7 @@ pub enum StateTopic {
     Providers,
     SearchEngines,
     Hooks,
+    /// Reserved for the future committed `AGENTS.md` state surface.
     AgentsMd,
 }
 
@@ -216,7 +217,6 @@ const PREFERENCES: &[StateTopic] = &[StateTopic::Preferences];
 const PROVIDERS: &[StateTopic] = &[StateTopic::Providers];
 const SEARCH_ENGINES: &[StateTopic] = &[StateTopic::SearchEngines];
 const HOOKS: &[StateTopic] = &[StateTopic::Hooks];
-const AGENTS_MD: &[StateTopic] = &[StateTopic::AgentsMd];
 const CONVERSATION: &[StateTopic] = &[StateTopic::Conversation];
 
 /// Map one core action to the topics that its reducer can affect.
@@ -237,7 +237,6 @@ pub fn topics_for_action(action: &Action) -> &'static [StateTopic] {
         | Action::SetAgentTeamConfig(_)
         | Action::SetOneShotAiConfig(_) => PREFERENCES,
         Action::SetProjectHookStatus(_) | Action::SetHookAudit(_) => HOOKS,
-        Action::AgentsMdFilesLoaded(_) => AGENTS_MD,
         Action::ProviderProfilesLoaded(_) | Action::ProviderKeyStatusLoaded(_) => PROVIDERS,
         Action::SearchEngineProfilesLoaded(_) | Action::SearchEngineKeyStatusLoaded(_) => {
             SEARCH_ENGINES
@@ -348,9 +347,9 @@ impl ChangeSet {
 mod tests {
     use super::*;
     use pi_whim_core::{
-        Action, AgentTeamConfig, AgentsMdFiles, ConversationItem, ConversationRole, Language,
-        ModelOption, ProjectHookStatus, QueueMode, SearchEngineProfile, SessionMetrics,
-        SessionStatus, ThinkingLevel,
+        Action, AgentTeamConfig, ConversationItem, ConversationRole, Language, ModelOption,
+        ProjectHookStatus, QueueMode, SearchEngineProfile, SessionMetrics, SessionStatus,
+        ThinkingLevel,
     };
     use uuid::Uuid;
 
@@ -391,7 +390,6 @@ mod tests {
             Action::SetOneShotAiConfig(Default::default()),
             Action::SetProjectHookStatus(ProjectHookStatus::default()),
             Action::SetHookAudit(Vec::new()),
-            Action::AgentsMdFilesLoaded(AgentsMdFiles::default()),
             Action::ProviderProfilesLoaded(Vec::new()),
             Action::ProviderKeyStatusLoaded(Vec::new()),
             Action::SearchEngineProfilesLoaded(Vec::<SearchEngineProfile>::new()),
