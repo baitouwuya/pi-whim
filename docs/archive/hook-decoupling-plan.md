@@ -395,9 +395,9 @@ pub struct AgentSpawningPayload {
 
 **当前硬编码 profile**（bash_dispatch.rs）:
 ```
-(version 1) (deny default) (allow process*) 
-(allow file-read* (subpath "/project") (subpath "/usr") (subpath "/bin") (subpath "/System")) 
-(allow file-write* (subpath "/project")) 
+(version 1) (deny default) (allow process*)
+(allow file-read* (subpath "/project") (subpath "/usr") (subpath "/bin") (subpath "/System"))
+(allow file-write* (subpath "/project"))
 (deny network*)
 ```
 
