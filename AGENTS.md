@@ -14,11 +14,11 @@ governs AI-assisted (pi-driven) contributions.
 
 ## Repository Layout
 
-- `crates/` — 12 crates in a strict acyclic layering (see `docs/architecture.md`). Cargo
+- `crates/` — 14 crates in a strict acyclic layering (see `docs/architecture.md`). Cargo
   dependency edges physically prevent upper layers from reaching lower internals; never add a
   `path =` dependency that crosses the documented boundaries.
-  - Foundation: `pi-whim-core`, `pi-whim-tool-protocol`, `pi-whim-pi-rpc`, `pi-whim-theme`
-  - Mid: `pi-whim-persistence`, `pi-whim-catalog`, `pi-whim-one-shot-ai`, `pi-whim-agent-team`
+  - Foundation: `pi-whim-core`, `pi-whim-signal`, `pi-whim-tool-protocol`, `pi-whim-pi-rpc`, `pi-whim-theme`
+  - Mid: `pi-whim-hook-host`, `pi-whim-persistence`, `pi-whim-catalog`, `pi-whim-one-shot-ai`, `pi-whim-agent-team`
   - Upper: `pi-whim-runtime`, `pi-whim-engine`, `pi-whim-gpui`, `pi-whim-app`
 - `vendor/pi-mono/` — read-only upstream reference (TypeScript AI agent). Model catalog JSON
   under `packages/ai/src/providers/data` is consumed by `crates/pi-whim-core/build.rs`. Never

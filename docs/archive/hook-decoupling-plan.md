@@ -1,3 +1,5 @@
+> **Archived:** This implementation plan has been completed and is retained for historical context. See [Architecture decisions](../architecture.md) and [Hooks](../hooks.md) for the current design.
+
 # Hook 解耦/优化方案
 
 > 基于对 `pi-whim` Hook 系统（15 事件 × 3 种类）及现有硬编码策略的全面分析，制定将内部逻辑迁移到可外部配置 Hook 体系的分阶段计划。

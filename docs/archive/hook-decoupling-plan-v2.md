@@ -1,3 +1,5 @@
+> **Archived:** This implementation plan has been completed and is retained for historical context. See [Architecture decisions](../architecture.md) and [Hooks](../hooks.md) for the current design.
+
 # Hook 解耦/优化方案 v2（架构审查版）
 
 > 本文档审查并替代 `hook-decoupling-plan.md`。目标不是将所有硬编码都变成 Hook，而是在不削弱 capability、沙箱和拓扑安全不变量的前提下，把**可由管理员配置的附加策略**外置。
