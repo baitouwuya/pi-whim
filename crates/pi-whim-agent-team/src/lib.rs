@@ -49,7 +49,7 @@ use pi_whim_core::{
     HookAuditRecord, HookConfig, HookEvent, SearchEngineId, SearchEngineProfile, ToolAuditOutcome,
     ToolAuditRecord, normalize_agent_policy, stable_session_id,
 };
-use pi_whim_hook_host::{HookHostManager, HookScopeHandle};
+use pi_whim_hook_host::HookScopeHandle;
 use pi_whim_tool_protocol::{
     ASK_USER_TOOL, BASH_TOOL, EDIT_FILE_TOOL, FETCH_TOOL, INTERRUPT_AGENT_TOOL, LIST_AGENTS_TOOL,
     LIST_AVAILABLE_MODELS_TOOL, LIST_PENDING_REQUESTS_TOOL, LIST_PROCESSES_TOOL,
@@ -210,15 +210,14 @@ impl AgentSupervisor {
 
     pub fn start_with_hook_scope(
         launch: AgentLaunchConfig,
-        hook_manager: HookHostManager,
         hook_scope: HookScopeHandle,
     ) -> Result<Self, SupervisorError> {
-        Self::start_inner(launch, Some((hook_manager, hook_scope)))
+        Self::start_inner(launch, Some(hook_scope))
     }
 
     fn start_inner(
         mut launch: AgentLaunchConfig,
-        supplied_hooks: Option<(HookHostManager, HookScopeHandle)>,
+        supplied_hooks: Option<HookScopeHandle>,
     ) -> Result<Self, SupervisorError> {
         launch.team_config = launch.team_config.normalized();
         let listener = TcpListener::bind("127.0.0.1:0").map_err(SupervisorError::Bind)?;
@@ -282,13 +281,10 @@ impl AgentSupervisor {
         let (hook_audit_sender, hook_audit_receiver) = std::sync::mpsc::sync_channel(512);
         let (tool_audit_sender, tool_audit_receiver) = std::sync::mpsc::sync_channel(512);
         let hooks = Arc::new(match supplied_hooks {
-            Some((manager, scope)) => hooks::SupervisorHooks::from_scope(
-                manager,
-                scope,
-                &launch.project_path,
-                hook_audit_sender,
-            )
-            .map_err(SupervisorError::HookConfig)?,
+            Some(scope) => {
+                hooks::SupervisorHooks::from_scope(scope, &launch.project_path, hook_audit_sender)
+                    .map_err(SupervisorError::HookConfig)?
+            }
             None => hooks::SupervisorHooks::from_v1_config(
                 launch.hooks.clone(),
                 launch.project_path.clone(),

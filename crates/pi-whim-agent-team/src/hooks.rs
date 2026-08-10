@@ -154,14 +154,13 @@ impl SupervisorHooks {
         }
         match build_v1_scope(&config, &project_root, &audit_sender) {
             Ok((scope, context, subscription)) => {
-                Self::active(scope, context, audit_sender, subscription)
+                Self::active(scope, context, audit_sender, Some(subscription))
             }
             Err(error) => Self::unavailable(audit_sender, error),
         }
     }
 
     pub(crate) fn from_scope(
-        manager: HookHostManager,
         scope: HookScopeHandle,
         project_root: &Path,
         audit_sender: mpsc::SyncSender<HookAuditRecord>,
@@ -175,26 +174,12 @@ impl SupervisorHooks {
         if key.project_root.as_ref() != Some(&canonical_root) {
             return Err("hook scope project root does not match the supervisor project".to_owned());
         }
-        let scope_id = scope.scope_id();
         let context = HookInvocationContext::project(
-            scope_id.clone(),
+            scope.scope_id(),
             key.manifest_revision.clone(),
             canonical_root.to_string_lossy().into_owned(),
         );
-        let adapter_sender = audit_sender.clone();
-        let subscription = manager.audit_signal().subscribe_fn(move |event| {
-            if event.scope_id == scope_id {
-                adapt_host_audit(&adapter_sender, event);
-            }
-        });
-        Ok(Self::active(
-            scope,
-            context,
-            audit_sender,
-            AuditSubscription {
-                _subscription: Box::new(subscription),
-            },
-        ))
+        Ok(Self::active(scope, context, audit_sender, None))
     }
 
     fn inactive(audit_sender: mpsc::SyncSender<HookAuditRecord>) -> Self {
@@ -223,14 +208,14 @@ impl SupervisorHooks {
         scope: HookScopeHandle,
         context: HookInvocationContext,
         audit_sender: mpsc::SyncSender<HookAuditRecord>,
-        subscription: AuditSubscription,
+        subscription: Option<AuditSubscription>,
     ) -> Self {
         Self {
             scope: Some(scope),
             context: Some(context),
             unavailable: None,
             audit_sender,
-            _audit_subscription: Some(Arc::new(subscription)),
+            _audit_subscription: subscription.map(Arc::new),
             observers_stopped: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -506,6 +491,11 @@ impl SupervisorHooks {
     #[cfg(test)]
     fn scope_id(&self) -> Option<String> {
         self.scope.as_ref().map(HookScopeHandle::scope_id)
+    }
+
+    #[cfg(test)]
+    fn adapts_external_audit(&self) -> bool {
+        self._audit_subscription.is_some()
     }
 }
 
@@ -1176,21 +1166,79 @@ mod tests {
         let key = HookScopeKey::project(directory.path(), project.revision.clone()).unwrap();
         let scope = manager.open_scope(key, Some(approved(&project))).unwrap();
         let expected_scope_id = scope.scope_id();
-        let first = SupervisorHooks::from_scope(
-            manager.clone(),
-            scope.clone(),
-            directory.path(),
-            mpsc::sync_channel(8).0,
-        )
-        .unwrap();
-        let second =
-            SupervisorHooks::from_scope(manager, scope, directory.path(), mpsc::sync_channel(8).0)
+        let first =
+            SupervisorHooks::from_scope(scope.clone(), directory.path(), mpsc::sync_channel(8).0)
                 .unwrap();
+        let second =
+            SupervisorHooks::from_scope(scope, directory.path(), mpsc::sync_channel(8).0).unwrap();
         assert_eq!(
             first.scope_id().as_deref(),
             Some(expected_scope_id.as_str())
         );
         assert_eq!(second.scope_id(), first.scope_id());
+        assert!(!first.adapts_external_audit());
+        assert!(!second.adapts_external_audit());
+        drop(manager);
+    }
+
+    #[test]
+    fn shared_scope_does_not_forward_manager_audit_to_supervisors() {
+        if !sandbox_available() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let global_config = config(vec![definition(
+            "shared-allow",
+            HookEvent::ToolDispatching,
+            CoreHookKind::Gate,
+            vec!["/bin/echo".to_owned(), "{}".to_owned()],
+        )]);
+        let manager = HookHostManager::new_with_registry(
+            supervisor_registry().unwrap(),
+            approved(&global_config),
+        )
+        .unwrap();
+        let manager_events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_events = manager_events.clone();
+        let _app_subscription = manager.audit_signal().subscribe_fn(move |event| {
+            captured_events.lock().unwrap().push(event);
+        });
+        let key = HookScopeKey::project(directory.path(), global_config.revision).unwrap();
+        let scope = manager.open_scope(key, None).unwrap();
+        let (first_sender, first_receiver) = mpsc::sync_channel(16);
+        let (second_sender, second_receiver) = mpsc::sync_channel(16);
+        let first =
+            SupervisorHooks::from_scope(scope.clone(), directory.path(), first_sender).unwrap();
+        let second = SupervisorHooks::from_scope(scope, directory.path(), second_sender).unwrap();
+
+        first
+            .control_tool_dispatch(tool_input("read", json!({})), validate_object)
+            .unwrap();
+        second
+            .control_tool_dispatch(tool_input("read", json!({})), validate_object)
+            .unwrap();
+
+        let manager_events = manager_events.lock().unwrap();
+        assert_eq!(
+            manager_events
+                .iter()
+                .filter(|event| event.hook_id == "shared-allow")
+                .count(),
+            2
+        );
+        for receiver in [first_receiver, second_receiver] {
+            let records = receiver.try_iter().collect::<Vec<_>>();
+            assert!(
+                records
+                    .iter()
+                    .any(|record| record.revision == BUILTIN_REVISION)
+            );
+            assert!(
+                records
+                    .iter()
+                    .all(|record| record.hook_id != "shared-allow")
+            );
+        }
     }
 
     #[test]
@@ -1510,6 +1558,7 @@ mod tests {
                 vec!["/bin/echo".to_owned(), "{}".to_owned()],
             )],
         );
+        assert!(pipeline.adapts_external_audit());
         let _ = pipeline.control_tool_dispatch(tool_input("read", json!({})), validate_object);
         let records = receiver.try_iter().collect::<Vec<_>>();
         assert!(records.iter().any(|record| {

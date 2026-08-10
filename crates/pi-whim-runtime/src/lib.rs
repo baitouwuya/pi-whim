@@ -56,8 +56,12 @@ impl RuntimeHookScope {
         self.scope.key()
     }
 
-    fn into_parts(self) -> (HookHostManager, HookScopeHandle) {
-        (self.manager, self.scope)
+    pub fn manager(&self) -> HookHostManager {
+        self.manager.clone()
+    }
+
+    pub fn scope(&self) -> HookScopeHandle {
+        self.scope.clone()
     }
 }
 
@@ -313,8 +317,7 @@ impl AgentRuntime for PiRpcRuntime {
         };
         let mut supervisor = match config.hook_scope {
             Some(hook_scope) => {
-                let (manager, scope) = hook_scope.into_parts();
-                AgentSupervisor::start_with_hook_scope(supervisor_launch, manager, scope)
+                AgentSupervisor::start_with_hook_scope(supervisor_launch, hook_scope.scope())
             }
             None => AgentSupervisor::start(supervisor_launch),
         }
@@ -670,6 +673,14 @@ mod tests {
         let cloned = scope.clone();
         assert_eq!(cloned.scope_id(), scope.scope_id());
         assert_eq!(cloned.key(), scope.key());
+        assert_eq!(scope.scope().scope_id(), scope.scope_id());
+        assert!(
+            scope
+                .manager()
+                .registry()
+                .spec("pi.tool.dispatching")
+                .is_some()
+        );
         let debug = format!("{scope:?}");
         assert!(debug.contains("RuntimeHookScope"));
         assert!(debug.contains(&scope.scope_id()));
@@ -703,7 +714,7 @@ mod tests {
     #[test]
     fn pi_runtime_uses_shared_scope_branch_when_present() {
         let scope = shared_scope(&env::temp_dir());
-        scope.scope.revoke();
+        scope.scope().revoke();
         let mut runtime = PiRpcRuntime::with_executable(PathBuf::from("/usr/bin/false"));
         let error = runtime
             .start(runtime_start(&env::temp_dir(), Some(scope)))
