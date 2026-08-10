@@ -4733,6 +4733,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pi-whim-hook-host"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+ "pi-whim-signal",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.19",
+ "uuid",
+]
+
+[[package]]
 name = "pi-whim-one-shot-ai"
 version = "0.1.0"
 dependencies = [
