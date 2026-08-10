@@ -390,6 +390,20 @@ impl<T> CommandEnvelope<T> {
     pub fn into_payload(self) -> T {
         self.payload
     }
+
+    /// Maps the typed payload while preserving all authenticated envelope metadata.
+    ///
+    /// The command identifier and routing context remain private and cannot be
+    /// supplied or changed by callers.
+    pub fn map_payload<U>(self, map: impl FnOnce(T) -> U) -> CommandEnvelope<U> {
+        CommandEnvelope {
+            command_id: self.command_id,
+            source: self.source,
+            project_id: self.project_id,
+            session_key: self.session_key,
+            payload: map(self.payload),
+        }
+    }
 }
 
 impl<T> fmt::Debug for CommandEnvelope<T> {
@@ -652,6 +666,26 @@ mod tests {
         assert!(debug.contains("AppCommand"));
         assert!(!debug.contains("prompt-secret-7f13"));
         assert!(!debug.contains("SubmitPrompt"));
+    }
+
+    #[test]
+    fn map_payload_preserves_authenticated_metadata_and_changes_type() {
+        let project_id = Uuid::new_v4();
+        let envelope =
+            CommandEnvelope::new(CommandSource::HookReplay, "payload-secret-26d9".to_owned())
+                .with_context(Some(project_id), Some("session-key".to_owned()));
+        let command_id = envelope.command_id();
+
+        let mapped = envelope.map_payload(|payload| payload.len());
+
+        assert_eq!(mapped.command_id(), command_id);
+        assert_eq!(mapped.source(), CommandSource::HookReplay);
+        assert_eq!(mapped.project_id(), Some(project_id));
+        assert_eq!(mapped.session_key(), Some("session-key"));
+        assert_eq!(*mapped.payload(), "payload-secret-26d9".len());
+        let debug = format!("{mapped:?}");
+        assert!(debug.contains("usize"));
+        assert!(!debug.contains("payload-secret-26d9"));
     }
 
     #[test]
