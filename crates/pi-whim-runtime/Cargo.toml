@@ -8,6 +8,7 @@ license.workspace = true
 crossbeam-channel.workspace = true
 pi-whim-agent-team = { path = "../pi-whim-agent-team" }
 pi-whim-core = { path = "../pi-whim-core" }
+pi-whim-hook-host = { path = "../pi-whim-hook-host" }
 pi-whim-pi-rpc = { path = "../pi-whim-pi-rpc" }
 serde.workspace = true
 serde_json.workspace = true

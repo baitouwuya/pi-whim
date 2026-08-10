@@ -4798,6 +4798,7 @@ dependencies = [
  "crossbeam-channel",
  "pi-whim-agent-team",
  "pi-whim-core",
+ "pi-whim-hook-host",
  "pi-whim-pi-rpc",
  "serde",
  "serde_json",

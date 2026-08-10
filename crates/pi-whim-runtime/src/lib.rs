@@ -16,6 +16,7 @@ use pi_whim_core::{
     AgentPermissionLevel, AgentTeamConfig, HookAuditRecord, HookConfig, SearchEngineProfile,
     ToolAuditRecord,
 };
+use pi_whim_hook_host::{HookHostManager, HookScopeHandle, HookScopeKey};
 use pi_whim_pi_rpc::{PiLaunch, PiRpcClient, PiRpcEvent, RpcError};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -32,6 +33,44 @@ pub enum RuntimeError {
     AgentSupervisor(String),
 }
 
+/// Shared, caller-created project Hook scope reused by one or more runtimes.
+///
+/// Runtime only transports these handles. Scope creation, manifests, approval,
+/// and registry policy remain owned by the caller and `pi-whim-hook-host`.
+#[derive(Clone)]
+pub struct RuntimeHookScope {
+    manager: HookHostManager,
+    scope: HookScopeHandle,
+}
+
+impl RuntimeHookScope {
+    pub fn new(manager: HookHostManager, scope: HookScopeHandle) -> Self {
+        Self { manager, scope }
+    }
+
+    pub fn scope_id(&self) -> String {
+        self.scope.scope_id()
+    }
+
+    pub fn key(&self) -> HookScopeKey {
+        self.scope.key()
+    }
+
+    fn into_parts(self) -> (HookHostManager, HookScopeHandle) {
+        (self.manager, self.scope)
+    }
+}
+
+impl std::fmt::Debug for RuntimeHookScope {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RuntimeHookScope")
+            .field("scope_id", &self.scope.scope_id())
+            .field("key", &self.scope.key())
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RuntimeStart {
     pub project_path: String,
@@ -46,6 +85,9 @@ pub struct RuntimeStart {
     pub search_engines: Vec<SearchEngineProfile>,
     pub search_engine_api_keys: SearchEngineApiKeys,
     pub hooks: HookConfig,
+    /// Optional shared project Hook scope. When present, the runtime reuses
+    /// its manager and scope instead of constructing the v1 compatibility scope.
+    pub hook_scope: Option<RuntimeHookScope>,
 }
 
 #[derive(Clone, Debug)]
@@ -258,7 +300,7 @@ impl AgentRuntime for PiRpcRuntime {
             None => Self::locate_pi()?,
         };
         let extension_paths: Vec<_> = config.extension_paths.iter().map(PathBuf::from).collect();
-        let mut supervisor = AgentSupervisor::start(AgentLaunchConfig {
+        let supervisor_launch = AgentLaunchConfig {
             executable: executable.clone(),
             project_path: PathBuf::from(&config.project_path),
             sessions_path: PathBuf::from(&config.sessions_path),
@@ -268,7 +310,14 @@ impl AgentRuntime for PiRpcRuntime {
             search_engines: config.search_engines,
             search_engine_api_keys: config.search_engine_api_keys,
             hooks: config.hooks,
-        })
+        };
+        let mut supervisor = match config.hook_scope {
+            Some(hook_scope) => {
+                let (manager, scope) = hook_scope.into_parts();
+                AgentSupervisor::start_with_hook_scope(supervisor_launch, manager, scope)
+            }
+            None => AgentSupervisor::start(supervisor_launch),
+        }
         .map_err(|error| RuntimeError::AgentSupervisor(error.to_string()))?;
         if let Some(interactions) = supervisor.take_interaction_events() {
             self.forward_interactions(interactions);
@@ -592,6 +641,91 @@ impl AgentRuntime for FakeRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shared_scope(project_path: &Path) -> RuntimeHookScope {
+        let manager = HookHostManager::empty().unwrap();
+        let key = HookScopeKey::project(project_path, "runtime-test").unwrap();
+        let scope = manager.open_scope(key, None).unwrap();
+        RuntimeHookScope::new(manager, scope)
+    }
+
+    fn runtime_start(project_path: &Path, hook_scope: Option<RuntimeHookScope>) -> RuntimeStart {
+        RuntimeStart {
+            project_path: project_path.to_string_lossy().into_owned(),
+            sessions_path: project_path.to_string_lossy().into_owned(),
+            session_path: None,
+            extension_paths: Vec::new(),
+            environment: HashMap::new(),
+            agent_team_config: AgentTeamConfig::default(),
+            search_engines: Vec::new(),
+            search_engine_api_keys: SearchEngineApiKeys::default(),
+            hooks: HookConfig::default(),
+            hook_scope,
+        }
+    }
+
+    #[test]
+    fn runtime_hook_scope_clone_and_debug_expose_only_scope_metadata() {
+        let scope = shared_scope(&env::temp_dir());
+        let cloned = scope.clone();
+        assert_eq!(cloned.scope_id(), scope.scope_id());
+        assert_eq!(cloned.key(), scope.key());
+        let debug = format!("{scope:?}");
+        assert!(debug.contains("RuntimeHookScope"));
+        assert!(debug.contains(&scope.scope_id()));
+        assert!(!debug.contains("HookHostManager"));
+    }
+
+    #[test]
+    fn runtime_start_clone_and_fake_runtime_preserve_shared_scope() {
+        let scope = shared_scope(&env::temp_dir());
+        let expected_scope_id = scope.scope_id();
+        let start = runtime_start(&env::temp_dir(), Some(scope));
+        let cloned = start.clone();
+        assert_eq!(
+            cloned.hook_scope.as_ref().map(RuntimeHookScope::scope_id),
+            Some(expected_scope_id.clone())
+        );
+
+        let mut runtime = FakeRuntime::default();
+        runtime.start(cloned).unwrap();
+        let starts = runtime.starts();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(
+            starts[0]
+                .hook_scope
+                .as_ref()
+                .map(RuntimeHookScope::scope_id),
+            Some(expected_scope_id)
+        );
+    }
+
+    #[test]
+    fn pi_runtime_uses_shared_scope_branch_when_present() {
+        let scope = shared_scope(&env::temp_dir());
+        scope.scope.revoke();
+        let mut runtime = PiRpcRuntime::with_executable(PathBuf::from("/usr/bin/false"));
+        let error = runtime
+            .start(runtime_start(&env::temp_dir(), Some(scope)))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RuntimeError::AgentSupervisor(message) if message.contains("revoked")
+        ));
+    }
+
+    #[test]
+    fn pi_runtime_preserves_legacy_v1_path_without_scope() {
+        let mut start = runtime_start(&env::temp_dir(), None);
+        start.hooks.version = 2;
+        let mut runtime = PiRpcRuntime::with_executable(PathBuf::from("/usr/bin/false"));
+        let error = runtime.start(start).unwrap_err();
+        assert!(matches!(
+            error,
+            RuntimeError::AgentSupervisor(message)
+                if message.contains("unsupported hook manifest version 2")
+        ));
+    }
 
     #[test]
     fn launch_generation_advances_after_a_restart() {
