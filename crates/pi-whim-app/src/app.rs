@@ -36,6 +36,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use pi_whim_catalog::ModelCapabilityResolver;
+use pi_whim_engine::commands::{AppCommand, ShellPaste};
 use pi_whim_engine::mailbox::Delivery;
 use pi_whim_engine::mailbox::SessionToken;
 use pi_whim_engine::pool::{PendingPrompt, SessionPool, SessionRuntime, is_draft};
@@ -51,7 +52,6 @@ use pi_whim_engine::session::{
 use pi_whim_engine::slash_commands::SlashCommand;
 use pi_whim_engine::state::EngineState;
 use pi_whim_engine::{controls, dialogs, events, launch, notice};
-use pi_whim_gpui::Request;
 
 /// A file picker the host should open, and what to do with the answer.
 ///
@@ -399,10 +399,9 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     ///
     /// The shell owns transient view state such as the cleared draft. Persistent
     /// transcript changes, the store, the pool, and Pi remain owned here.
-    pub(crate) fn handle(&mut self, request: Request) {
-        match request {
-            Request::AddProject => self.add_project(),
-            Request::RemoveProject(project_id) => {
+    pub(crate) fn handle(&mut self, command: AppCommand) {
+        match command {
+            AppCommand::RemoveProject(project_id) => {
                 self.stop_project_runtimes(project_id);
                 if let Some(store) = self.store.as_ref()
                     && let Err(error) = store.delete_project(project_id)
@@ -411,62 +410,52 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 }
                 self.reload_projects();
             }
-            Request::RevealProject(project_id) => {
-                if let Some(project) = self.find_project(project_id) {
-                    let _ = std::process::Command::new("open").arg(project.path).spawn();
-                }
+            AppCommand::OpenProject(project_id) => self.start_project(project_id),
+            AppCommand::NewSession(project_id) => self.start_new_session(project_id),
+            AppCommand::ActivateSession { project_id, path } => {
+                self.switch_session(project_id, path)
             }
-            Request::OpenProject(project_id) => self.start_project(project_id),
-            Request::NewSession(project_id) => self.start_new_session(project_id),
-            Request::ActivateSession { project_id, path } => self.switch_session(project_id, path),
-            Request::RenameSession { path, title } => self.rename_session(path, title),
-            // Transcript loading belongs to `Host`, where it can run on the
-            // background executor without blocking GPUI's main thread.
-            Request::SmartRenameSession { .. } => self.report("notice-smart-rename-unavailable"),
-            Request::CloneSession => self.clone_session(),
-            Request::DeleteSession(path) => self.delete_session(path),
-            Request::SubmitPrompt {
+            AppCommand::RenameSession { path, title } => self.rename_session(path, title),
+            AppCommand::CloneSession => self.clone_session(),
+            AppCommand::DeleteSession(path) => self.delete_session(path),
+            AppCommand::SubmitPrompt {
                 content,
                 attachments,
                 mode,
             } => self.submit_prompt(content, attachments, mode),
-            Request::AnswerPrompt(answer) => self.send_answer(answer),
-            Request::DiscardAttachment(path) => {
+            AppCommand::AnswerPrompt(answer) => self.send_answer(answer),
+            AppCommand::DiscardAttachment(path) => {
                 // Only the generated ones reach here — the composer decides that
                 // — so this deletes the file it wrote without asking again.
                 if let Err(error) = self.attachment_store.remove_generated(&path) {
                     self.notices.error(error);
                 }
             }
-            // Opened by the host, which has the window the platform picker needs.
-            Request::PickAttachments => {
-                debug_assert!(false, "the host opens the picker");
-            }
-            Request::SetAutoCompaction(enabled) => self.set_auto_compaction(enabled),
-            Request::Stop => {
+            AppCommand::SetAutoCompaction(enabled) => self.set_auto_compaction(enabled),
+            AppCommand::Stop => {
                 if let Err(error) = self.active_command(json!({"type":"abort"})) {
                     self.notices.error(error);
                 }
             }
-            Request::ClearQueue => {
+            AppCommand::ClearQueue => {
                 // Pi answers with the queue it dropped and a `queue_update`
                 // event, which is what refreshes the snapshot.
                 if let Err(error) = self.active_command(json!({"type":"clear_queue"})) {
                     self.notices.error(error);
                 }
             }
-            Request::SetLanguage(language) => {
+            AppCommand::SetLanguage(language) => {
                 self.apply(Action::SetLanguage(language));
                 self.save_preferences();
             }
-            Request::SetBashPolicy(policy) => {
+            AppCommand::SetBashPolicy(policy) => {
                 if self.state().bash_policy != policy {
                     self.apply(Action::SetBashPolicy(policy));
                     self.save_preferences();
                     self.restart_selected_project();
                 }
             }
-            Request::SetBlockedPatterns(patterns) => {
+            AppCommand::SetBlockedPatterns(patterns) => {
                 let patterns = normalize_bash_patterns(patterns);
                 if self.state().bash_blocked_patterns != patterns {
                     self.apply(Action::SetBashBlockedPatterns(patterns));
@@ -474,12 +463,15 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                     self.restart_selected_project();
                 }
             }
-            Request::SetPermissionLevel(level) => self.set_permission_level(level),
-            Request::ApproveProjectHooks { fingerprint } => {
+            AppCommand::SetPermissionLevel(level) => self.set_permission_level(level),
+            AppCommand::LoadAgentsMdFiles
+            | AppCommand::SaveGlobalAgentsMd(_)
+            | AppCommand::SaveProjectAgentsMd(_) => {}
+            AppCommand::ApproveProjectHooks { fingerprint } => {
                 self.approve_project_hooks(&fingerprint)
             }
-            Request::RevokeProjectHooks => self.revoke_project_hooks(),
-            Request::SetAgentTeamConfig(config) => {
+            AppCommand::RevokeProjectHooks => self.revoke_project_hooks(),
+            AppCommand::SetAgentTeamConfig(config) => {
                 let config = config.normalized();
                 if self.state().agent_team_config != config {
                     self.apply(Action::SetAgentTeamConfig(config));
@@ -487,7 +479,7 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                     self.restart_selected_project();
                 }
             }
-            Request::SetOneShotAiConfig(config) => {
+            AppCommand::SetOneShotAiConfig(config) => {
                 let config = config.normalized();
                 if self.state().one_shot_ai_config != config {
                     self.apply(Action::SetOneShotAiConfig(config));
@@ -495,28 +487,16 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                     self.rebuild_one_shot_ai();
                 }
             }
-            Request::SetModel(model) => self.queue_model_switch(model),
-            Request::SetThinkingLevel(level) => self.set_thinking_level(level),
-            Request::SetQueueModes {
+            AppCommand::SetModel(model) => self.queue_model_switch(model),
+            AppCommand::SetThinkingLevel(level) => self.set_thinking_level(level),
+            AppCommand::SetQueueModes {
                 steering,
                 follow_up,
             } => self.set_queue_modes(steering, follow_up),
-            Request::RunCommand(command) => self.run_command(command),
-            Request::DeleteProvider(profile_id) => self.delete_provider(profile_id),
-            Request::SaveSearchEngines(profiles) => {
+            AppCommand::RunSlashCommand(command) => self.run_command(command),
+            AppCommand::DeleteProvider(profile_id) => self.delete_provider(profile_id),
+            AppCommand::SaveSearchEngines(profiles) => {
                 self.save_search_engines(profiles);
-            }
-            Request::SaveSearchEngine { profile, api_key } => {
-                self.save_search_engine(profile, api_key);
-            }
-            // Each of these either needs the window and the clipboard, or answers
-            // with something a view has to be told, so the host keeps them.
-            Request::CopyToClipboard(_)
-            | Request::AttachPaste(_)
-            | Request::SaveProvider { .. }
-            | Request::TestSearchEngine { .. }
-            | Request::DiscoverProviderModels { .. } => {
-                unreachable!("handled by the host")
             }
         }
     }
@@ -663,12 +643,6 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
             model: None,
             attachments: Vec::new(),
         }));
-    }
-
-    /// Ask for a folder to register. The host opens the picker and answers with
-    /// [`Self::add_project_at`].
-    fn add_project(&mut self) {
-        self.picker = Some(Picker::Project);
     }
 
     /// Register `path` as a project.
@@ -1187,6 +1161,10 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 None
             }
         }
+    }
+
+    pub(crate) fn project_path(&self, id: ProjectId) -> Option<String> {
+        self.find_project(id).map(|project| project.path)
     }
 
     fn find_project(&self, id: ProjectId) -> Option<Project> {
@@ -2151,9 +2129,9 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
     /// Answered rather than staged, because a paste is the reader waiting on one
     /// action and the composer is where it lands. Files come as a list, so this
     /// answers with however many the clipboard held.
-    pub(crate) fn attachments_for(&mut self, paste: pi_whim_gpui::chat::Paste) -> Vec<Attachment> {
+    pub(crate) fn attachments_for(&mut self, paste: ShellPaste) -> Vec<Attachment> {
         let created = match paste {
-            pi_whim_gpui::chat::Paste::Files(paths) => {
+            ShellPaste::Files(paths) => {
                 let mut attachments = Vec::new();
                 for path in paths {
                     match attachment_from_path(Path::new(&path), false) {
@@ -2165,17 +2143,10 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
                 }
                 return attachments;
             }
-            pi_whim_gpui::chat::Paste::Image { extension, bytes } => self
+            ShellPaste::Image { extension, bytes } => self
                 .attachment_store
                 .create_pasted_encoded_image(&extension, &bytes),
-            pi_whim_gpui::chat::Paste::LongText(text) => {
-                self.attachment_store.create_pasted_text(&text)
-            }
-            // The composer resolves this one itself by inserting the text, so it
-            // is never reported as a request.
-            pi_whim_gpui::chat::Paste::Insert => {
-                unreachable!("the composer inserts rather than attaching")
-            }
+            ShellPaste::LongText(text) => self.attachment_store.create_pasted_text(&text),
         };
         match created {
             Ok(attachment) => vec![attachment],
@@ -3747,11 +3718,11 @@ mod tests {
         start_test_session(&mut app, &directory);
         let starts = observer.starts().len();
 
-        app.handle(Request::SetBashPolicy(app.state().bash_policy));
-        app.handle(Request::SetBlockedPatterns(
+        app.handle(AppCommand::SetBashPolicy(app.state().bash_policy));
+        app.handle(AppCommand::SetBlockedPatterns(
             app.state().bash_blocked_patterns.clone(),
         ));
-        app.handle(Request::SetAgentTeamConfig(
+        app.handle(AppCommand::SetAgentTeamConfig(
             app.state().agent_team_config.clone(),
         ));
 
@@ -3785,7 +3756,9 @@ mod tests {
         assert_eq!(app.sessions.iter().count(), 2);
         let starts = observer.starts().len();
 
-        app.handle(Request::SetPermissionLevel(AgentPermissionLevel::ReadOnly));
+        app.handle(AppCommand::SetPermissionLevel(
+            AgentPermissionLevel::ReadOnly,
+        ));
 
         assert_eq!(observer.starts().len(), starts);
         assert_eq!(app.sessions.iter().count(), 2);
@@ -4107,7 +4080,7 @@ mod tests {
         let mut app = test_application(&directory, runtime);
         start_test_session(&mut app, &directory);
 
-        app.handle(Request::ClearQueue);
+        app.handle(AppCommand::ClearQueue);
 
         assert!(
             observer.commands().iter().any(|command| {

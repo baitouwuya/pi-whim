@@ -13,12 +13,149 @@
 use std::path::Path;
 
 use gpui::{ClipboardItem, Context, Entity, IntoElement, PathPromptOptions, Render, Task, Window};
-use pi_whim_gpui::{Request, RequestsRaised, Workspace, pump};
+use pi_whim_core::{Attachment, SubmitMode};
+use pi_whim_engine::commands::{AppCommand, ShellCommand, ShellPaste};
+use pi_whim_gpui::{Request, RequestsRaised, Workspace, chat::Paste, pump};
 use pi_whim_one_shot_ai::MAX_ONE_SHOT_INPUT_BYTES;
 use pi_whim_persistence::session_title_context_from_jsonl;
 use pi_whim_runtime::{AgentRuntime, test_search_engine};
 
 use crate::app::{PiWhimApplication, Picker};
+
+enum RequestRoute {
+    App(AppCommand),
+    Shell(ShellCommand),
+    SubmitPrompt {
+        content: String,
+        attachments: Vec<Attachment>,
+        mode: SubmitMode,
+    },
+    InsertPasteHandledByComposer,
+}
+
+fn adapt_request(request: Request) -> RequestRoute {
+    match request {
+        Request::AddProject => RequestRoute::Shell(ShellCommand::AddProject),
+        Request::NewSession(project_id) => RequestRoute::App(AppCommand::NewSession(project_id)),
+        Request::OpenProject(project_id) => RequestRoute::App(AppCommand::OpenProject(project_id)),
+        Request::SetModel(model) => RequestRoute::App(AppCommand::SetModel(model)),
+        Request::SetThinkingLevel(level) => RequestRoute::App(AppCommand::SetThinkingLevel(level)),
+        Request::SetQueueModes {
+            steering,
+            follow_up,
+        } => RequestRoute::App(AppCommand::SetQueueModes {
+            steering,
+            follow_up,
+        }),
+        Request::RunCommand(command) => RequestRoute::App(AppCommand::RunSlashCommand(command)),
+        Request::RevealProject(project_id) => {
+            RequestRoute::Shell(ShellCommand::RevealProject(project_id))
+        }
+        Request::RemoveProject(project_id) => {
+            RequestRoute::App(AppCommand::RemoveProject(project_id))
+        }
+        Request::RenameSession { path, title } => {
+            RequestRoute::App(AppCommand::RenameSession { path, title })
+        }
+        Request::SmartRenameSession {
+            project_id,
+            path,
+            title,
+        } => RequestRoute::Shell(ShellCommand::SmartRenameSession {
+            project_id,
+            path,
+            title,
+        }),
+        Request::CloneSession => RequestRoute::App(AppCommand::CloneSession),
+        Request::CopyToClipboard(text) => RequestRoute::Shell(ShellCommand::CopyToClipboard(text)),
+        Request::DeleteSession(path) => RequestRoute::App(AppCommand::DeleteSession(path)),
+        Request::AnswerPrompt(answer) => RequestRoute::App(AppCommand::AnswerPrompt(answer)),
+        Request::AttachPaste(paste) => match shell_paste(paste) {
+            Some(paste) => RequestRoute::Shell(ShellCommand::AttachPaste(paste)),
+            None => RequestRoute::InsertPasteHandledByComposer,
+        },
+        Request::PickAttachments => RequestRoute::Shell(ShellCommand::PickAttachments),
+        Request::DiscardAttachment(path) => RequestRoute::App(AppCommand::DiscardAttachment(path)),
+        Request::SubmitPrompt {
+            content,
+            attachments,
+            mode,
+        } => RequestRoute::SubmitPrompt {
+            content,
+            attachments,
+            mode,
+        },
+        Request::ActivateSession { project_id, path } => {
+            RequestRoute::App(AppCommand::ActivateSession { project_id, path })
+        }
+        Request::Stop => RequestRoute::App(AppCommand::Stop),
+        Request::ClearQueue => RequestRoute::App(AppCommand::ClearQueue),
+        Request::SetLanguage(language) => RequestRoute::App(AppCommand::SetLanguage(language)),
+        Request::SetBashPolicy(policy) => RequestRoute::App(AppCommand::SetBashPolicy(policy)),
+        Request::SetBlockedPatterns(patterns) => {
+            RequestRoute::App(AppCommand::SetBlockedPatterns(patterns))
+        }
+        Request::SetPermissionLevel(level) => {
+            RequestRoute::App(AppCommand::SetPermissionLevel(level))
+        }
+        Request::SetAgentTeamConfig(config) => {
+            RequestRoute::App(AppCommand::SetAgentTeamConfig(config))
+        }
+        Request::ApproveProjectHooks { fingerprint } => {
+            RequestRoute::App(AppCommand::ApproveProjectHooks { fingerprint })
+        }
+        Request::RevokeProjectHooks => RequestRoute::App(AppCommand::RevokeProjectHooks),
+        Request::SetOneShotAiConfig(config) => {
+            RequestRoute::App(AppCommand::SetOneShotAiConfig(config))
+        }
+        Request::SetAutoCompaction(enabled) => {
+            RequestRoute::App(AppCommand::SetAutoCompaction(enabled))
+        }
+        Request::SaveProvider { profile, api_key } => {
+            RequestRoute::Shell(ShellCommand::SaveProvider { profile, api_key })
+        }
+        Request::DeleteProvider(profile_id) => {
+            RequestRoute::App(AppCommand::DeleteProvider(profile_id))
+        }
+        Request::SaveSearchEngines(profiles) => {
+            RequestRoute::App(AppCommand::SaveSearchEngines(profiles))
+        }
+        Request::SaveSearchEngine { profile, api_key } => {
+            RequestRoute::Shell(ShellCommand::SaveSearchEngine { profile, api_key })
+        }
+        Request::TestSearchEngine {
+            profile,
+            api_key,
+            editor,
+        } => RequestRoute::Shell(ShellCommand::TestSearchEngine {
+            profile,
+            api_key,
+            editor,
+        }),
+        Request::DiscoverProviderModels {
+            profile_id,
+            provider_name,
+            base_url,
+            protocol,
+            api_key,
+        } => RequestRoute::Shell(ShellCommand::DiscoverProviderModels {
+            profile_id,
+            provider_name,
+            base_url,
+            protocol,
+            api_key,
+        }),
+    }
+}
+
+fn shell_paste(paste: Paste) -> Option<ShellPaste> {
+    match paste {
+        Paste::Insert => None,
+        Paste::Files(paths) => Some(ShellPaste::Files(paths)),
+        Paste::Image { extension, bytes } => Some(ShellPaste::Image { extension, bytes }),
+        Paste::LongText(text) => Some(ShellPaste::LongText(text)),
+    }
+}
 
 /// The window's view, and what it drives.
 ///
@@ -187,42 +324,97 @@ impl<R: AgentRuntime + 'static> Host<R> {
     /// the keychain. The few that stay here are the ones whose answer is a change
     /// to the view rather than to the domain.
     fn handle(&mut self, request: Request, window: &mut Window, cx: &mut Context<Self>) {
-        match request {
-            Request::DiscoverProviderModels {
-                profile_id,
-                provider_name,
-                base_url,
-                protocol,
-                api_key,
+        match adapt_request(request) {
+            RequestRoute::App(command) => self.application.handle(command),
+            RequestRoute::Shell(command) => self.handle_shell(command, window, cx),
+            RequestRoute::SubmitPrompt {
+                content,
+                attachments,
+                mode,
             } => {
-                let models = self.application.discover_provider_models(
-                    profile_id,
-                    provider_name,
-                    base_url,
-                    protocol,
-                    api_key,
-                );
-                if let Some(models) = models {
+                // The composer clears only after its local readiness check, but
+                // a session can disappear before this queued request reaches the
+                // host. Restore the exact draft if that race rejects the turn.
+                if !self.application.can_submit_prompt() {
+                    self.application.report_submission_unavailable();
                     self.shell.update(cx, |shell, cx| {
-                        shell.set_discovered_models(models, cx);
+                        shell.restore_submission(content, attachments, window, cx);
+                    });
+                } else {
+                    self.application.handle(AppCommand::SubmitPrompt {
+                        content,
+                        attachments,
+                        mode,
                     });
                 }
             }
-            Request::SaveProvider { profile, api_key } => {
+            RequestRoute::InsertPasteHandledByComposer => {}
+        }
+    }
+
+    fn handle_shell(&mut self, command: ShellCommand, window: &mut Window, cx: &mut Context<Self>) {
+        match command {
+            ShellCommand::AddProject => self.open_picker(Picker::Project, window, cx),
+            ShellCommand::RevealProject(project_id) => {
+                if let Some(project_path) = self.application.project_path(project_id) {
+                    let _ = std::process::Command::new("open").arg(project_path).spawn();
+                }
+            }
+            ShellCommand::SmartRenameSession {
+                project_id,
+                path,
+                title,
+            } => {
+                let transcript_path = path.clone();
+                cx.spawn_in(window, async move |host, cx| {
+                    let context = cx
+                        .background_executor()
+                        .spawn(async move {
+                            session_title_context_from_jsonl(
+                                Path::new(&transcript_path),
+                                MAX_ONE_SHOT_INPUT_BYTES,
+                            )
+                            .ok()
+                            .flatten()
+                        })
+                        .await;
+                    let _ = host.update_in(cx, |host, window, cx| {
+                        host.application
+                            .start_smart_session_rename(project_id, path, title, context);
+                        host.publish(window, cx);
+                    });
+                })
+                .detach();
+            }
+            ShellCommand::CopyToClipboard(text) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            ShellCommand::AttachPaste(paste) => {
+                // A paste of several files is several attachments, so this is a
+                // list even though most pastes produce one.
+                for attachment in self.application.attachments_for(paste) {
+                    self.shell
+                        .update(cx, |shell, cx| shell.attach(attachment, cx));
+                }
+            }
+            ShellCommand::PickAttachments => {
+                self.open_picker(Picker::Attachments, window, cx);
+            }
+            ShellCommand::SaveProvider { profile, api_key } => {
                 if let Some((id, key_saved)) = self.application.save_provider(profile, api_key) {
                     self.shell.update(cx, |shell, cx| {
                         shell.provider_saved(id, key_saved, window, cx);
                     });
                 }
             }
-            Request::SaveSearchEngine { profile, api_key } => {
+            ShellCommand::SaveSearchEngine { profile, api_key } => {
                 if self.application.save_search_engine(profile, api_key) {
                     self.shell.update(cx, |shell, cx| {
                         shell.search_engine_saved(window, cx);
                     });
                 }
             }
-            Request::TestSearchEngine {
+            ShellCommand::TestSearchEngine {
                 profile,
                 api_key,
                 editor,
@@ -264,66 +456,26 @@ impl<R: AgentRuntime + 'static> Host<R> {
                     }
                 }
             }
-            Request::AttachPaste(paste) => {
-                // A paste of several files is several attachments, so this is a
-                // list even though most pastes produce one.
-                for attachment in self.application.attachments_for(paste) {
-                    self.shell
-                        .update(cx, |shell, cx| shell.attach(attachment, cx));
-                }
-            }
-            Request::CopyToClipboard(text) => {
-                cx.write_to_clipboard(ClipboardItem::new_string(text));
-            }
-            Request::SmartRenameSession {
-                project_id,
-                path,
-                title,
+            ShellCommand::DiscoverProviderModels {
+                profile_id,
+                provider_name,
+                base_url,
+                protocol,
+                api_key,
             } => {
-                let transcript_path = path.clone();
-                cx.spawn_in(window, async move |host, cx| {
-                    let context = cx
-                        .background_executor()
-                        .spawn(async move {
-                            session_title_context_from_jsonl(
-                                Path::new(&transcript_path),
-                                MAX_ONE_SHOT_INPUT_BYTES,
-                            )
-                            .ok()
-                            .flatten()
-                        })
-                        .await;
-                    let _ = host.update_in(cx, |host, window, cx| {
-                        host.application
-                            .start_smart_session_rename(project_id, path, title, context);
-                        host.publish(window, cx);
-                    });
-                })
-                .detach();
-            }
-            Request::PickAttachments => self.open_picker(Picker::Attachments, window, cx),
-            Request::SubmitPrompt {
-                content,
-                attachments,
-                mode,
-            } => {
-                // The composer clears only after its local readiness check, but
-                // a session can disappear before this queued request reaches the
-                // host. Restore the exact draft if that race rejects the turn.
-                if !self.application.can_submit_prompt() {
-                    self.application.report_submission_unavailable();
+                let models = self.application.discover_provider_models(
+                    profile_id,
+                    provider_name,
+                    base_url,
+                    protocol,
+                    api_key,
+                );
+                if let Some(models) = models {
                     self.shell.update(cx, |shell, cx| {
-                        shell.restore_submission(content, attachments, window, cx);
-                    });
-                } else {
-                    self.application.handle(Request::SubmitPrompt {
-                        content,
-                        attachments,
-                        mode,
+                        shell.set_discovered_models(models, cx);
                     });
                 }
             }
-            other => self.application.handle(other),
         }
     }
 
@@ -373,5 +525,116 @@ impl<R: AgentRuntime + 'static> Host<R> {
 impl<R: AgentRuntime + 'static> Render for Host<R> {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         self.shell.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pi_whim_core::{AttachmentKind, ProviderProfile, ProviderProtocol, SubmitMode};
+    use pi_whim_engine::{commands::CommandControlPolicy, slash_commands::SlashCommand};
+    use uuid::Uuid;
+
+    #[test]
+    fn domain_adapter_preserves_typed_and_safety_commands() {
+        for request in [
+            Request::Stop,
+            Request::ClearQueue,
+            Request::RevokeProjectHooks,
+        ] {
+            let RequestRoute::App(command) = adapt_request(request) else {
+                panic!("safety request must map to AppCommand");
+            };
+            assert!(command.is_safety_command());
+            assert_eq!(command.control_policy(), CommandControlPolicy::Bypass);
+        }
+
+        let RequestRoute::App(AppCommand::RunSlashCommand(command)) =
+            adapt_request(Request::RunCommand(SlashCommand::ShowHotkeys))
+        else {
+            panic!("slash command must map to RunSlashCommand");
+        };
+        assert_eq!(command, SlashCommand::ShowHotkeys);
+    }
+
+    #[test]
+    fn submit_prompt_adapter_preserves_draft_for_host_readiness_check() {
+        let attachment = Attachment {
+            name: "notes.txt".into(),
+            path: "/tmp/notes.txt".into(),
+            kind: AttachmentKind::File,
+            generated_by_app: false,
+        };
+        let RequestRoute::SubmitPrompt {
+            content,
+            attachments,
+            mode,
+        } = adapt_request(Request::SubmitPrompt {
+            content: "keep this exact draft".into(),
+            attachments: vec![attachment.clone()],
+            mode: SubmitMode::FollowUp,
+        })
+        else {
+            panic!("submit prompt must retain the host readiness seam");
+        };
+        assert_eq!(content, "keep this exact draft");
+        assert_eq!(attachments, vec![attachment]);
+        assert_eq!(mode, SubmitMode::FollowUp);
+    }
+
+    #[test]
+    fn shell_paste_conversion_is_lossless_and_debug_is_redacted() {
+        let bytes = vec![0, 1, 2, 254, 255];
+        let image = shell_paste(Paste::Image {
+            extension: "png".into(),
+            bytes: bytes.clone(),
+        });
+        assert_eq!(
+            image,
+            Some(ShellPaste::Image {
+                extension: "png".into(),
+                bytes,
+            })
+        );
+        assert_eq!(
+            shell_paste(Paste::Files(vec!["/tmp/a".into(), "/tmp/b".into()])),
+            Some(ShellPaste::Files(vec!["/tmp/a".into(), "/tmp/b".into()]))
+        );
+        assert_eq!(
+            shell_paste(Paste::LongText("paste-secret-99c1".into())),
+            Some(ShellPaste::LongText("paste-secret-99c1".into()))
+        );
+        assert_eq!(shell_paste(Paste::Insert), None);
+
+        let command = ShellCommand::SaveProvider {
+            profile: ProviderProfile {
+                id: Uuid::nil(),
+                name: "provider".into(),
+                base_url: "https://private.invalid".into(),
+                protocol: ProviderProtocol::OpenAiCompletions,
+                models: Vec::new(),
+                updated_at_ms: 0,
+                has_api_key: true,
+            },
+            api_key: Some("api-key-secret-70af".into()),
+        };
+        let debug = format!("{command:?}");
+        assert!(debug.contains("shell.provider.save"));
+        assert!(!debug.contains("api-key-secret-70af"));
+        assert!(!debug.contains("private.invalid"));
+
+        let clipboard = ShellCommand::CopyToClipboard("clipboard-secret-51de".into());
+        assert!(!format!("{clipboard:?}").contains("clipboard-secret-51de"));
+        assert!(
+            !format!("{:?}", ShellPaste::LongText("paste-secret-99c1".into()))
+                .contains("paste-secret-99c1")
+        );
+        assert!(
+            !format!(
+                "{:?}",
+                ShellPaste::Files(vec!["/private/secret.txt".into()])
+            )
+            .contains("/private/secret.txt")
+        );
     }
 }
