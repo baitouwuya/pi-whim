@@ -16,12 +16,15 @@ pub mod notice;
 pub mod pool;
 pub mod protocol;
 pub mod providers;
+pub mod replay;
 pub mod session;
 pub mod settings;
 pub mod slash_commands;
 pub mod state;
 pub mod thinking;
 pub mod typewriter;
+
+pub use replay::{ReplaySelection, StateSelector, StateSelectorError};
 
 pub use changes::{
     ChangeSet, CommitContext, CommitError, CommitScope, CommitSource, SessionIdentity, StateTopic,

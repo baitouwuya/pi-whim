@@ -4708,6 +4708,7 @@ dependencies = [
  "pi-whim-core",
  "pi-whim-persistence",
  "pi-whim-runtime",
+ "pi-whim-signal",
  "serde_json",
  "tempfile",
  "unicode-segmentation",

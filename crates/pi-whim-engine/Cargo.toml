@@ -10,6 +10,7 @@ dirs.workspace = true
 pi-whim-core = { path = "../pi-whim-core" }
 pi-whim-persistence = { path = "../pi-whim-persistence" }
 pi-whim-runtime = { path = "../pi-whim-runtime" }
+pi-whim-signal = { path = "../pi-whim-signal" }
 serde_json.workspace = true
 unicode-segmentation.workspace = true
 ureq.workspace = true
