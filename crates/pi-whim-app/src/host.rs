@@ -10,17 +10,20 @@
 //! do the waking: [`pi_whim_gpui::pump`] blocks on a background thread and returns
 //! to the main thread with each batch, so an idle app costs nothing.
 
-use std::path::Path;
+use std::{collections::VecDeque, path::Path};
 
 use gpui::{ClipboardItem, Context, Entity, IntoElement, PathPromptOptions, Render, Task, Window};
 use pi_whim_core::{Attachment, SubmitMode};
-use pi_whim_engine::commands::{AppCommand, ShellCommand, ShellPaste};
+use pi_whim_engine::commands::{
+    AppCommand, CommandControlPolicy, CommandDiagnostic, CommandEnvelope, CommandLifecycle,
+    CommandStage, ShellCommand, ShellPaste,
+};
 use pi_whim_gpui::{Request, RequestsRaised, Workspace, chat::Paste, pump};
 use pi_whim_one_shot_ai::MAX_ONE_SHOT_INPUT_BYTES;
 use pi_whim_persistence::session_title_context_from_jsonl;
 use pi_whim_runtime::{AgentRuntime, test_search_engine};
 
-use crate::app::{PiWhimApplication, Picker};
+use crate::app::{CommandHookController, CommandHookError, PiWhimApplication, Picker};
 
 enum RequestRoute {
     App(AppCommand),
@@ -157,6 +160,95 @@ fn shell_paste(paste: Paste) -> Option<ShellPaste> {
     }
 }
 
+#[derive(Clone, PartialEq)]
+struct PromptDraft {
+    content: String,
+    attachments: Vec<Attachment>,
+    mode: SubmitMode,
+}
+
+struct QueuedCommandControl {
+    controller: CommandHookController,
+    envelope: CommandEnvelope<AppCommand>,
+    lifecycle: CommandLifecycle,
+    prompt_draft: Option<PromptDraft>,
+}
+
+struct QueuedLifecycleObserve {
+    controller: CommandHookController,
+    lifecycle: CommandLifecycle,
+}
+
+struct OrderedControlQueue<T> {
+    pending: VecDeque<T>,
+    in_flight: bool,
+}
+
+impl<T> Default for OrderedControlQueue<T> {
+    fn default() -> Self {
+        Self {
+            pending: VecDeque::new(),
+            in_flight: false,
+        }
+    }
+}
+
+impl<T> OrderedControlQueue<T> {
+    fn enqueue(&mut self, item: T) {
+        self.pending.push_back(item);
+    }
+
+    fn begin_next(&mut self) -> Option<T> {
+        if self.in_flight {
+            return None;
+        }
+        let next = self.pending.pop_front()?;
+        self.in_flight = true;
+        Some(next)
+    }
+
+    fn finish_current(&mut self) {
+        self.in_flight = false;
+    }
+}
+
+enum ControlledCompletion {
+    Execute(Box<CommandEnvelope<AppCommand>>),
+    Denied(CommandDiagnostic),
+}
+
+fn requires_background_control(command: &AppCommand, has_controller: bool) -> bool {
+    has_controller
+        && !command.is_safety_command()
+        && command.control_policy() == CommandControlPolicy::GateTransform
+}
+
+fn resolve_controlled_command(
+    result: Result<CommandEnvelope<AppCommand>, CommandHookError>,
+) -> ControlledCompletion {
+    match result {
+        Ok(envelope) => ControlledCompletion::Execute(Box::new(envelope)),
+        Err(error) => ControlledCompletion::Denied(command_hook_diagnostic(&error)),
+    }
+}
+
+fn command_hook_diagnostic(error: &CommandHookError) -> CommandDiagnostic {
+    let message = match error {
+        CommandHookError::InvalidCommand(_) => "command rejected by typed validation",
+        CommandHookError::Denied { .. } => "command denied by external hook",
+        CommandHookError::FailedClosed { .. } => "command hook failed closed",
+    };
+    CommandDiagnostic::new(message)
+}
+
+fn prompt_route_is_current(
+    expected_project: Option<pi_whim_core::ProjectId>,
+    selected_project: Option<pi_whim_core::ProjectId>,
+    can_submit: bool,
+) -> bool {
+    can_submit && expected_project.is_some() && expected_project == selected_project
+}
+
 /// The window's view, and what it drives.
 ///
 /// One entity holding both, rather than the application observing the shell: the
@@ -171,6 +263,10 @@ pub struct Host<R: AgentRuntime + 'static> {
     /// so owning them here is what stops every pump when the window goes away.
     #[allow(dead_code, reason = "held for cancellation, not for reading")]
     pumps: Vec<Task<()>>,
+    /// Gate/Transform commands waiting for the single background control slot.
+    command_controls: OrderedControlQueue<QueuedCommandControl>,
+    /// Metadata-only lifecycle observes, ordered but never awaited by handlers.
+    lifecycle_observes: OrderedControlQueue<QueuedLifecycleObserve>,
 }
 
 impl<R: AgentRuntime + 'static> Host<R> {
@@ -248,6 +344,8 @@ impl<R: AgentRuntime + 'static> Host<R> {
             application,
             shell,
             pumps,
+            command_controls: OrderedControlQueue::default(),
+            lifecycle_observes: OrderedControlQueue::default(),
         };
         host.publish(window, cx);
         host
@@ -325,31 +423,232 @@ impl<R: AgentRuntime + 'static> Host<R> {
     /// to the view rather than to the domain.
     fn handle(&mut self, request: Request, window: &mut Window, cx: &mut Context<Self>) {
         match adapt_request(request) {
-            RequestRoute::App(command) => self.application.handle(command),
+            RequestRoute::App(command) => {
+                self.submit_app_command(command, None, window, cx);
+            }
             RequestRoute::Shell(command) => self.handle_shell(command, window, cx),
             RequestRoute::SubmitPrompt {
                 content,
                 attachments,
                 mode,
             } => {
-                // The composer clears only after its local readiness check, but
-                // a session can disappear before this queued request reaches the
-                // host. Restore the exact draft if that race rejects the turn.
-                if !self.application.can_submit_prompt() {
-                    self.application.report_submission_unavailable();
-                    self.shell.update(cx, |shell, cx| {
-                        shell.restore_submission(content, attachments, window, cx);
-                    });
+                let draft = PromptDraft {
+                    content,
+                    attachments,
+                    mode,
+                };
+                let command = AppCommand::SubmitPrompt {
+                    content: draft.content.clone(),
+                    attachments: draft.attachments.clone(),
+                    mode: draft.mode,
+                };
+                let envelope = self.application.ui_command_envelope(command);
+                let lifecycle = CommandLifecycle::submitted(&envelope);
+                self.emit_command_lifecycle(lifecycle.clone(), window, cx);
+
+                // The composer cleared only after its readiness check. Recheck
+                // before Hook control and restore the exact original draft if
+                // the queued request lost its session.
+                if !prompt_route_is_current(
+                    envelope.project_id(),
+                    self.application.state().selected_project,
+                    self.application.can_submit_prompt(),
+                ) {
+                    self.fail_submission(lifecycle, draft, window, cx);
                 } else {
-                    self.application.handle(AppCommand::SubmitPrompt {
-                        content,
-                        attachments,
-                        mode,
-                    });
+                    self.dispatch_envelope(envelope, lifecycle, Some(draft), window, cx);
                 }
             }
             RequestRoute::InsertPasteHandledByComposer => {}
         }
+    }
+
+    fn emit_command_lifecycle(
+        &mut self,
+        lifecycle: CommandLifecycle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let observer = self.application.emit_command_lifecycle(lifecycle.clone());
+        if let Some(controller) = observer {
+            self.lifecycle_observes.enqueue(QueuedLifecycleObserve {
+                controller,
+                lifecycle,
+            });
+            self.start_next_lifecycle_observe(window, cx);
+        }
+    }
+
+    fn start_next_lifecycle_observe(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(queued) = self.lifecycle_observes.begin_next() else {
+            return;
+        };
+        cx.spawn_in(window, async move |host, cx| {
+            cx.background_executor()
+                .spawn(async move { queued.controller.observe_lifecycle(&queued.lifecycle) })
+                .await;
+            let _ = host.update_in(cx, |host, window, cx| {
+                host.lifecycle_observes.finish_current();
+                host.start_next_lifecycle_observe(window, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn submit_app_command(
+        &mut self,
+        command: AppCommand,
+        prompt_draft: Option<PromptDraft>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let envelope = self.application.ui_command_envelope(command);
+        let lifecycle = CommandLifecycle::submitted(&envelope);
+        self.emit_command_lifecycle(lifecycle.clone(), window, cx);
+        self.dispatch_envelope(envelope, lifecycle, prompt_draft, window, cx);
+    }
+
+    fn dispatch_envelope(
+        &mut self,
+        envelope: CommandEnvelope<AppCommand>,
+        lifecycle: CommandLifecycle,
+        prompt_draft: Option<PromptDraft>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let controller = self.application.command_hook_controller(&envelope);
+        if requires_background_control(envelope.payload(), controller.is_some()) {
+            let Some(controller) = controller else {
+                self.execute_envelope(envelope, lifecycle, prompt_draft, window, cx);
+                return;
+            };
+            self.emit_command_lifecycle(
+                lifecycle.clone().with_stage(CommandStage::Transforming),
+                window,
+                cx,
+            );
+            self.command_controls.enqueue(QueuedCommandControl {
+                controller,
+                envelope,
+                lifecycle,
+                prompt_draft,
+            });
+            self.start_next_command_control(window, cx);
+        } else {
+            self.execute_envelope(envelope, lifecycle, prompt_draft, window, cx);
+        }
+    }
+
+    fn start_next_command_control(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(queued) = self.command_controls.begin_next() else {
+            return;
+        };
+        let QueuedCommandControl {
+            controller,
+            envelope,
+            lifecycle,
+            prompt_draft,
+        } = queued;
+        cx.spawn_in(window, async move |host, cx| {
+            let completion = cx
+                .background_executor()
+                .spawn(async move { resolve_controlled_command(controller.control(envelope)) })
+                .await;
+            let _ = host.update_in(cx, |host, window, cx| {
+                host.command_controls.finish_current();
+                host.finish_command_control(completion, lifecycle, prompt_draft, window, cx);
+                host.start_next_command_control(window, cx);
+                host.publish(window, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn finish_command_control(
+        &mut self,
+        completion: ControlledCompletion,
+        lifecycle: CommandLifecycle,
+        prompt_draft: Option<PromptDraft>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match completion {
+            ControlledCompletion::Execute(envelope) => {
+                self.execute_envelope(*envelope, lifecycle, prompt_draft, window, cx);
+            }
+            ControlledCompletion::Denied(diagnostic) => {
+                self.emit_command_lifecycle(
+                    lifecycle.with_stage(CommandStage::Denied(diagnostic.clone())),
+                    window,
+                    cx,
+                );
+                self.application.report_command_diagnostic(&diagnostic);
+                if let Some(draft) = prompt_draft {
+                    self.restore_submission(draft, window, cx);
+                }
+            }
+        }
+    }
+
+    fn execute_envelope(
+        &mut self,
+        envelope: CommandEnvelope<AppCommand>,
+        lifecycle: CommandLifecycle,
+        prompt_draft: Option<PromptDraft>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(draft) = prompt_draft
+            && !prompt_route_is_current(
+                envelope.project_id(),
+                self.application.state().selected_project,
+                self.application.can_submit_prompt(),
+            )
+        {
+            self.fail_submission(lifecycle, draft, window, cx);
+            return;
+        }
+
+        self.emit_command_lifecycle(
+            lifecycle.clone().with_stage(CommandStage::Accepted),
+            window,
+            cx,
+        );
+        self.emit_command_lifecycle(
+            lifecycle.clone().with_stage(CommandStage::Executing),
+            window,
+            cx,
+        );
+        self.application.execute_command_envelope(envelope);
+        self.emit_command_lifecycle(lifecycle.with_stage(CommandStage::Completed), window, cx);
+    }
+
+    fn fail_submission(
+        &mut self,
+        lifecycle: CommandLifecycle,
+        draft: PromptDraft,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let diagnostic = CommandDiagnostic::new("prompt session is no longer available");
+        self.emit_command_lifecycle(
+            lifecycle.with_stage(CommandStage::Failed(diagnostic)),
+            window,
+            cx,
+        );
+        self.application.report_submission_unavailable();
+        self.restore_submission(draft, window, cx);
+    }
+
+    fn restore_submission(
+        &mut self,
+        draft: PromptDraft,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.shell.update(cx, |shell, cx| {
+            shell.restore_submission(draft.content, draft.attachments, window, cx);
+        });
     }
 
     fn handle_shell(&mut self, command: ShellCommand, window: &mut Window, cx: &mut Context<Self>) {
@@ -580,6 +879,70 @@ mod tests {
         assert_eq!(content, "keep this exact draft");
         assert_eq!(attachments, vec![attachment]);
         assert_eq!(mode, SubmitMode::FollowUp);
+    }
+
+    #[test]
+    fn ordered_control_queue_runs_one_at_a_time_in_fifo_order() {
+        let mut queue = OrderedControlQueue::default();
+        queue.enqueue(1);
+        queue.enqueue(2);
+        queue.enqueue(3);
+
+        assert_eq!(queue.begin_next(), Some(1));
+        assert_eq!(queue.begin_next(), None);
+        queue.finish_current();
+        assert_eq!(queue.begin_next(), Some(2));
+        queue.finish_current();
+        assert_eq!(queue.begin_next(), Some(3));
+        queue.finish_current();
+        assert_eq!(queue.begin_next(), None);
+    }
+
+    #[test]
+    fn safety_and_no_scope_commands_never_wait_for_background_control() {
+        let submit = AppCommand::SubmitPrompt {
+            content: "controlled".into(),
+            attachments: Vec::new(),
+            mode: SubmitMode::Prompt,
+        };
+        assert!(requires_background_control(&submit, true));
+        assert!(!requires_background_control(&submit, false));
+        assert!(!requires_background_control(&AppCommand::Stop, true));
+        assert!(!requires_background_control(&AppCommand::ClearQueue, true));
+    }
+
+    #[test]
+    fn denied_control_completion_cannot_reach_the_handler() {
+        let completion = resolve_controlled_command(Err(CommandHookError::Denied {
+            hook_id: "deny-hook".into(),
+            message: "private-hook-output-984d".into(),
+        }));
+        let ControlledCompletion::Denied(diagnostic) = completion else {
+            panic!("a denied hook result must not retain an executable envelope");
+        };
+        assert_eq!(diagnostic.as_str(), "command denied by external hook");
+        assert!(!diagnostic.as_str().contains("private-hook-output-984d"));
+    }
+
+    #[test]
+    fn prompt_route_rejects_session_races_and_missing_context() {
+        let expected = Uuid::new_v4();
+        assert!(prompt_route_is_current(
+            Some(expected),
+            Some(expected),
+            true
+        ));
+        assert!(!prompt_route_is_current(
+            Some(expected),
+            Some(Uuid::new_v4()),
+            true
+        ));
+        assert!(!prompt_route_is_current(
+            Some(expected),
+            Some(expected),
+            false
+        ));
+        assert!(!prompt_route_is_current(None, Some(expected), true));
     }
 
     #[test]

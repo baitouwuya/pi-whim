@@ -8,6 +8,8 @@
 mod hooks;
 mod signals;
 
+pub(crate) use hooks::{CommandHookController, CommandHookError};
+
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
@@ -330,32 +332,49 @@ impl<R: AgentRuntime> PiWhimApplication<R> {
         self.signals.command_lifecycle()
     }
 
+    /// Wrap a UI command in authenticated metadata without exporting a session path.
+    pub(crate) fn ui_command_envelope(&self, command: AppCommand) -> CommandEnvelope<AppCommand> {
+        CommandEnvelope::ui(command).with_context(self.state().selected_project, None)
+    }
+
     /// Select the shared project Hook controller for one authenticated envelope.
-    #[allow(dead_code, reason = "reserved for the Host command pipeline")]
     pub(crate) fn command_hook_controller(
         &self,
         envelope: &CommandEnvelope<AppCommand>,
-    ) -> Option<hooks::CommandHookController> {
+    ) -> Option<CommandHookController> {
         envelope
             .project_id()
             .and_then(|project_id| self.command_hook_controller_for_project(project_id))
     }
 
-    /// Emit a typed command lifecycle stage, then best-effort external Observe.
-    #[allow(dead_code, reason = "reserved for the typed command pipeline")]
-    pub(crate) fn emit_command_lifecycle(&self, lifecycle: CommandLifecycle) {
+    /// Execute the typed payload after the Host has completed command control.
+    pub(crate) fn execute_command_envelope(&mut self, envelope: CommandEnvelope<AppCommand>) {
+        self.handle(envelope.into_payload());
+    }
+
+    /// Surface a bounded, metadata-only command diagnostic.
+    pub(crate) fn report_command_diagnostic(&mut self, diagnostic: &CommandDiagnostic) {
+        self.notices.error(diagnostic.as_str().to_owned());
+    }
+
+    /// Emit the local typed lifecycle stage and return its external observer.
+    ///
+    /// The Host schedules the observer off the GPUI thread after this returns,
+    /// preserving local-before-external ordering without delaying the handler.
+    pub(crate) fn emit_command_lifecycle(
+        &self,
+        lifecycle: CommandLifecycle,
+    ) -> Option<CommandHookController> {
         self.signals.emit_command_lifecycle(lifecycle.clone());
-        if let Some(project_id) = lifecycle.project_id()
-            && let Some(controller) = self.command_hook_controller_for_project(project_id)
-        {
-            controller.observe_lifecycle(&lifecycle);
-        }
+        lifecycle
+            .project_id()
+            .and_then(|project_id| self.command_hook_controller_for_project(project_id))
     }
 
     fn command_hook_controller_for_project(
         &self,
         project_id: ProjectId,
-    ) -> Option<hooks::CommandHookController> {
+    ) -> Option<CommandHookController> {
         let project = self.find_project(project_id)?;
         self.hook_host.controller(Path::new(&project.path))
     }
@@ -3509,6 +3528,25 @@ done
             title_eligible: HashSet::new(),
             title_attempted: HashSet::new(),
         }
+    }
+
+    #[test]
+    fn ui_command_envelope_uses_selected_project_without_session_path_context() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = test_application(&directory, FakeRuntime::default());
+        let project = project("selected", directory.path());
+        app.apply(Action::ProjectsLoaded(vec![project.clone()]));
+        app.apply(Action::SelectProject(project.id));
+
+        let envelope = app.ui_command_envelope(AppCommand::SetThinkingLevel(ThinkingLevel::Medium));
+
+        assert_eq!(
+            envelope.source(),
+            pi_whim_engine::commands::CommandSource::Ui
+        );
+        assert_eq!(envelope.project_id(), Some(project.id));
+        assert_eq!(envelope.session_key(), None);
+        assert!(!format!("{envelope:?}").contains(directory.path().to_string_lossy().as_ref()));
     }
 
     #[test]
