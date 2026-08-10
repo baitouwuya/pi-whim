@@ -14,6 +14,11 @@
 
 use pi_whim_core::{Action, AppState, Project, ProjectId, ProviderProfile, SearchEngineProfile};
 
+use crate::changes::{
+    ChangeSet, CommitContext, CommitError, CommitSource, TransactionRevision,
+    collect_changed_topics,
+};
+
 /// Something a view may need to do in response to an applied action.
 ///
 /// The reducer has already run by the time one of these is handed back; it
@@ -34,6 +39,7 @@ pub enum ViewEffect {
 #[derive(Default)]
 pub struct EngineState {
     state: AppState,
+    revision: TransactionRevision,
 }
 
 impl EngineState {
@@ -44,7 +50,10 @@ impl EngineState {
     /// Adopt an already-populated state, for callers that seed defaults before
     /// any action has been applied.
     pub fn from_state(state: AppState) -> Self {
-        Self { state }
+        Self {
+            state,
+            revision: TransactionRevision::default(),
+        }
     }
 
     /// Read access for rendering.
@@ -52,10 +61,71 @@ impl EngineState {
         &self.state
     }
 
+    /// Read the revision of the most recently committed action batch.
+    pub fn revision(&self) -> TransactionRevision {
+        self.revision
+    }
+
+    /// Apply a complete action batch and publish one typed change set.
+    ///
+    /// A non-empty batch first preflights the next revision. If that checked
+    /// increment overflows, no action is dispatched and the error is returned.
+    /// Once preflight succeeds, every action is dispatched and the precomputed
+    /// revision is assigned exactly once. The reducer itself has no fallible
+    /// step, so no rollback is needed after preflight succeeds. An empty batch
+    /// returns an explicit no-op change set at the current revision and does
+    /// not advance it.
+    pub fn apply_batch<I>(
+        &mut self,
+        actions: I,
+        context: CommitContext,
+    ) -> Result<ChangeSet, CommitError>
+    where
+        I: IntoIterator<Item = Action>,
+    {
+        let actions: Vec<Action> = actions.into_iter().collect();
+        let action_count = actions.len();
+        let changed_topics = collect_changed_topics(&actions);
+        let next_revision = if action_count == 0 {
+            None
+        } else {
+            Some(self.revision.checked_next()?)
+        };
+
+        for action in actions {
+            self.state.dispatch(action);
+        }
+
+        let Some(revision) = next_revision else {
+            return Ok(ChangeSet {
+                revision: self.revision,
+                scope: context.scope,
+                source: context.source,
+                changed_topics,
+                action_count,
+                coalesced: context.coalesced,
+            });
+        };
+        self.revision = revision;
+
+        Ok(ChangeSet {
+            revision,
+            scope: context.scope,
+            source: context.source,
+            changed_topics,
+            action_count,
+            coalesced: context.coalesced,
+        })
+    }
+
     /// Apply `action` through the reducer, returning any view-local follow-up.
     ///
-    /// Callers that render should act on the returned effect; callers that do
-    /// not can ignore it.
+    /// This legacy facade commits the action as one global
+    /// [`CommitSource::InternalEffect`] batch. Callers that render should act
+    /// on the returned effect; callers that do not can ignore it. The historic
+    /// signature cannot expose [`CommitError`], so a failed legacy commit is
+    /// represented by `None` and does not apply a view effect. Normal calls
+    /// retain the previous reducer and `ViewEffect` behavior.
     pub fn apply(&mut self, action: Action) -> Option<ViewEffect> {
         let effect = match &action {
             Action::ProviderProfilesLoaded(profiles) => {
@@ -68,8 +138,13 @@ impl EngineState {
             Action::ClearConversation => Some(ViewEffect::ConversationCleared),
             _ => None,
         };
-        self.state.dispatch(action);
-        effect
+        match self.apply_batch(
+            std::iter::once(action),
+            CommitContext::global(CommitSource::InternalEffect),
+        ) {
+            Ok(_) => effect,
+            Err(_error) => None,
+        }
     }
 
     /// The project whose sessions are currently shown, if any.
@@ -81,6 +156,7 @@ impl EngineState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::changes::{CommitScope, SessionIdentity, StateTopic};
     use pi_whim_core::{
         ConversationItem, ConversationRole, ProviderProtocol, SessionStatus, SessionSummary,
         stable_session_id,
@@ -210,5 +286,116 @@ mod tests {
             }),
             None
         );
+    }
+
+    #[test]
+    fn a_batch_applies_every_action_and_allocates_one_revision() {
+        let mut engine = EngineState::new();
+        let change_set = engine
+            .apply_batch(
+                [
+                    Action::SetSessionStatus(SessionStatus::Starting),
+                    Action::SetSessionStatus(SessionStatus::Ready),
+                    Action::QueueUpdated {
+                        steering: vec!["steer".into()],
+                        follow_up: vec!["follow".into()],
+                    },
+                ],
+                CommitContext::global_coalesced(CommitSource::RuntimeEvent),
+            )
+            .expect("a normal revision should commit");
+
+        assert_eq!(change_set.revision, TransactionRevision::new(1));
+        assert_eq!(engine.revision(), TransactionRevision::new(1));
+        assert_eq!(change_set.action_count, 3);
+        assert_eq!(
+            change_set.changed_topics,
+            vec![StateTopic::SessionRuntime, StateTopic::Queue,]
+        );
+        assert!(change_set.coalesced);
+        assert_eq!(engine.get().session_status, SessionStatus::Ready);
+        assert_eq!(engine.get().pending_steering, vec!["steer"]);
+        assert_eq!(engine.get().pending_follow_up, vec!["follow"]);
+    }
+
+    #[test]
+    fn an_empty_batch_is_an_explicit_noop_without_revision_change() {
+        let mut engine = EngineState::new();
+        let context = CommitContext::global(CommitSource::Test);
+        let change_set = engine
+            .apply_batch(Vec::<Action>::new(), context)
+            .expect("an empty batch cannot overflow");
+
+        assert!(change_set.is_noop());
+        assert_eq!(change_set.revision, TransactionRevision::ZERO);
+        assert_eq!(engine.revision(), TransactionRevision::ZERO);
+        assert_eq!(change_set.scope, CommitScope::Global);
+        assert_eq!(change_set.source, CommitSource::Test);
+        assert!(change_set.changed_topics.is_empty());
+    }
+
+    #[test]
+    fn a_session_context_is_preserved_in_the_change_set() {
+        let mut engine = EngineState::new();
+        let identity = SessionIdentity::with_ids(
+            crate::mailbox::SessionToken::next(),
+            3,
+            Some(Uuid::nil()),
+            Some(Uuid::from_u128(1)),
+        );
+        let change_set = engine
+            .apply_batch(
+                [Action::SetSessionStatus(SessionStatus::Streaming)],
+                CommitContext::session(identity, CommitSource::UserCommand),
+            )
+            .expect("a normal revision should commit");
+
+        assert_eq!(change_set.scope, CommitScope::Session(identity));
+        assert_eq!(change_set.source, CommitSource::UserCommand);
+    }
+
+    #[test]
+    fn revision_overflow_returns_an_error_without_applying_actions() {
+        let mut engine = EngineState::new();
+        engine.revision = TransactionRevision::MAX;
+
+        let result = engine.apply_batch(
+            [Action::SetSessionStatus(SessionStatus::Ready)],
+            CommitContext::global(CommitSource::Test),
+        );
+
+        assert_eq!(
+            result,
+            Err(CommitError::RevisionOverflow {
+                current: TransactionRevision::MAX,
+            })
+        );
+        assert_eq!(engine.revision(), TransactionRevision::MAX);
+        assert_eq!(engine.get().session_status, SessionStatus::Offline);
+    }
+
+    #[test]
+    fn legacy_apply_swallows_commit_error_without_applying_or_effect() {
+        let mut engine = EngineState::new();
+        engine.revision = TransactionRevision::MAX;
+        let profile = provider("Overflow");
+
+        let effect = engine.apply(Action::ProviderProfilesLoaded(vec![profile]));
+
+        assert_eq!(effect, None);
+        assert_eq!(engine.revision(), TransactionRevision::MAX);
+        assert!(engine.get().provider_profiles.is_empty());
+    }
+
+    #[test]
+    fn legacy_apply_still_runs_the_reducer_and_returns_view_effects() {
+        let mut engine = EngineState::new();
+        let profile = provider("Legacy");
+
+        let effect = engine.apply(Action::ProviderProfilesLoaded(vec![profile.clone()]));
+
+        assert_eq!(effect, Some(ViewEffect::ProvidersReloaded(vec![profile])));
+        assert_eq!(engine.revision(), TransactionRevision::new(1));
+        assert_eq!(engine.get().provider_profiles.len(), 1);
     }
 }

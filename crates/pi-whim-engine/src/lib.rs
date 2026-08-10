@@ -5,6 +5,7 @@
 //! actions. It holds no UI framework types, so it can be exercised headlessly
 //! against a fake runtime.
 
+pub mod changes;
 pub mod composer;
 pub mod controls;
 pub mod dialogs;
@@ -21,3 +22,8 @@ pub mod slash_commands;
 pub mod state;
 pub mod thinking;
 pub mod typewriter;
+
+pub use changes::{
+    ChangeSet, CommitContext, CommitError, CommitScope, CommitSource, SessionIdentity, StateTopic,
+    TransactionRevision,
+};
