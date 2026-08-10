@@ -1,380 +1,834 @@
-//! Host-side Hook dispatcher for supervisor control-plane events.
+//! Typed supervisor Hook pipeline backed exclusively by `pi-whim-hook-host`.
 
 use std::{
-    io::{BufReader, Read, Write},
+    any::Any,
+    collections::BTreeMap,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
-    thread,
-    time::Duration,
+    time::Instant,
 };
 
-use pi_whim_core::{
-    HookAuditOutcome, HookAuditRecord, HookConfig, HookDefinition, HookEvent, HookKind,
+use pi_whim_core::{HookAuditOutcome as CoreAuditOutcome, HookAuditRecord, HookConfig, HookEvent};
+use pi_whim_hook_host::{
+    ApprovedHookManifest, EventRegistry, HookAuditEvent, HookAuditOutcome as HostAuditOutcome,
+    HookDataClass, HookEventSpec, HookFieldSpec, HookGateDecision, HookHostManager,
+    HookInvocationContext, HookKind as HostHookKind, HookKindSpec, HookManifest, HookPayload,
+    HookScopeHandle, HookScopeKey, HookTransformResult,
 };
-use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
+use serde::Serialize;
+use serde_json::{Map, Value, json};
 
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_HOOK_OUTPUT: usize = 64 * 1024;
-const OBSERVE_QUEUE_CAPACITY: usize = 64;
-const FINALIZE_BUDGET: Duration = Duration::from_secs(5);
+use crate::model::AgentDescriptor;
 
-struct ObserveTask {
-    hook: HookDefinition,
-    event: HookEvent,
-    payload: Value,
+const BUILTIN_REVISION: &str = "builtin";
+const LEGACY_EMPTY_REVISION: &str = "legacy-v1";
+
+struct AuditSubscription {
+    _subscription: Box<dyn Any + Send + Sync>,
 }
 
-pub(crate) trait RustHook: Send + Sync {
-    fn id(&self) -> &'static str;
-    fn gate(&self, event: HookEvent, payload: &Value) -> Result<(), String>;
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct AgentEventContext {
+    agent_id: String,
+    agent_level: u8,
+    team_id: String,
+    session_id: String,
+    parent_session_id: Option<String>,
+    parent_agent_id: Option<String>,
+    request_id: Option<String>,
+    agent_name: String,
+    agent_role: String,
 }
 
-struct SafetyFloorHook;
-
-impl RustHook for SafetyFloorHook {
-    fn id(&self) -> &'static str {
-        "builtin.safety_floor"
-    }
-
-    fn gate(&self, event: HookEvent, payload: &Value) -> Result<(), String> {
-        let arguments = || {
-            payload
-                .get("arguments")
-                .and_then(Value::as_object)
-                .ok_or_else(|| "hook event arguments must be an object".to_owned())
-        };
-        match event {
-            HookEvent::MessageSending => {
-                let arguments = arguments()?;
-                let message = arguments
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| "message must be a string".to_owned())?;
-                if message.trim().is_empty() || message.len() > crate::MAX_MESSAGE_BYTES {
-                    return Err("message violates supervisor size constraints".into());
-                }
-            }
-            HookEvent::AgentSpawning => {
-                let arguments = arguments()?;
-                for field in ["name", "task"] {
-                    if arguments
-                        .get(field)
-                        .and_then(Value::as_str)
-                        .is_none_or(|value| value.trim().is_empty())
-                    {
-                        return Err(format!("agent {field} cannot be empty"));
-                    }
-                }
-            }
-            HookEvent::PermissionResolving
-            | HookEvent::ToolDispatching
-            | HookEvent::AgentLaunching => {}
-            _ => return Ok(()),
+impl AgentEventContext {
+    pub(crate) fn new(descriptor: &AgentDescriptor, request_id: Option<&str>) -> Self {
+        Self {
+            agent_id: descriptor.id.to_string(),
+            agent_level: descriptor.level,
+            team_id: descriptor.team_id.to_string(),
+            session_id: descriptor.session_id.to_string(),
+            parent_session_id: descriptor.parent_session_id.map(|id| id.to_string()),
+            parent_agent_id: descriptor.parent_id.map(|id| id.to_string()),
+            request_id: request_id.map(str::to_owned),
+            agent_name: descriptor.name.clone(),
+            agent_role: descriptor.role.clone(),
         }
-        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ToolDispatchInput {
+    pub(crate) actor: AgentEventContext,
+    pub(crate) tool: String,
+    pub(crate) arguments: Value,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AgentLaunchInput {
+    pub(crate) actor: AgentEventContext,
+    pub(crate) fields: Value,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PermissionResolutionInput {
+    pub(crate) actor: AgentEventContext,
+    pub(crate) fields: Value,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct InteractionResolutionInput {
+    pub(crate) actor: AgentEventContext,
+    pub(crate) fields: Value,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct HookObservation {
+    event: HookEvent,
+    actor: AgentEventContext,
+    fields: Value,
+}
+
+impl HookObservation {
+    pub(crate) fn new(event: HookEvent, actor: AgentEventContext, fields: Value) -> Self {
+        Self {
+            event,
+            actor,
+            fields,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum HookControlError {
+    Denied(String),
+    InvalidPayload(String),
+}
+
+impl HookControlError {
+    pub(crate) fn message(self) -> String {
+        match self {
+            Self::Denied(message) | Self::InvalidPayload(message) => message,
+        }
     }
 }
 
 #[derive(Clone)]
-pub(crate) struct HookDispatcher {
-    rust_hooks: Vec<Arc<dyn RustHook>>,
-    hooks: Vec<HookDefinition>,
-    project_root: PathBuf,
+pub(crate) struct SupervisorHooks {
+    scope: Option<HookScopeHandle>,
+    context: Option<HookInvocationContext>,
+    unavailable: Option<String>,
     audit_sender: mpsc::SyncSender<HookAuditRecord>,
-    revision: String,
-    observe_sender: mpsc::SyncSender<ObserveTask>,
-    observe_stopping: Arc<AtomicBool>,
+    _audit_subscription: Option<Arc<AuditSubscription>>,
+    observers_stopped: Arc<AtomicBool>,
 }
 
-impl std::fmt::Debug for HookDispatcher {
+impl std::fmt::Debug for SupervisorHooks {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("HookDispatcher")
-            .field("rust_hooks", &self.rust_hooks.len())
-            .field("command_hooks", &self.hooks.len())
-            .field("project_root", &self.project_root)
-            .field("revision", &self.revision)
+            .debug_struct("SupervisorHooks")
+            .field(
+                "scope_id",
+                &self.scope.as_ref().map(HookScopeHandle::scope_id),
+            )
+            .field("unavailable", &self.unavailable)
+            .field(
+                "observers_stopped",
+                &self.observers_stopped.load(Ordering::Acquire),
+            )
             .finish()
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) enum HookDecision {
-    Continue(Value),
-    Deny(String),
-}
-
-impl HookDispatcher {
-    pub(crate) fn new(
+impl SupervisorHooks {
+    pub(crate) fn from_v1_config(
         config: HookConfig,
         project_root: PathBuf,
         audit_sender: mpsc::SyncSender<HookAuditRecord>,
     ) -> Self {
-        let (observe_sender, observe_receiver) =
-            mpsc::sync_channel::<ObserveTask>(OBSERVE_QUEUE_CAPACITY);
-        let worker_project_root = project_root.clone();
-        let worker_audit_sender = audit_sender.clone();
-        let worker_revision = config.revision.clone();
-        let observe_stopping = Arc::new(AtomicBool::new(false));
-        let worker_stopping = observe_stopping.clone();
-        thread::spawn(move || {
-            for task in observe_receiver {
-                if worker_stopping.load(Ordering::Acquire) {
-                    break;
-                }
-                observe_once(
-                    &worker_audit_sender,
-                    &worker_revision,
-                    &task.hook,
-                    task.event,
-                    &task.payload,
-                    &worker_project_root,
-                );
+        if config.hooks.is_empty() {
+            return Self::inactive(audit_sender);
+        }
+        match build_v1_scope(&config, &project_root, &audit_sender) {
+            Ok((scope, context, subscription)) => {
+                Self::active(scope, context, audit_sender, subscription)
+            }
+            Err(error) => Self::unavailable(audit_sender, error),
+        }
+    }
+
+    pub(crate) fn from_scope(
+        manager: HookHostManager,
+        scope: HookScopeHandle,
+        project_root: &Path,
+        audit_sender: mpsc::SyncSender<HookAuditRecord>,
+    ) -> Result<Self, String> {
+        if scope.is_revoked() {
+            return Err("hook scope has been revoked".to_owned());
+        }
+        let canonical_root =
+            std::fs::canonicalize(project_root).map_err(|error| error.to_string())?;
+        let key = scope.key();
+        if key.project_root.as_ref() != Some(&canonical_root) {
+            return Err("hook scope project root does not match the supervisor project".to_owned());
+        }
+        let scope_id = scope.scope_id();
+        let context = HookInvocationContext::project(
+            scope_id.clone(),
+            key.manifest_revision.clone(),
+            canonical_root.to_string_lossy().into_owned(),
+        );
+        let adapter_sender = audit_sender.clone();
+        let subscription = manager.audit_signal().subscribe_fn(move |event| {
+            if event.scope_id == scope_id {
+                adapt_host_audit(&adapter_sender, event);
             }
         });
-        Self {
-            rust_hooks: vec![Arc::new(SafetyFloorHook)],
-            revision: config.revision.clone(),
-            hooks: config.hooks,
-            project_root,
+        Ok(Self::active(
+            scope,
+            context,
             audit_sender,
-            observe_sender,
-            observe_stopping,
+            AuditSubscription {
+                _subscription: Box::new(subscription),
+            },
+        ))
+    }
+
+    fn inactive(audit_sender: mpsc::SyncSender<HookAuditRecord>) -> Self {
+        Self {
+            scope: None,
+            context: None,
+            unavailable: None,
+            audit_sender,
+            _audit_subscription: None,
+            observers_stopped: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    pub(crate) fn gate(&self, event: HookEvent, payload: Value) -> HookDecision {
-        let mut payload = payload;
-        for hook in &self.rust_hooks {
-            let started = std::time::Instant::now();
-            let result = hook.gate(event, &payload);
-            let _ = self.audit_sender.try_send(HookAuditRecord {
-                hook_id: hook.id().into(),
-                event,
-                outcome: if result.is_ok() {
-                    HookAuditOutcome::Allowed
-                } else {
-                    HookAuditOutcome::Denied
-                },
-                duration_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
-                output_truncated: false,
-                revision: "builtin".into(),
-            });
-            if let Err(message) = result {
-                return HookDecision::Deny(message);
-            }
+    fn unavailable(audit_sender: mpsc::SyncSender<HookAuditRecord>, error: String) -> Self {
+        Self {
+            scope: None,
+            context: None,
+            unavailable: Some(error),
+            audit_sender,
+            _audit_subscription: None,
+            observers_stopped: Arc::new(AtomicBool::new(false)),
         }
-        let hooks = self.matching(event, &payload).cloned().collect::<Vec<_>>();
-        for hook in &hooks {
-            let started = std::time::Instant::now();
-            let result = invoke(hook, event, &payload, &self.project_root);
-            match (hook.kind, result) {
-                (HookKind::Gate, Ok(result))
-                    if result.get("decision").and_then(Value::as_str) == Some("deny") =>
-                {
-                    self.audit(
-                        hook,
-                        event,
-                        HookAuditOutcome::Denied,
-                        started.elapsed(),
-                        false,
-                    );
-                    return HookDecision::Deny(
-                        result
-                            .get("message")
-                            .and_then(Value::as_str)
-                            .unwrap_or("blocked by hook")
-                            .to_owned(),
-                    );
-                }
-                (HookKind::Gate, Ok(_)) => {
-                    self.audit(
-                        hook,
-                        event,
-                        HookAuditOutcome::Allowed,
-                        started.elapsed(),
-                        false,
-                    );
-                }
-                (HookKind::Transform, Ok(result)) => {
-                    match result
-                        .get("arguments")
-                        .filter(|arguments| arguments.is_object())
-                    {
-                        Some(arguments) if transform_is_valid(event, &payload, &result) => {
-                            payload["arguments"] = arguments.clone();
-                            self.audit(
-                                hook,
-                                event,
-                                HookAuditOutcome::Succeeded,
-                                started.elapsed(),
-                                false,
-                            );
-                        }
-                        _ => self.audit(
-                            hook,
-                            event,
-                            HookAuditOutcome::Failed,
-                            started.elapsed(),
-                            false,
-                        ),
-                    }
-                }
-                (HookKind::Gate, Err(error)) => {
-                    self.audit(
-                        hook,
-                        event,
-                        if error == "timed out" {
-                            HookAuditOutcome::TimedOut
-                        } else {
-                            HookAuditOutcome::Failed
-                        },
-                        started.elapsed(),
-                        error == "output exceeds limit",
-                    );
-                    return HookDecision::Deny(format!("hook {} failed: {error}", hook.id));
-                }
-                (HookKind::Transform, Err(error)) => {
-                    self.audit(
-                        hook,
-                        event,
-                        if error == "timed out" {
-                            HookAuditOutcome::TimedOut
-                        } else {
-                            HookAuditOutcome::Failed
-                        },
-                        started.elapsed(),
-                        error == "output exceeds limit",
-                    );
-                }
-                (HookKind::Observe, _) => {}
-            }
-        }
-        HookDecision::Continue(payload)
     }
 
-    pub(crate) fn observe(&self, event: HookEvent, payload: Value) {
-        if self.observe_stopping.load(Ordering::Acquire) {
-            return;
+    fn active(
+        scope: HookScopeHandle,
+        context: HookInvocationContext,
+        audit_sender: mpsc::SyncSender<HookAuditRecord>,
+        subscription: AuditSubscription,
+    ) -> Self {
+        Self {
+            scope: Some(scope),
+            context: Some(context),
+            unavailable: None,
+            audit_sender,
+            _audit_subscription: Some(Arc::new(subscription)),
+            observers_stopped: Arc::new(AtomicBool::new(false)),
         }
-        let hooks = self
-            .matching(event, &payload)
-            .filter(|hook| matches!(hook.kind, HookKind::Observe))
-            .cloned()
-            .collect::<Vec<_>>();
-        for hook in &hooks {
-            let task = ObserveTask {
-                hook: hook.clone(),
+    }
+
+    pub(crate) fn control_tool_dispatch<F>(
+        &self,
+        input: ToolDispatchInput,
+        validate: F,
+    ) -> Result<Value, HookControlError>
+    where
+        F: Fn(&Value) -> Result<(), String>,
+    {
+        self.control_arguments(HookEvent::ToolDispatching, input, validate)
+    }
+
+    pub(crate) fn control_agent_spawn<F>(
+        &self,
+        input: ToolDispatchInput,
+        validate: F,
+    ) -> Result<Value, HookControlError>
+    where
+        F: Fn(&Value) -> Result<(), String>,
+    {
+        self.control_arguments(HookEvent::AgentSpawning, input, validate)
+    }
+
+    pub(crate) fn control_message_send<F>(
+        &self,
+        input: ToolDispatchInput,
+        validate: F,
+    ) -> Result<Value, HookControlError>
+    where
+        F: Fn(&Value) -> Result<(), String>,
+    {
+        self.control_arguments(HookEvent::MessageSending, input, validate)
+    }
+
+    fn control_arguments<F>(
+        &self,
+        event: HookEvent,
+        input: ToolDispatchInput,
+        validate: F,
+    ) -> Result<Value, HookControlError>
+    where
+        F: Fn(&Value) -> Result<(), String>,
+    {
+        validate(&input.arguments).map_err(HookControlError::InvalidPayload)?;
+        let original = control_payload(&input.actor, &input.tool, &input.arguments)
+            .map_err(HookControlError::InvalidPayload)?;
+        self.safety_floor("builtin.safety_floor", event, &original)
+            .map_err(HookControlError::Denied)?;
+
+        let public_original = redact_private(&original);
+        let transformed = self.transform(event, public_original.clone());
+        let candidate = if transformed == public_original {
+            original.clone()
+        } else if validate_transformed_payload(event, &public_original, &transformed).is_ok() {
+            restore_private(&original, &transformed)
+        } else {
+            self.audit_builtin(
+                "builtin.transform_validation",
                 event,
-                payload: payload.clone(),
-            };
-            if self.observe_sender.try_send(task).is_err() {
-                self.audit(hook, event, HookAuditOutcome::Failed, Duration::ZERO, false);
-            }
+                CoreAuditOutcome::Failed,
+                Instant::now(),
+            );
+            original.clone()
+        };
+        let arguments = candidate.get("arguments").cloned().ok_or_else(|| {
+            HookControlError::InvalidPayload("hook payload lost arguments".to_owned())
+        })?;
+        let final_payload = if validate(&arguments).is_ok()
+            && self
+                .safety_floor("builtin.safety_floor.final", event, &candidate)
+                .is_ok()
+        {
+            candidate
+        } else {
+            self.audit_builtin(
+                "builtin.transform_validation",
+                event,
+                CoreAuditOutcome::Failed,
+                Instant::now(),
+            );
+            original
+        };
+        self.run_gate(event, &redact_private(&final_payload))
+            .map_err(HookControlError::Denied)?;
+        final_payload.get("arguments").cloned().ok_or_else(|| {
+            HookControlError::InvalidPayload("hook payload lost arguments".to_owned())
+        })
+    }
+
+    pub(crate) fn gate_agent_launch(
+        &self,
+        input: AgentLaunchInput,
+    ) -> Result<(), HookControlError> {
+        self.gate_only(
+            HookEvent::AgentLaunching,
+            envelope(&input.actor, input.fields)?,
+        )
+    }
+
+    pub(crate) fn gate_permission_resolution(
+        &self,
+        input: PermissionResolutionInput,
+    ) -> Result<(), HookControlError> {
+        self.gate_only(
+            HookEvent::PermissionResolving,
+            envelope(&input.actor, input.fields)?,
+        )
+    }
+
+    fn gate_only(&self, event: HookEvent, payload: Value) -> Result<(), HookControlError> {
+        self.safety_floor("builtin.safety_floor", event, &payload)
+            .map_err(HookControlError::Denied)?;
+        self.run_gate(event, &redact_private(&payload))
+            .map_err(HookControlError::Denied)
+    }
+
+    pub(crate) fn transform_interaction_resolution(
+        &self,
+        input: InteractionResolutionInput,
+    ) -> Option<String> {
+        let original = envelope(&input.actor, input.fields).ok()?;
+        if self
+            .safety_floor(
+                "builtin.safety_floor",
+                HookEvent::InteractionResolving,
+                &original,
+            )
+            .is_err()
+        {
+            return None;
         }
+        let transformed =
+            self.transform(HookEvent::InteractionResolving, redact_private(&original));
+        if validate_transformed_payload(
+            HookEvent::InteractionResolving,
+            &redact_private(&original),
+            &transformed,
+        )
+        .is_err()
+            || self
+                .safety_floor(
+                    "builtin.safety_floor.final",
+                    HookEvent::InteractionResolving,
+                    &transformed,
+                )
+                .is_err()
+        {
+            return None;
+        }
+        transformed
+            .get("arguments")?
+            .get("decision")?
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    }
+
+    pub(crate) fn observe(&self, observation: HookObservation) {
+        if !self.observers_stopped.load(Ordering::Acquire) {
+            self.observe_inner(observation);
+        }
+    }
+
+    pub(crate) fn finalize(&self, observation: HookObservation) {
+        self.observe_inner(observation);
     }
 
     pub(crate) fn stop_observers(&self) {
-        self.observe_stopping.store(true, Ordering::Release);
+        self.observers_stopped.store(true, Ordering::Release);
     }
 
-    pub(crate) fn finalize(&self, event: HookEvent, payload: Value) {
-        let hooks = self
-            .matching(event, &payload)
-            .filter(|hook| matches!(hook.kind, HookKind::Observe))
-            .cloned()
-            .collect::<Vec<_>>();
-        let finalize_started = std::time::Instant::now();
-        for hook in &hooks {
-            let Some(remaining) = FINALIZE_BUDGET.checked_sub(finalize_started.elapsed()) else {
-                self.audit(
-                    hook,
-                    event,
-                    HookAuditOutcome::TimedOut,
-                    Duration::ZERO,
-                    false,
-                );
-                continue;
-            };
-            let mut bounded_hook = hook.clone();
-            bounded_hook.timeout_ms = Some(
-                bounded_hook
-                    .timeout_ms
-                    .unwrap_or(DEFAULT_TIMEOUT.as_millis() as u64)
-                    .min(remaining.as_millis().max(1) as u64),
-            );
-            self.observe_once(&bounded_hook, event, &payload, &self.project_root);
+    fn observe_inner(&self, observation: HookObservation) {
+        let Ok(payload) = envelope(&observation.actor, observation.fields) else {
+            return;
+        };
+        let Ok((scope, context)) = self.active_scope() else {
+            return;
+        };
+        let Ok(payload) = HookPayload::from_value(redact_private(&payload)) else {
+            return;
+        };
+        let _ = scope.observe(event_name(observation.event), context.clone(), payload);
+    }
+
+    fn run_gate(&self, event: HookEvent, payload: &Value) -> Result<(), String> {
+        if self.scope.is_none() && self.unavailable.is_none() {
+            return Ok(());
+        }
+        let (scope, context) = self.active_scope()?;
+        let payload = HookPayload::from_value(payload.clone())
+            .map_err(|error| format!("hook payload rejected: {error}"))?;
+        match scope.gate(event_name(event), context.clone(), payload) {
+            Ok(HookGateDecision::Allow) => Ok(()),
+            Ok(HookGateDecision::Deny { hook_id, message }) => {
+                Err(format!("hook {hook_id} denied: {message}"))
+            }
+            Ok(HookGateDecision::FailedClosed { hook_id, error }) => {
+                Err(format!("hook {hook_id} failed: {error}"))
+            }
+            Err(error) => Err(format!("hook gate failed closed: {error}")),
         }
     }
 
-    fn observe_once(
-        &self,
-        hook: &HookDefinition,
-        event: HookEvent,
-        payload: &Value,
-        project_root: &Path,
-    ) {
-        observe_once(
-            &self.audit_sender,
-            &self.revision,
-            hook,
-            event,
-            payload,
-            project_root,
-        );
+    fn transform(&self, event: HookEvent, payload: Value) -> Value {
+        if self.scope.is_none() && self.unavailable.is_none() {
+            return payload;
+        }
+        let Ok((scope, context)) = self.active_scope() else {
+            return payload;
+        };
+        let Ok(host_payload) = HookPayload::from_value(payload.clone()) else {
+            return payload;
+        };
+        match scope.transform(event_name(event), context.clone(), host_payload) {
+            Ok(HookTransformResult::Transformed(payload))
+            | Ok(HookTransformResult::Preserved { payload, .. }) => payload.into_value(),
+            Err(_) => payload,
+        }
     }
 
-    fn audit(
+    fn active_scope(&self) -> Result<(&HookScopeHandle, &HookInvocationContext), String> {
+        match (&self.scope, &self.context) {
+            (Some(scope), Some(context)) if !scope.is_revoked() => Ok((scope, context)),
+            _ => Err(self
+                .unavailable
+                .clone()
+                .unwrap_or_else(|| "hook scope is unavailable".to_owned())),
+        }
+    }
+
+    fn safety_floor(
         &self,
-        hook: &HookDefinition,
+        hook_id: &'static str,
         event: HookEvent,
-        outcome: HookAuditOutcome,
-        duration: Duration,
-        output_truncated: bool,
+        payload: &Value,
+    ) -> Result<(), String> {
+        let started = Instant::now();
+        let result = safety_floor(event, payload);
+        self.audit_builtin(
+            hook_id,
+            event,
+            if result.is_ok() {
+                CoreAuditOutcome::Allowed
+            } else {
+                CoreAuditOutcome::Denied
+            },
+            started,
+        );
+        result
+    }
+
+    fn audit_builtin(
+        &self,
+        hook_id: &str,
+        event: HookEvent,
+        outcome: CoreAuditOutcome,
+        started: Instant,
     ) {
         let _ = self.audit_sender.try_send(HookAuditRecord {
-            hook_id: hook.id.clone(),
+            hook_id: hook_id.to_owned(),
             event,
             outcome,
-            duration_ms: duration.as_millis().min(u128::from(u64::MAX)) as u64,
-            output_truncated,
-            revision: self.revision.clone(),
+            duration_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            output_truncated: false,
+            revision: BUILTIN_REVISION.to_owned(),
         });
     }
 
-    fn matching(&self, event: HookEvent, payload: &Value) -> impl Iterator<Item = &HookDefinition> {
-        self.hooks.iter().filter(move |hook| {
-            hook.event == event
-                && (hook.matcher.tools.is_empty()
-                    || payload
-                        .get("tool")
-                        .and_then(Value::as_str)
-                        .is_some_and(|tool| {
-                            hook.matcher.tools.iter().any(|candidate| candidate == tool)
-                        }))
-                && (hook.matcher.agent_levels.is_empty()
-                    || payload
-                        .get("agent_level")
-                        .and_then(Value::as_u64)
-                        .is_some_and(|level| hook.matcher.agent_levels.contains(&(level as u8))))
-        })
+    #[cfg(test)]
+    fn scope_id(&self) -> Option<String> {
+        self.scope.as_ref().map(HookScopeHandle::scope_id)
     }
 }
 
-fn transform_is_valid(event: HookEvent, payload: &Value, result: &Value) -> bool {
-    let response_contains_only_arguments = result
-        .as_object()
-        .is_some_and(|response| response.keys().all(|key| key == "arguments"));
-    result.get("arguments").is_some_and(|arguments| {
-        response_contains_only_arguments
-            && validate_transform(event, &payload["arguments"], arguments).is_ok()
-    })
+fn control_payload(
+    actor: &AgentEventContext,
+    tool: &str,
+    arguments: &Value,
+) -> Result<Value, String> {
+    let mut value = envelope(actor, json!({"tool": tool, "arguments": arguments}))
+        .map_err(HookControlError::message)?;
+    if !value.is_object() {
+        return Err("hook payload must be an object".to_owned());
+    }
+    Ok(value.take())
+}
+
+fn envelope(actor: &AgentEventContext, fields: Value) -> Result<Value, HookControlError> {
+    let mut object = fields.as_object().cloned().ok_or_else(|| {
+        HookControlError::InvalidPayload("hook event fields must be an object".to_owned())
+    })?;
+    let context = serde_json::to_value(actor)
+        .map_err(|error| HookControlError::InvalidPayload(error.to_string()))?;
+    let context = context.as_object().ok_or_else(|| {
+        HookControlError::InvalidPayload("agent hook context must be an object".to_owned())
+    })?;
+    for (key, value) in context {
+        object.entry(key.clone()).or_insert_with(|| value.clone());
+    }
+    Ok(Value::Object(object))
+}
+
+fn redact_private(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .filter(|(key, _)| !private_field_name(key))
+                .map(|(key, value)| (key.clone(), redact_private(value)))
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(values.iter().map(redact_private).collect()),
+        _ => value.clone(),
+    }
+}
+
+fn restore_private(original: &Value, transformed: &Value) -> Value {
+    match (original, transformed) {
+        (Value::Object(original), Value::Object(transformed)) => {
+            let mut restored = transformed.clone();
+            for (key, value) in original {
+                if private_field_name(key) {
+                    restored.insert(key.clone(), value.clone());
+                } else if let Some(candidate) = restored.get(key).cloned() {
+                    restored.insert(key.clone(), restore_private(value, &candidate));
+                }
+            }
+            Value::Object(restored)
+        }
+        _ => transformed.clone(),
+    }
+}
+
+fn private_field_name(name: &str) -> bool {
+    let normalized = name.to_ascii_lowercase().replace('-', "_");
+    normalized.contains("capability")
+        || normalized.contains("environment")
+        || normalized == "env"
+        || normalized.contains("api_key")
+        || normalized.contains("provider_key")
+        || normalized.contains("approval_ticket")
+        || normalized.contains("endpoint")
+        || normalized.contains("authorization")
+        || normalized.contains("token")
+        || normalized.contains("secret")
+}
+
+fn build_v1_scope(
+    config: &HookConfig,
+    project_root: &Path,
+    audit_sender: &mpsc::SyncSender<HookAuditRecord>,
+) -> Result<(HookScopeHandle, HookInvocationContext, AuditSubscription), String> {
+    config.validate()?;
+    let revision = effective_revision(config);
+    let manifest_json = serde_json::to_string(config).map_err(|error| error.to_string())?;
+    let fingerprints = config
+        .hooks
+        .iter()
+        .filter_map(|hook| {
+            hook.entrypoint_fingerprint
+                .as_ref()
+                .map(|fingerprint| (hook.id.clone(), fingerprint.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let manifest = HookManifest::parse_json(&manifest_json)
+        .and_then(|manifest| {
+            manifest
+                .with_revision(revision.clone())
+                .with_entrypoint_fingerprints(&fingerprints)
+        })
+        .map_err(|error| error.to_string())?;
+    let approved = ApprovedHookManifest::new(manifest, revision.clone(), fingerprints)
+        .map_err(|error| error.to_string())?;
+    let manager = HookHostManager::new_with_registry(
+        supervisor_registry().map_err(|error| error.to_string())?,
+        approved,
+    )
+    .map_err(|error| error.to_string())?;
+    let adapter_sender = audit_sender.clone();
+    let subscription = manager
+        .audit_signal()
+        .subscribe_fn(move |event| adapt_host_audit(&adapter_sender, event));
+    let key =
+        HookScopeKey::project(project_root, revision.clone()).map_err(|error| error.to_string())?;
+    let scope = manager
+        .open_scope(key.clone(), None)
+        .map_err(|error| error.to_string())?;
+    let canonical_root = key
+        .project_root
+        .as_ref()
+        .map(|root| root.to_string_lossy().into_owned())
+        .ok_or_else(|| "project hook scope lost its canonical root".to_owned())?;
+    let context = HookInvocationContext::project(scope.scope_id(), revision, canonical_root);
+    Ok((
+        scope,
+        context,
+        AuditSubscription {
+            _subscription: Box::new(subscription),
+        },
+    ))
+}
+
+fn supervisor_registry() -> Result<EventRegistry, pi_whim_hook_host::HookHostError> {
+    let controls = [
+        HookEvent::ToolDispatching,
+        HookEvent::AgentSpawning,
+        HookEvent::MessageSending,
+    ];
+    let gate_only = [HookEvent::PermissionResolving, HookEvent::AgentLaunching];
+    let transform_only = [HookEvent::InteractionResolving];
+    let observes = [
+        HookEvent::SupervisorStarted,
+        HookEvent::SupervisorStopping,
+        HookEvent::SessionPublished,
+        HookEvent::SessionExpired,
+        HookEvent::ToolCompleted,
+        HookEvent::ToolDenied,
+        HookEvent::AgentStarted,
+        HookEvent::AgentFinished,
+        HookEvent::MessageDelivered,
+        HookEvent::InteractionCreated,
+        HookEvent::InteractionResolved,
+        HookEvent::TeamReset,
+    ];
+    let mut specs = Vec::new();
+    for event in controls {
+        specs.push(event_spec(
+            event,
+            &[HostHookKind::Gate, HostHookKind::Transform],
+        )?);
+    }
+    for event in gate_only {
+        specs.push(event_spec(event, &[HostHookKind::Gate])?);
+    }
+    for event in transform_only {
+        specs.push(event_spec(event, &[HostHookKind::Transform])?);
+    }
+    for event in observes {
+        specs.push(event_spec(event, &[HostHookKind::Observe])?);
+    }
+    EventRegistry::new(specs)
+}
+
+fn event_spec(
+    event: HookEvent,
+    kinds: &[HostHookKind],
+) -> Result<HookEventSpec, pi_whim_hook_host::HookHostError> {
+    let mut spec = HookEventSpec::new(event_name(event)).with_alias(core_event_alias(event));
+    for kind in kinds {
+        spec = spec.with_kind(*kind, HookKindSpec::new(*kind));
+    }
+    for key in [
+        "tools",
+        "agent_levels",
+        "source",
+        "agent_id",
+        "project_id",
+        "operation",
+    ] {
+        spec = spec.with_matcher_key(key);
+    }
+    for (name, class, transformable) in registry_fields() {
+        spec = spec.with_field(HookFieldSpec::new(name, class, transformable, true)?);
+    }
+    Ok(spec)
+}
+
+fn registry_fields() -> Vec<(&'static str, HookDataClass, bool)> {
+    vec![
+        ("arguments", HookDataClass::UserContent, true),
+        ("tool", HookDataClass::PublicString, false),
+        ("agent_id", HookDataClass::PublicString, false),
+        ("agent_level", HookDataClass::Number, false),
+        ("team_id", HookDataClass::PublicString, false),
+        ("session_id", HookDataClass::PublicString, false),
+        ("parent_session_id", HookDataClass::UserContent, false),
+        ("parent_agent_id", HookDataClass::UserContent, false),
+        ("request_id", HookDataClass::UserContent, false),
+        ("agent_name", HookDataClass::PublicString, false),
+        ("agent_role", HookDataClass::PublicString, false),
+        ("root_agent_id", HookDataClass::PublicString, false),
+        ("sender_id", HookDataClass::PublicString, false),
+        ("requester_id", HookDataClass::PublicString, false),
+        ("owner_id", HookDataClass::PublicString, false),
+        ("target", HookDataClass::PublicString, false),
+        ("name", HookDataClass::PublicString, false),
+        ("task", HookDataClass::UserContent, false),
+        ("message", HookDataClass::UserContent, false),
+        ("reason", HookDataClass::UserContent, false),
+        ("status", HookDataClass::PublicString, false),
+        ("success", HookDataClass::Boolean, false),
+        ("interrupted", HookDataClass::Boolean, false),
+        ("exit_code", HookDataClass::UserContent, false),
+        ("duration_ms", HookDataClass::Number, false),
+        ("decision", HookDataClass::UserContent, false),
+        ("kind", HookDataClass::PublicString, false),
+        ("title", HookDataClass::UserContent, false),
+        ("options", HookDataClass::UserContent, false),
+        ("default_option", HookDataClass::UserContent, false),
+        ("operation_hash", HookDataClass::PublicString, false),
+        ("delivery", HookDataClass::UserContent, false),
+        ("response", HookDataClass::UserContent, false),
+        ("effective_policy", HookDataClass::UserContent, false),
+        ("delegated_models", HookDataClass::UserContent, false),
+        ("spawn", HookDataClass::UserContent, false),
+        ("source", HookDataClass::PublicString, false),
+        ("operation", HookDataClass::PublicString, false),
+    ]
+}
+
+fn effective_revision(config: &HookConfig) -> String {
+    if config.revision.is_empty() {
+        LEGACY_EMPTY_REVISION.to_owned()
+    } else {
+        config.revision.clone()
+    }
+}
+
+fn adapt_host_audit(sender: &mpsc::SyncSender<HookAuditRecord>, event: HookAuditEvent) {
+    let Some(core_event) = event_from_name(&event.event) else {
+        return;
+    };
+    let outcome = match event.outcome {
+        HostAuditOutcome::Allowed => CoreAuditOutcome::Allowed,
+        HostAuditOutcome::Denied => CoreAuditOutcome::Denied,
+        HostAuditOutcome::Transformed
+        | HostAuditOutcome::Observed
+        | HostAuditOutcome::Restarted => CoreAuditOutcome::Succeeded,
+        HostAuditOutcome::TimedOut => CoreAuditOutcome::TimedOut,
+        HostAuditOutcome::Preserved | HostAuditOutcome::Failed | HostAuditOutcome::Dropped => {
+            CoreAuditOutcome::Failed
+        }
+    };
+    let _ = sender.try_send(HookAuditRecord {
+        hook_id: event.hook_id,
+        event: core_event,
+        outcome,
+        duration_ms: event.duration_ms,
+        output_truncated: false,
+        revision: event.revision,
+    });
+}
+
+fn safety_floor(event: HookEvent, payload: &Value) -> Result<(), String> {
+    let arguments = || {
+        payload
+            .get("arguments")
+            .and_then(Value::as_object)
+            .ok_or_else(|| "hook event arguments must be an object".to_owned())
+    };
+    match event {
+        HookEvent::MessageSending => {
+            let message = arguments()?
+                .get("message")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "message must be a string".to_owned())?;
+            if message.trim().is_empty() || message.len() > crate::MAX_MESSAGE_BYTES {
+                return Err("message violates supervisor size constraints".to_owned());
+            }
+        }
+        HookEvent::AgentSpawning => {
+            let arguments = arguments()?;
+            for field in ["name", "task"] {
+                if arguments
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .is_none_or(|value| value.trim().is_empty())
+                {
+                    return Err(format!("agent {field} cannot be empty"));
+                }
+            }
+        }
+        HookEvent::ToolDispatching
+        | HookEvent::PermissionResolving
+        | HookEvent::AgentLaunching
+        | HookEvent::InteractionResolving => {}
+        _ => return Ok(()),
+    }
+    Ok(())
+}
+
+fn validate_transformed_payload(
+    event: HookEvent,
+    original: &Value,
+    transformed: &Value,
+) -> Result<(), ()> {
+    let mut original_envelope = original.as_object().cloned().ok_or(())?;
+    let mut transformed_envelope = transformed.as_object().cloned().ok_or(())?;
+    let original_arguments = original_envelope.remove("arguments").ok_or(())?;
+    let transformed_arguments = transformed_envelope.remove("arguments").ok_or(())?;
+    if original_envelope != transformed_envelope {
+        return Err(());
+    }
+    validate_transform(event, &original_arguments, &transformed_arguments)
 }
 
 fn validate_transform(event: HookEvent, original: &Value, transformed: &Value) -> Result<(), ()> {
@@ -394,8 +848,6 @@ fn validate_transform(event: HookEvent, original: &Value, transformed: &Value) -
         }
         HookEvent::AgentSpawning => validate_spawn_transform(original, transformed),
         HookEvent::InteractionResolving => {
-            // Only the decision may change: an answer hook replies to the
-            // question as asked, not to a question it rewrote.
             let mut original = original.clone();
             let mut transformed = transformed.clone();
             let decision_valid = match transformed.get("decision") {
@@ -421,22 +873,31 @@ fn transformed_message_is_valid(message: Option<&Value>) -> bool {
 }
 
 fn validate_spawn_transform(
-    original: &serde_json::Map<String, Value>,
-    transformed: &serde_json::Map<String, Value>,
+    original: &Map<String, Value>,
+    transformed: &Map<String, Value>,
 ) -> Result<(), ()> {
-    const PERMISSION_FIELDS: &[&str] = &["permission_level", "enabled_tools", "trusted_extensions"];
-    for key in original.keys().chain(transformed.keys()) {
-        if !PERMISSION_FIELDS.contains(&key.as_str()) && original.get(key) != transformed.get(key) {
-            return Err(());
-        }
+    const POLICY_FIELDS: &[&str] = &[
+        "permission_level",
+        "enabled_tools",
+        "trusted_extensions",
+        "allowed_models",
+    ];
+    let mut original_identity = original.clone();
+    let mut transformed_identity = transformed.clone();
+    for field in POLICY_FIELDS {
+        original_identity.remove(*field);
+        transformed_identity.remove(*field);
+    }
+    if original_identity != transformed_identity {
+        return Err(());
     }
     if original.get("permission_level") != transformed.get("permission_level") {
-        let requested = transformed
+        let original = original
             .get("permission_level")
             .and_then(Value::as_str)
             .and_then(permission_rank)
-            .ok_or(())?;
-        let original = original
+            .unwrap_or(3);
+        let requested = transformed
             .get("permission_level")
             .and_then(Value::as_str)
             .and_then(permission_rank)
@@ -446,11 +907,17 @@ fn validate_spawn_transform(
         }
     }
     for field in ["enabled_tools", "trusted_extensions"] {
-        if original.get(field) == transformed.get(field) {
-            continue;
+        if original.get(field) != transformed.get(field) {
+            let original = string_set(original.get(field)).ok_or(())?;
+            let transformed = string_set(transformed.get(field)).ok_or(())?;
+            if transformed.is_empty() || !transformed.is_subset(&original) {
+                return Err(());
+            }
         }
-        let original = string_set(original.get(field)).ok_or(())?;
-        let transformed = string_set(transformed.get(field)).ok_or(())?;
+    }
+    if original.get("allowed_models") != transformed.get("allowed_models") {
+        let original = json_set(original.get("allowed_models")).ok_or(())?;
+        let transformed = json_set(transformed.get("allowed_models")).ok_or(())?;
         if transformed.is_empty() || !transformed.is_subset(&original) {
             return Err(());
         }
@@ -466,611 +933,116 @@ fn permission_rank(value: &str) -> Option<u8> {
         _ => None,
     }
 }
-
 fn string_set(value: Option<&Value>) -> Option<std::collections::HashSet<&str>> {
     value?.as_array()?.iter().map(Value::as_str).collect()
 }
-
-fn observe_once(
-    audit_sender: &mpsc::SyncSender<HookAuditRecord>,
-    revision: &str,
-    hook: &HookDefinition,
-    event: HookEvent,
-    payload: &Value,
-    project_root: &Path,
-) {
-    let started = std::time::Instant::now();
-    let (outcome, truncated) = match invoke(hook, event, payload, project_root) {
-        Ok(_) => (HookAuditOutcome::Succeeded, false),
-        Err(error) if error == "timed out" => (HookAuditOutcome::TimedOut, false),
-        Err(error) => (HookAuditOutcome::Failed, error == "output exceeds limit"),
-    };
-    let _ = audit_sender.try_send(HookAuditRecord {
-        hook_id: hook.id.clone(),
-        event,
-        outcome,
-        duration_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
-        output_truncated: truncated,
-        revision: revision.to_owned(),
-    });
+fn json_set(value: Option<&Value>) -> Option<std::collections::HashSet<String>> {
+    value?
+        .as_array()?
+        .iter()
+        .map(|value| serde_json::to_string(value).ok())
+        .collect()
 }
 
-fn invoke(
-    hook: &HookDefinition,
-    event: HookEvent,
-    payload: &Value,
-    project_root: &Path,
-) -> Result<Value, String> {
-    let project_root =
-        std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
-    let (program, arguments) = hook
-        .command
-        .split_first()
-        .ok_or_else(|| "command is empty".to_owned())?;
-    let program = Path::new(program);
-    if !program.is_file() {
-        return Err("command is not an existing file".into());
+fn event_name(event: HookEvent) -> &'static str {
+    match event {
+        HookEvent::SupervisorStarted => "pi.supervisor.started",
+        HookEvent::SupervisorStopping => "pi.supervisor.stopping",
+        HookEvent::SessionPublished => "pi.session.published",
+        HookEvent::SessionExpired => "pi.session.expired",
+        HookEvent::ToolDispatching => "pi.tool.dispatching",
+        HookEvent::AgentSpawning => "pi.agent.spawning",
+        HookEvent::MessageSending => "pi.message.sending",
+        HookEvent::PermissionResolving => "pi.permission.resolving",
+        HookEvent::AgentLaunching => "pi.agent.launching",
+        HookEvent::ToolCompleted => "pi.tool.completed",
+        HookEvent::ToolDenied => "pi.tool.denied",
+        HookEvent::AgentStarted => "pi.agent.started",
+        HookEvent::AgentFinished => "pi.agent.finished",
+        HookEvent::MessageDelivered => "pi.message.delivered",
+        HookEvent::InteractionCreated => "pi.interaction.created",
+        HookEvent::InteractionResolving => "pi.interaction.resolving",
+        HookEvent::InteractionResolved => "pi.interaction.resolved",
+        HookEvent::TeamReset => "pi.team.reset",
     }
-    let approved_entrypoint = if let Some(expected) = hook.entrypoint_fingerprint.as_deref() {
-        let content = std::fs::read(program).map_err(|error| error.to_string())?;
-        let actual = Sha256::digest(&content)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        if actual != expected {
-            return Err("approved command entrypoint changed".into());
-        }
-        let permissions = std::fs::metadata(program)
-            .map_err(|error| error.to_string())?
-            .permissions();
-        Some((content, permissions))
-    } else {
-        None
-    };
-    if !Path::new("/usr/bin/sandbox-exec").is_file() {
-        return Err("sandbox-exec is unavailable".into());
-    }
-    let temporary_directory =
-        std::env::temp_dir().join(format!("pi-whim-hook-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&temporary_directory).map_err(|error| error.to_string())?;
-    let execution_program = if let Some((content, permissions)) = approved_entrypoint {
-        let staged = temporary_directory.join("approved-entrypoint");
-        if let Err(error) = std::fs::write(&staged, content)
-            .and_then(|()| std::fs::set_permissions(&staged, permissions))
-        {
-            let _ = std::fs::remove_dir_all(&temporary_directory);
-            return Err(error.to_string());
-        }
-        staged
-    } else {
-        program.to_path_buf()
-    };
-    let profile = sandbox_profile(&project_root, &temporary_directory, program);
-    let mut child = match Command::new("/usr/bin/sandbox-exec")
-        .args(["-p", &profile])
-        .arg(&execution_program)
-        .args(arguments)
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .env("TMPDIR", &temporary_directory)
-        .current_dir(&project_root)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(error) => {
-            let _ = std::fs::remove_dir_all(&temporary_directory);
-            return Err(error.to_string());
-        }
-    };
-    let request = json!({
-        "version": 1,
-        "hook_id": hook.id,
-        "event": event,
-        "entrypoint": program,
-        "project_root": project_root,
-        "payload": payload
-    });
-    let result = (|| {
-        child
-            .stdin
-            .take()
-            .ok_or_else(|| "hook stdin unavailable".to_owned())?
-            .write_all(format!("{}\n", request).as_bytes())
-            .map_err(|error| error.to_string())?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "hook stdout unavailable".to_owned())?;
-        let (sender, receiver) = mpsc::sync_channel(1);
-        thread::spawn(move || {
-            let mut output = String::new();
-            let result = BufReader::new(stdout)
-                .take((MAX_HOOK_OUTPUT + 1) as u64)
-                .read_to_string(&mut output)
-                .map(|_| output)
-                .map_err(|error| format!("failed to read hook stdout: {error}"));
-            let _ = sender.send(result);
-        });
-        let timeout = Duration::from_millis(
-            hook.timeout_ms
-                .unwrap_or(DEFAULT_TIMEOUT.as_millis() as u64),
-        );
-        receiver
-            .recv_timeout(timeout)
-            .map_err(|_| "timed out".to_owned())?
-    })();
-    let mut status = None;
-    if result.is_ok() {
-        for _ in 0..10 {
-            match child.try_wait() {
-                Ok(Some(exit)) => {
-                    status = Some(exit);
-                    break;
-                }
-                Ok(None) => thread::sleep(Duration::from_millis(1)),
-                Err(error) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = std::fs::remove_dir_all(&temporary_directory);
-                    return Err(error.to_string());
-                }
-            }
-        }
-    }
-    if status.is_none() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-    let _ = std::fs::remove_dir_all(&temporary_directory);
-    let line = result?;
-    if line.len() > MAX_HOOK_OUTPUT {
-        return Err("output exceeds limit".into());
-    }
-    let Some(status) = status else {
-        return Err("hook did not exit after closing stdout".into());
-    };
-    if !status.success() {
-        return Err(format!("hook exited with status {status}"));
-    }
-    let response = if line.trim().is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_str(&line).map_err(|error| format!("invalid JSON response: {error}"))?
-    };
-    if matches!(hook.kind, HookKind::Gate) {
-        validate_gate_response(&response)?;
-    }
-    Ok(response)
 }
-
-fn validate_gate_response(response: &Value) -> Result<(), String> {
-    if response.is_null() {
-        return Ok(());
+fn core_event_alias(event: HookEvent) -> &'static str {
+    match event {
+        HookEvent::SupervisorStarted => "supervisor_started",
+        HookEvent::SupervisorStopping => "supervisor_stopping",
+        HookEvent::SessionPublished => "session_published",
+        HookEvent::SessionExpired => "session_expired",
+        HookEvent::ToolDispatching => "tool_dispatching",
+        HookEvent::AgentSpawning => "agent_spawning",
+        HookEvent::MessageSending => "message_sending",
+        HookEvent::PermissionResolving => "permission_resolving",
+        HookEvent::AgentLaunching => "agent_launching",
+        HookEvent::ToolCompleted => "tool_completed",
+        HookEvent::ToolDenied => "tool_denied",
+        HookEvent::AgentStarted => "agent_started",
+        HookEvent::AgentFinished => "agent_finished",
+        HookEvent::MessageDelivered => "message_delivered",
+        HookEvent::InteractionCreated => "interaction_created",
+        HookEvent::InteractionResolving => "interaction_resolving",
+        HookEvent::InteractionResolved => "interaction_resolved",
+        HookEvent::TeamReset => "team_reset",
     }
-    let object = response
-        .as_object()
-        .ok_or_else(|| "gate hook response must be a JSON object".to_owned())?;
-    if let Some(decision) = object.get("decision") {
-        match decision.as_str() {
-            Some("allow" | "deny") => {}
-            _ => return Err("gate hook decision must be 'allow' or 'deny'".into()),
-        }
-    }
-    if object
-        .get("message")
-        .is_some_and(|message| !message.is_string())
-    {
-        return Err("gate hook message must be a string".into());
-    }
-    Ok(())
 }
-
-fn sandbox_profile(project_root: &Path, temporary_directory: &Path, program: &Path) -> String {
-    fn quoted(path: &Path) -> String {
-        path.to_string_lossy().replace('"', "\\\"")
-    }
-    let project_root =
-        std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
-    let temporary_directory = std::fs::canonicalize(temporary_directory)
-        .unwrap_or_else(|_| temporary_directory.to_path_buf());
-    let program = std::fs::canonicalize(program).unwrap_or_else(|_| program.to_path_buf());
-    let program_dir = program.parent().unwrap_or(&program);
-    format!(
-        "(version 1) (deny default) (import \"system.sb\") (allow process*) (allow file-read* (subpath \"{}\") (subpath \"{}\") (subpath \"{}\") (subpath \"{}\") (subpath \"/usr\") (subpath \"/bin\") (subpath \"/sbin\") (subpath \"/System\") (subpath \"/dev\")) (allow file-write* (subpath \"{}\"))",
-        quoted(&project_root),
-        quoted(program_dir),
-        quoted(&program),
-        quoted(&temporary_directory),
-        quoted(&temporary_directory)
-    )
+fn event_from_name(event: &str) -> Option<HookEvent> {
+    Some(match event {
+        "pi.supervisor.started" => HookEvent::SupervisorStarted,
+        "pi.supervisor.stopping" => HookEvent::SupervisorStopping,
+        "pi.session.published" => HookEvent::SessionPublished,
+        "pi.session.expired" => HookEvent::SessionExpired,
+        "pi.tool.dispatching" => HookEvent::ToolDispatching,
+        "pi.agent.spawning" => HookEvent::AgentSpawning,
+        "pi.message.sending" => HookEvent::MessageSending,
+        "pi.permission.resolving" => HookEvent::PermissionResolving,
+        "pi.agent.launching" => HookEvent::AgentLaunching,
+        "pi.tool.completed" => HookEvent::ToolCompleted,
+        "pi.tool.denied" => HookEvent::ToolDenied,
+        "pi.agent.started" => HookEvent::AgentStarted,
+        "pi.agent.finished" => HookEvent::AgentFinished,
+        "pi.message.delivered" => HookEvent::MessageDelivered,
+        "pi.interaction.created" => HookEvent::InteractionCreated,
+        "pi.interaction.resolving" => HookEvent::InteractionResolving,
+        "pi.interaction.resolved" => HookEvent::InteractionResolved,
+        "pi.team.reset" => HookEvent::TeamReset,
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pi_whim_core::HookMatcher;
-    use std::os::unix::fs::PermissionsExt;
+    use pi_whim_core::{
+        AgentPermissionLevel, HookDefinition, HookKind as CoreHookKind, HookMatcher,
+    };
+    use pi_whim_hook_host::{ReentrancyGuard, ReentrancyKind};
+    use serde_json::json;
+    use sha2::{Digest, Sha256};
+    use std::{fs, os::unix::fs::PermissionsExt, time::Duration};
+    use uuid::Uuid;
+
+    fn sandbox_available() -> bool {
+        Path::new("/usr/bin/sandbox-exec").is_file()
+    }
 
     fn write_executable(path: &Path, content: &str) {
-        std::fs::write(path, content).unwrap();
-        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        fs::write(path, content).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
         permissions.set_mode(0o755);
-        std::fs::set_permissions(path, permissions).unwrap();
+        fs::set_permissions(path, permissions).unwrap();
     }
 
-    #[test]
-    fn non_matching_hooks_are_skipped() {
-        let dispatcher = HookDispatcher::new(
-            HookConfig {
-                version: 1,
-                revision: String::new(),
-                hooks: vec![HookDefinition {
-                    id: "only-bash".into(),
-                    event: HookEvent::ToolDispatching,
-                    kind: HookKind::Gate,
-                    command: vec!["false".into()],
-                    timeout_ms: None,
-                    matcher: HookMatcher {
-                        tools: vec!["bash".into()],
-                        agent_levels: vec![],
-                    },
-                    entrypoint_fingerprint: None,
-                }],
-            },
-            PathBuf::from("/tmp"),
-            mpsc::sync_channel(16).0,
-        );
-        let payload = json!({"tool":"read", "arguments":{}});
-        assert_eq!(
-            dispatcher.gate(HookEvent::ToolDispatching, payload.clone()),
-            HookDecision::Continue(payload)
-        );
-    }
-
-    #[test]
-    fn gate_hooks_can_deny_an_operation() {
-        if !Path::new("/usr/bin/sandbox-exec").is_file() {
-            return;
-        }
-        let (audit_sender, audit_receiver) = mpsc::sync_channel(16);
-        let dispatcher = HookDispatcher::new(
-            HookConfig {
-                version: 1,
-                revision: "sha256:test".into(),
-                hooks: vec![HookDefinition {
-                    id: "deny".into(),
-                    event: HookEvent::ToolDispatching,
-                    kind: HookKind::Gate,
-                    command: vec![
-                        "/bin/echo".into(),
-                        r#"{"decision":"deny","message":"policy"}"#.into(),
-                    ],
-                    timeout_ms: Some(1_000),
-                    matcher: HookMatcher::default(),
-                    entrypoint_fingerprint: None,
-                }],
-            },
-            PathBuf::from("/tmp"),
-            audit_sender,
-        );
-        assert_eq!(
-            dispatcher.gate(
-                HookEvent::ToolDispatching,
-                json!({"tool":"bash", "agent_level": 0, "arguments":{}})
-            ),
-            HookDecision::Deny("policy".into())
-        );
-        let _builtin = audit_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
-        let audit = audit_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert_eq!(audit.outcome, HookAuditOutcome::Denied);
-        assert_eq!(audit.revision, "sha256:test");
-    }
-
-    #[test]
-    fn failed_transform_preserves_the_original_arguments() {
-        let (audit_sender, audit_receiver) = mpsc::sync_channel(16);
-        let dispatcher = HookDispatcher::new(
-            HookConfig {
-                version: 1,
-                revision: "sha256:test".into(),
-                hooks: vec![HookDefinition {
-                    id: "transform".into(),
-                    event: HookEvent::ToolDispatching,
-                    kind: HookKind::Transform,
-                    command: vec!["/missing/hook".into()],
-                    timeout_ms: None,
-                    matcher: HookMatcher::default(),
-                    entrypoint_fingerprint: None,
-                }],
-            },
-            PathBuf::from("/tmp"),
-            audit_sender,
-        );
-        let payload = json!({"tool":"bash", "arguments":{"command":"pwd"}});
-        assert_eq!(
-            dispatcher.gate(HookEvent::ToolDispatching, payload.clone()),
-            HookDecision::Continue(payload)
-        );
-        let _builtin = audit_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert_eq!(
-            audit_receiver
-                .recv_timeout(Duration::from_secs(1))
-                .unwrap()
-                .outcome,
-            HookAuditOutcome::Failed
-        );
-    }
-
-    #[test]
-    fn changed_approved_entrypoint_fails_a_gate_closed() {
-        let dispatcher = HookDispatcher::new(
-            HookConfig {
-                version: 1,
-                revision: "sha256:test".into(),
-                hooks: vec![HookDefinition {
-                    id: "approved".into(),
-                    event: HookEvent::ToolDispatching,
-                    kind: HookKind::Gate,
-                    command: vec!["/usr/bin/true".into()],
-                    timeout_ms: None,
-                    matcher: HookMatcher::default(),
-                    entrypoint_fingerprint: Some("00".repeat(32)),
-                }],
-            },
-            PathBuf::from("/tmp"),
-            mpsc::sync_channel(16).0,
-        );
-        assert!(matches!(
-            dispatcher.gate(
-                HookEvent::ToolDispatching,
-                json!({"tool":"bash", "arguments":{}})
-            ),
-            HookDecision::Deny(message) if message.contains("entrypoint changed")
-        ));
-    }
-
-    #[test]
-    fn nonzero_hook_exit_is_a_failure() {
-        if !Path::new("/usr/bin/sandbox-exec").is_file() {
-            return;
-        }
-        let hook = HookDefinition {
-            id: "failure".into(),
-            event: HookEvent::ToolDispatching,
-            kind: HookKind::Gate,
-            command: vec!["/usr/bin/false".into()],
-            timeout_ms: Some(1_000),
-            matcher: HookMatcher::default(),
-            entrypoint_fingerprint: None,
-        };
-        assert!(
-            invoke(
-                &hook,
-                HookEvent::ToolDispatching,
-                &json!({"arguments":{}}),
-                Path::new("/tmp")
-            )
-            .unwrap_err()
-            .contains("exited with status")
-        );
-    }
-
-    #[test]
-    fn invalid_utf8_stdout_is_a_hook_failure() {
-        if !Path::new("/usr/bin/sandbox-exec").is_file() {
-            return;
-        }
-        let hook = HookDefinition {
-            id: "invalid-utf8".into(),
-            event: HookEvent::ToolDispatching,
-            kind: HookKind::Gate,
-            command: vec!["/usr/bin/printf".into(), "\\377".into()],
-            timeout_ms: Some(1_000),
-            matcher: HookMatcher::default(),
-            entrypoint_fingerprint: None,
-        };
-        assert!(
-            invoke(
-                &hook,
-                HookEvent::ToolDispatching,
-                &json!({"arguments":{}}),
-                Path::new("/tmp")
-            )
-            .unwrap_err()
-            .starts_with("failed to read hook stdout")
-        );
-    }
-
-    #[test]
-    fn gate_responses_reject_ambiguous_decisions() {
-        assert!(validate_gate_response(&Value::Null).is_ok());
-        assert!(validate_gate_response(&json!({})).is_ok());
-        assert!(validate_gate_response(&json!({"decision":"allow"})).is_ok());
-        assert!(validate_gate_response(&json!({"decision":"deny"})).is_ok());
-        assert!(validate_gate_response(&json!({"decision":"unknown"})).is_err());
-        assert!(validate_gate_response(&json!([])).is_err());
-        assert!(validate_gate_response(&json!({"message": 42})).is_err());
-    }
-
-    #[test]
-    fn malformed_gate_decisions_fail_closed() {
-        if !Path::new("/usr/bin/sandbox-exec").is_file() {
-            return;
-        }
-        let dispatcher = HookDispatcher::new(
-            HookConfig {
-                version: 1,
-                revision: "sha256:test".into(),
-                hooks: vec![HookDefinition {
-                    id: "ambiguous".into(),
-                    event: HookEvent::ToolDispatching,
-                    kind: HookKind::Gate,
-                    command: vec!["/bin/echo".into(), r#"{"decision":"maybe"}"#.into()],
-                    timeout_ms: Some(1_000),
-                    matcher: HookMatcher::default(),
-                    entrypoint_fingerprint: None,
-                }],
-            },
-            PathBuf::from("/tmp"),
-            mpsc::sync_channel(16).0,
-        );
-        assert!(matches!(
-            dispatcher.gate(
-                HookEvent::ToolDispatching,
-                json!({"tool":"bash", "arguments":{}})
-            ),
-            HookDecision::Deny(message) if message.contains("decision must be")
-        ));
-    }
-
-    #[test]
-    fn sandbox_allows_project_reads_but_denies_project_writes() {
-        if !Path::new("/usr/bin/sandbox-exec").is_file() {
-            return;
-        }
-        let directory = tempfile::tempdir().unwrap();
-        let blocked = directory.path().join("blocked");
-        let script = directory.path().join("hook.sh");
-        write_executable(
-            &script,
-            &format!(
-                "#!/bin/sh\necho denied > \"{}\"\nprintf '{{}}\\n'\n",
-                blocked.display()
-            ),
-        );
-
-        let hook = HookDefinition {
-            id: "sandbox-write".into(),
-            event: HookEvent::ToolDispatching,
-            kind: HookKind::Gate,
-            command: vec![script.to_string_lossy().into_owned()],
-            timeout_ms: Some(5_000),
-            matcher: HookMatcher::default(),
-            entrypoint_fingerprint: None,
-        };
-        assert_eq!(
-            invoke(
-                &hook,
-                HookEvent::ToolDispatching,
-                &json!({"arguments":{}}),
-                directory.path()
-            )
-            .unwrap(),
-            json!({})
-        );
-        assert!(!blocked.exists());
-
-        let profile = sandbox_profile(directory.path(), directory.path(), &script);
-        assert!(!profile.contains("network"));
-    }
-
-    #[test]
-    fn hook_envelope_identifies_hook_entrypoint_and_project() {
-        if !Path::new("/usr/bin/sandbox-exec").is_file() {
-            return;
-        }
-        let directory = tempfile::tempdir().unwrap();
-        let project_root = std::fs::canonicalize(directory.path()).unwrap();
-        let script = directory.path().join("envelope.sh");
-        write_executable(
-            &script,
-            r#"#!/bin/sh
-read request
-[ "$PWD" = "$1" ] || exit 10
-printf '%s' "$request" | /usr/bin/grep -F '"hook_id":"envelope"' >/dev/null || exit 11
-printf '%s' "$request" | /usr/bin/grep -F '"entrypoint":' >/dev/null || exit 12
-printf '%s' "$request" | /usr/bin/grep -F '"project_root":' >/dev/null || exit 13
-printf '{}\n'
-"#,
-        );
-        let hook = HookDefinition {
-            id: "envelope".into(),
-            event: HookEvent::ToolDispatching,
-            kind: HookKind::Gate,
-            command: vec![
-                script.to_string_lossy().into_owned(),
-                project_root.to_string_lossy().into_owned(),
-            ],
-            timeout_ms: Some(5_000),
-            matcher: HookMatcher::default(),
-            entrypoint_fingerprint: None,
-        };
-
-        assert_eq!(
-            invoke(
-                &hook,
-                HookEvent::ToolDispatching,
-                &json!({"arguments":{}}),
-                &project_root
-            )
-            .unwrap(),
-            json!({})
-        );
-    }
-
-    #[test]
-    fn approved_entrypoints_execute_from_the_verified_snapshot() {
-        if !Path::new("/usr/bin/sandbox-exec").is_file() {
-            return;
-        }
-        let directory = tempfile::tempdir().unwrap();
-        let script = directory.path().join("approved.sh");
-        let content = r#"#!/bin/sh
-case "$0" in
-  */pi-whim-hook-*/approved-entrypoint) printf '{"decision":"allow"}\n' ;;
-  *) exit 12 ;;
-esac
-"#;
-        write_executable(&script, content);
-        let fingerprint = Sha256::digest(content.as_bytes())
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        let hook = HookDefinition {
-            id: "approved".into(),
-            event: HookEvent::ToolDispatching,
-            kind: HookKind::Gate,
-            command: vec![script.to_string_lossy().into_owned()],
-            timeout_ms: Some(1_000),
-            matcher: HookMatcher::default(),
-            entrypoint_fingerprint: Some(fingerprint),
-        };
-
-        assert_eq!(
-            invoke(
-                &hook,
-                HookEvent::ToolDispatching,
-                &json!({"arguments":{}}),
-                directory.path()
-            )
-            .unwrap(),
-            json!({"decision":"allow"})
-        );
-    }
-
-    fn test_dispatcher(project_root: &Path, hooks: Vec<HookDefinition>) -> HookDispatcher {
-        HookDispatcher::new(
-            HookConfig {
-                version: 1,
-                revision: "sha256:test".into(),
-                hooks,
-            },
-            project_root.to_path_buf(),
-            mpsc::sync_channel(64).0,
-        )
-    }
-
-    fn test_hook(
+    fn definition(
         id: &str,
         event: HookEvent,
-        kind: HookKind,
+        kind: CoreHookKind,
         command: Vec<String>,
     ) -> HookDefinition {
         HookDefinition {
-            id: id.into(),
+            id: id.to_owned(),
             event,
             kind,
             command,
@@ -1080,335 +1052,625 @@ esac
         }
     }
 
-    #[test]
-    fn gate_hook_failures_deny_operations_closed() {
-        if !Path::new("/usr/bin/sandbox-exec").is_file() {
-            return;
+    fn config(hooks: Vec<HookDefinition>) -> HookConfig {
+        HookConfig {
+            version: 1,
+            hooks,
+            revision: "revision-test".to_owned(),
         }
-        let directory = tempfile::tempdir().unwrap();
-        let payload = json!({"tool":"bash", "agent_level":0, "arguments":{}});
-        let cases = [
-            test_hook(
-                "nonzero",
-                HookEvent::ToolDispatching,
-                HookKind::Gate,
-                vec!["/usr/bin/false".into()],
-            ),
-            HookDefinition {
-                timeout_ms: Some(1),
-                ..test_hook(
-                    "timeout",
-                    HookEvent::ToolDispatching,
-                    HookKind::Gate,
-                    vec!["/bin/sleep".into(), "1".into()],
-                )
+    }
+
+    fn test_pipeline(
+        root: &Path,
+        hooks: Vec<HookDefinition>,
+    ) -> (SupervisorHooks, mpsc::Receiver<HookAuditRecord>) {
+        let (sender, receiver) = mpsc::sync_channel(128);
+        (
+            SupervisorHooks::from_v1_config(config(hooks), root.to_path_buf(), sender),
+            receiver,
+        )
+    }
+
+    fn actor() -> AgentEventContext {
+        AgentEventContext::new(
+            &AgentDescriptor {
+                id: Uuid::from_u128(1),
+                session_id: Uuid::from_u128(2),
+                team_id: Uuid::from_u128(3),
+                parent_id: Some(Uuid::from_u128(4)),
+                parent_session_id: Some(Uuid::from_u128(5)),
+                level: 2,
+                name: "reviewer".to_owned(),
+                role: "code review".to_owned(),
+                status: crate::model::AgentStatus::Running,
+                permission_level: AgentPermissionLevel::Controlled,
             },
-            test_hook(
-                "invalid-json",
-                HookEvent::ToolDispatching,
-                HookKind::Gate,
-                vec!["/bin/echo".into(), "not json".into()],
-            ),
-            test_hook(
-                "oversized-output",
-                HookEvent::ToolDispatching,
-                HookKind::Gate,
-                vec!["/usr/bin/printf".into(), "%65537s".into(), "".into()],
-            ),
-        ];
+            Some("request-42"),
+        )
+    }
 
-        for hook in cases {
-            assert!(matches!(
-                test_dispatcher(directory.path(), vec![hook])
-                    .gate(HookEvent::ToolDispatching, payload.clone()),
-                HookDecision::Deny(_)
-            ));
+    fn tool_input(tool: &str, arguments: Value) -> ToolDispatchInput {
+        ToolDispatchInput {
+            actor: actor(),
+            tool: tool.to_owned(),
+            arguments,
         }
     }
 
+    fn validate_object(value: &Value) -> Result<(), String> {
+        value
+            .is_object()
+            .then_some(())
+            .ok_or_else(|| "arguments must be an object".to_owned())
+    }
+
+    fn approved(config: &HookConfig) -> ApprovedHookManifest {
+        let revision = effective_revision(config);
+        let fingerprints = config
+            .hooks
+            .iter()
+            .filter_map(|hook| {
+                hook.entrypoint_fingerprint
+                    .as_ref()
+                    .map(|fingerprint| (hook.id.clone(), fingerprint.clone()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let manifest = HookManifest::parse_json(&serde_json::to_string(config).unwrap())
+            .unwrap()
+            .with_revision(revision.clone())
+            .with_entrypoint_fingerprints(&fingerprints)
+            .unwrap();
+        ApprovedHookManifest::new(manifest, revision, fingerprints).unwrap()
+    }
+
     #[test]
-    fn interaction_resolving_transforms_only_set_the_decision() {
-        if !Path::new("/usr/bin/sandbox-exec").is_file() {
+    fn v1_conversion_preserves_order_matcher_timeout_fingerprint_and_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = definition(
+            "first",
+            HookEvent::ToolDispatching,
+            CoreHookKind::Gate,
+            vec!["/usr/bin/true".to_owned()],
+        );
+        let mut second = definition(
+            "second",
+            HookEvent::MessageSending,
+            CoreHookKind::Transform,
+            vec!["/usr/bin/true".to_owned()],
+        );
+        second.timeout_ms = Some(321);
+        second.matcher.tools = vec!["send_message".to_owned()];
+        second.matcher.agent_levels = vec![2];
+        second.entrypoint_fingerprint = Some("ab".repeat(32));
+        let config = HookConfig {
+            version: 1,
+            hooks: vec![first, second],
+            revision: "revision-7".to_owned(),
+        };
+        let approved = approved(&config);
+        assert_eq!(approved.revision, "revision-7");
+        assert_eq!(approved.manifest.hooks[0].id, "first");
+        assert_eq!(approved.manifest.hooks[1].id, "second");
+        assert_eq!(approved.manifest.hooks[1].timeout_ms, Some(321));
+        assert_eq!(approved.manifest.hooks[1].matcher.tools, ["send_message"]);
+        assert_eq!(approved.manifest.hooks[1].matcher.agent_levels, [2]);
+        assert_eq!(
+            approved.entrypoint_fingerprints.get("second"),
+            Some(&"ab".repeat(32))
+        );
+        assert!(build_v1_scope(&config, directory.path(), &mpsc::sync_channel(8).0).is_ok());
+    }
+
+    #[test]
+    fn supplied_scope_handle_is_reused_without_another_manager() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = config(Vec::new());
+        let global = ApprovedHookManifest::new(
+            HookManifest::default().with_revision("global"),
+            "global",
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let manager =
+            HookHostManager::new_with_registry(supervisor_registry().unwrap(), global).unwrap();
+        let key = HookScopeKey::project(directory.path(), project.revision.clone()).unwrap();
+        let scope = manager.open_scope(key, Some(approved(&project))).unwrap();
+        let expected_scope_id = scope.scope_id();
+        let first = SupervisorHooks::from_scope(
+            manager.clone(),
+            scope.clone(),
+            directory.path(),
+            mpsc::sync_channel(8).0,
+        )
+        .unwrap();
+        let second =
+            SupervisorHooks::from_scope(manager, scope, directory.path(), mpsc::sync_channel(8).0)
+                .unwrap();
+        assert_eq!(
+            first.scope_id().as_deref(),
+            Some(expected_scope_id.as_str())
+        );
+        assert_eq!(second.scope_id(), first.scope_id());
+    }
+
+    #[test]
+    fn non_matching_gate_is_skipped() {
+        if !sandbox_available() {
             return;
         }
         let directory = tempfile::tempdir().unwrap();
-        let payload =
-            || json!({"request_id":"r1", "kind":"question", "arguments":{"decision":null}});
-
-        // An answer comes through.
-        let dispatcher = test_dispatcher(
-            directory.path(),
-            vec![test_hook(
-                "answer",
-                HookEvent::InteractionResolving,
-                HookKind::Transform,
-                vec![
-                    "/bin/echo".into(),
-                    r#"{"arguments":{"decision":"use pnpm"}}"#.into(),
-                ],
-            )],
-        );
-        assert_eq!(
-            dispatcher.gate(HookEvent::InteractionResolving, payload()),
-            HookDecision::Continue(
-                json!({"request_id":"r1", "kind":"question", "arguments":{"decision":"use pnpm"}})
-            )
-        );
-
-        // A blank or reshaping answer is a failure, and the question is left
-        // to its owner.
-        for response in [
-            r#"{"arguments":{"decision":"  "}}"#,
-            r#"{"arguments":{"decision":"x","kind":"approval"}}"#,
-            r#"{"arguments":{"decision":"x"},"extra":1}"#,
-        ] {
-            let dispatcher = test_dispatcher(
-                directory.path(),
-                vec![test_hook(
-                    "invalid-answer",
-                    HookEvent::InteractionResolving,
-                    HookKind::Transform,
-                    vec!["/bin/echo".into(), response.into()],
-                )],
-            );
-            assert_eq!(
-                dispatcher.gate(HookEvent::InteractionResolving, payload()),
-                HookDecision::Continue(payload())
-            );
-        }
-    }
-
-    #[test]
-    fn transform_responses_preserve_arguments_when_they_violate_the_contract() {
-        if !Path::new("/usr/bin/sandbox-exec").is_file() {
-            return;
-        }
-        let directory = tempfile::tempdir().unwrap();
-
-        for response in ["[]", r#"{"arguments":"string"}"#] {
-            let payload = json!({"tool":"bash", "arguments":{"command":"pwd"}});
-            let dispatcher = test_dispatcher(
-                directory.path(),
-                vec![test_hook(
-                    "invalid-tool-transform",
-                    HookEvent::ToolDispatching,
-                    HookKind::Transform,
-                    vec!["/bin/echo".into(), response.into()],
-                )],
-            );
-            assert_eq!(
-                dispatcher.gate(HookEvent::ToolDispatching, payload.clone()),
-                HookDecision::Continue(payload)
-            );
-        }
-
-        let payload = json!({"tool":"bash", "arguments":{"command":"pwd"}});
-        let dispatcher = test_dispatcher(
-            directory.path(),
-            vec![test_hook(
-                "tool-envelope-is-immutable",
-                HookEvent::ToolDispatching,
-                HookKind::Transform,
-                vec!["/bin/echo".into(), r#"{"tool":"write"}"#.into()],
-            )],
-        );
-        assert_eq!(
-            dispatcher.gate(HookEvent::ToolDispatching, payload.clone()),
-            HookDecision::Continue(payload)
-        );
-
-        let payload =
-            json!({"tool":"send_message", "arguments":{"target":"child","message":"old"}});
-        let dispatcher = test_dispatcher(
-            directory.path(),
-            vec![test_hook(
-                "changed-target",
-                HookEvent::MessageSending,
-                HookKind::Transform,
-                vec![
-                    "/bin/echo".into(),
-                    r#"{"arguments":{"target":"other","message":"new"}}"#.into(),
-                ],
-            )],
-        );
-        assert_eq!(
-            dispatcher.gate(HookEvent::MessageSending, payload.clone()),
-            HookDecision::Continue(payload)
-        );
-    }
-
-    #[test]
-    fn matchers_use_protocol_tool_names_levels_and_empty_wildcards() {
-        let directory = tempfile::tempdir().unwrap();
-        let deny_bash = test_hook(
+        let mut hook = definition(
             "bash-only",
             HookEvent::ToolDispatching,
-            HookKind::Gate,
-            vec!["/usr/bin/false".into()],
+            CoreHookKind::Gate,
+            vec!["/bin/echo".to_owned(), r#"{"decision":"deny"}"#.to_owned()],
         );
-        let dispatcher = test_dispatcher(
-            directory.path(),
-            vec![HookDefinition {
-                matcher: HookMatcher {
-                    tools: vec!["bash".into()],
-                    agent_levels: vec![2],
-                },
-                ..deny_bash
-            }],
-        );
-        let payload = json!({"tool":"bash_command", "agent_level":2, "arguments":{}});
+        hook.matcher.tools = vec!["bash".to_owned()];
+        let (pipeline, _) = test_pipeline(directory.path(), vec![hook]);
         assert_eq!(
-            dispatcher.gate(HookEvent::ToolDispatching, payload.clone()),
-            HookDecision::Continue(payload)
+            pipeline
+                .control_tool_dispatch(tool_input("read", json!({})), validate_object)
+                .unwrap(),
+            json!({})
         );
-        let payload = json!({"tool":"bash", "agent_level":1, "arguments":{}});
-        assert_eq!(
-            dispatcher.gate(HookEvent::ToolDispatching, payload.clone()),
-            HookDecision::Continue(payload)
-        );
+    }
 
-        // A matching tool and level reaches the hook; its missing executable fails closed.
-        assert!(matches!(
-            dispatcher.gate(
-                HookEvent::ToolDispatching,
-                json!({"tool":"bash", "agent_level":2, "arguments":{}})
-            ),
-            HookDecision::Deny(_)
-        ));
-
-        let dispatcher = test_dispatcher(
+    #[test]
+    fn gate_denial_can_only_reject() {
+        if !sandbox_available() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let (pipeline, _) = test_pipeline(
             directory.path(),
-            vec![test_hook(
-                "all-events",
+            vec![definition(
+                "deny",
                 HookEvent::ToolDispatching,
-                HookKind::Gate,
-                vec!["/missing/hook".into()],
+                CoreHookKind::Gate,
+                vec![
+                    "/bin/echo".to_owned(),
+                    r#"{"decision":"deny","message":"blocked"}"#.to_owned(),
+                ],
             )],
         );
         assert!(matches!(
-            dispatcher.gate(
-                HookEvent::ToolDispatching,
-                json!({"tool":"read", "agent_level":0, "arguments":{}})
-            ),
-            HookDecision::Deny(_)
+            pipeline.control_tool_dispatch(tool_input("read", json!({})), validate_object),
+            Err(HookControlError::Denied(message)) if message.contains("blocked")
         ));
     }
 
     #[test]
-    fn builtin_safety_floor_rejects_invalid_spawn_and_messages() {
+    fn gate_execution_failure_fails_closed() {
+        if !sandbox_available() {
+            return;
+        }
         let directory = tempfile::tempdir().unwrap();
-        let dispatcher = test_dispatcher(directory.path(), Vec::new());
-        assert!(matches!(
-            dispatcher.gate(
-                HookEvent::AgentSpawning,
-                json!({"arguments":{"task":"work"}})
-            ),
-            HookDecision::Deny(_)
-        ));
-        assert!(matches!(
-            dispatcher.gate(
-                HookEvent::MessageSending,
-                json!({"arguments":{"message":"  "}})
-            ),
-            HookDecision::Deny(_)
-        ));
-        assert!(matches!(
-            dispatcher.gate(
-                HookEvent::MessageSending,
-                json!({"arguments":{"message":"x".repeat(crate::MAX_MESSAGE_BYTES + 1)}})
-            ),
-            HookDecision::Deny(_)
-        ));
-    }
-
-    #[test]
-    fn hook_config_validation_rejects_security_boundaries() {
-        let _directory = tempfile::tempdir().unwrap();
-        let valid = || {
-            test_hook(
-                "valid",
+        let (pipeline, _) = test_pipeline(
+            directory.path(),
+            vec![definition(
+                "failure",
                 HookEvent::ToolDispatching,
-                HookKind::Gate,
-                vec!["/usr/bin/true".into()],
-            )
-        };
-
-        let mut config = HookConfig {
-            version: 2,
-            revision: String::new(),
-            hooks: vec![valid()],
-        };
-        assert!(config.validate().is_err());
-        config.version = 1;
-        config.hooks = (0..65)
-            .map(|index| {
-                test_hook(
-                    &format!("hook-{index}"),
-                    HookEvent::ToolDispatching,
-                    HookKind::Gate,
-                    vec!["/usr/bin/true".into()],
-                )
-            })
-            .collect();
-        assert!(config.validate().is_err());
-        config.hooks = vec![test_hook(
-            "non-ascii-ä",
-            HookEvent::ToolDispatching,
-            HookKind::Gate,
-            vec!["/usr/bin/true".into()],
-        )];
-        assert!(config.validate().is_err());
-        config.hooks = vec![test_hook(
-            "relative",
-            HookEvent::ToolDispatching,
-            HookKind::Gate,
-            vec!["echo".into()],
-        )];
-        assert!(config.validate().is_err());
-        config.hooks = vec![HookDefinition {
-            timeout_ms: Some(30_001),
-            ..valid()
-        }];
-        assert!(config.validate().is_err());
+                CoreHookKind::Gate,
+                vec!["/usr/bin/false".to_owned()],
+            )],
+        );
+        assert!(matches!(
+            pipeline.control_tool_dispatch(tool_input("read", json!({})), validate_object),
+            Err(HookControlError::Denied(message)) if message.contains("failure")
+        ));
     }
 
     #[test]
-    fn event_specific_transforms_cannot_widen_their_contract() {
-        assert!(transform_is_valid(
+    fn malformed_gate_response_fails_closed() {
+        if !sandbox_available() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let (pipeline, _) = test_pipeline(
+            directory.path(),
+            vec![definition(
+                "malformed",
+                HookEvent::ToolDispatching,
+                CoreHookKind::Gate,
+                vec!["/bin/echo".to_owned(), "not-json".to_owned()],
+            )],
+        );
+        assert!(
+            pipeline
+                .control_tool_dispatch(tool_input("read", json!({})), validate_object)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn failed_transform_preserves_original_payload() {
+        if !sandbox_available() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let (pipeline, _) = test_pipeline(
+            directory.path(),
+            vec![definition(
+                "failure",
+                HookEvent::ToolDispatching,
+                CoreHookKind::Transform,
+                vec!["/usr/bin/false".to_owned()],
+            )],
+        );
+        let original = json!({"path":"README.md"});
+        assert_eq!(
+            pipeline
+                .control_tool_dispatch(tool_input("read", original.clone()), validate_object)
+                .unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn invalid_transformed_handler_input_preserves_then_validates_original() {
+        if !sandbox_available() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let (pipeline, _) = test_pipeline(
+            directory.path(),
+            vec![definition(
+                "invalid",
+                HookEvent::ToolDispatching,
+                CoreHookKind::Transform,
+                vec![
+                    "/bin/echo".to_owned(),
+                    r#"{"arguments":"not-an-object"}"#.to_owned(),
+                ],
+            )],
+        );
+        let original = json!({"path":"README.md"});
+        assert_eq!(
+            pipeline
+                .control_tool_dispatch(tool_input("read", original.clone()), validate_object)
+                .unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn message_transform_changes_only_body_not_target() {
+        if !sandbox_available() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let changed_target = definition(
+            "target",
             HookEvent::MessageSending,
-            &json!({"arguments":{"target":"child", "message":"old"}}),
-            &json!({"arguments":{"target":"child", "message":"new"}})
-        ));
-        assert!(!transform_is_valid(
+            CoreHookKind::Transform,
+            vec![
+                "/bin/echo".to_owned(),
+                r#"{"arguments":{"target":"other","message":"changed"}}"#.to_owned(),
+            ],
+        );
+        let (pipeline, _) = test_pipeline(directory.path(), vec![changed_target]);
+        let original = json!({"target":"parent","message":"original"});
+        assert_eq!(
+            pipeline
+                .control_message_send(
+                    tool_input("send_message", original.clone()),
+                    validate_object
+                )
+                .unwrap(),
+            original
+        );
+
+        let body_only = definition(
+            "body",
             HookEvent::MessageSending,
-            &json!({"arguments":{"target":"child", "message":"old"}}),
-            &json!({"arguments":{"target":"other", "message":"new"}})
-        ));
+            CoreHookKind::Transform,
+            vec![
+                "/bin/echo".to_owned(),
+                r#"{"arguments":{"target":"parent","message":"changed"}}"#.to_owned(),
+            ],
+        );
+        let (pipeline, _) = test_pipeline(directory.path(), vec![body_only]);
+        assert_eq!(
+            pipeline
+                .control_message_send(tool_input("send_message", original), validate_object)
+                .unwrap(),
+            json!({"target":"parent","message":"changed"})
+        );
+    }
+
+    #[test]
+    fn spawn_transform_may_tighten_but_not_widen_policy() {
+        if !sandbox_available() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let original = json!({
+            "name":"worker", "role":"review", "task":"check",
+            "provider":null, "model":null, "permission_level":"full",
+            "enabled_tools":["read","write"], "trusted_extensions":["safe"]
+        });
+        let tighten = definition(
+            "tighten",
+            HookEvent::AgentSpawning,
+            CoreHookKind::Transform,
+            vec![
+                "/bin/echo".to_owned(),
+                r#"{"arguments":{"name":"worker","role":"review","task":"check","provider":null,"model":null,"permission_level":"controlled","enabled_tools":["read"],"trusted_extensions":["safe"]}}"#.to_owned(),
+            ],
+        );
+        let (pipeline, _) = test_pipeline(directory.path(), vec![tighten]);
+        let tightened = pipeline
+            .control_agent_spawn(tool_input("spawn_agent", original), validate_object)
+            .unwrap();
+        assert_eq!(tightened["permission_level"], "controlled");
+        assert_eq!(tightened["enabled_tools"], json!(["read"]));
+
+        let widen = definition(
+            "widen",
+            HookEvent::AgentSpawning,
+            CoreHookKind::Transform,
+            vec![
+                "/bin/echo".to_owned(),
+                r#"{"arguments":{"name":"worker","role":"review","task":"check","provider":null,"model":null,"permission_level":"full","enabled_tools":["read","write"],"trusted_extensions":["safe"]}}"#.to_owned(),
+            ],
+        );
+        let (pipeline, _) = test_pipeline(directory.path(), vec![widen]);
+        let controlled = json!({
+            "name":"worker", "role":"review", "task":"check",
+            "provider":null, "model":null, "permission_level":"controlled",
+            "enabled_tools":["read"], "trusted_extensions":["safe"]
+        });
+        assert_eq!(
+            pipeline
+                .control_agent_spawn(
+                    tool_input("spawn_agent", controlled.clone()),
+                    validate_object
+                )
+                .unwrap(),
+            controlled
+        );
+    }
+
+    #[test]
+    fn spawn_transform_cannot_change_name_task_or_model_identity() {
+        let original = json!({"name":"worker","task":"check","provider":"p","model":"m"});
         assert!(
             validate_transform(
                 HookEvent::AgentSpawning,
-                &json!({
-                    "name":"worker",
-                    "task":"task",
-                    "permission_level":"controlled",
-                    "enabled_tools":["read", "bash"]
-                }),
-                &json!({
-                    "name":"worker",
-                    "task":"task",
-                    "permission_level":"read_only",
-                    "enabled_tools":["read"]
-                })
+                &original,
+                &json!({"name":"admin","task":"escape","provider":"p2","model":"m2"})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn interaction_transform_requires_nonempty_bounded_answer() {
+        let original = json!({"decision":null});
+        assert!(
+            validate_transform(
+                HookEvent::InteractionResolving,
+                &original,
+                &json!({"decision":"answer"})
             )
             .is_ok()
         );
         assert!(
             validate_transform(
-                HookEvent::AgentSpawning,
-                &json!({"name":"worker", "task":"task", "permission_level":"controlled"}),
-                &json!({"name":"worker", "task":"changed", "permission_level":"read_only"})
+                HookEvent::InteractionResolving,
+                &original,
+                &json!({"decision":""})
             )
             .is_err()
         );
+        assert!(
+            validate_transform(
+                HookEvent::InteractionResolving,
+                &original,
+                &json!({"decision":"x".repeat(4097)})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn builtin_floor_rejects_invalid_message_and_spawn() {
+        let directory = tempfile::tempdir().unwrap();
+        let (pipeline, _) = test_pipeline(directory.path(), Vec::new());
+        assert!(
+            pipeline
+                .control_message_send(
+                    tool_input("send_message", json!({"target":"parent","message":" "})),
+                    validate_object,
+                )
+                .is_err()
+        );
+        assert!(
+            pipeline
+                .control_agent_spawn(
+                    tool_input("spawn_agent", json!({"name":"","task":"work"})),
+                    validate_object,
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn host_audit_adapter_records_metadata_only_outcome() {
+        if !sandbox_available() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let (pipeline, receiver) = test_pipeline(
+            directory.path(),
+            vec![definition(
+                "allow",
+                HookEvent::ToolDispatching,
+                CoreHookKind::Gate,
+                vec!["/bin/echo".to_owned(), "{}".to_owned()],
+            )],
+        );
+        let _ = pipeline.control_tool_dispatch(tool_input("read", json!({})), validate_object);
+        let records = receiver.try_iter().collect::<Vec<_>>();
+        assert!(records.iter().any(|record| {
+            record.hook_id == "allow"
+                && record.event == HookEvent::ToolDispatching
+                && record.outcome == CoreAuditOutcome::Allowed
+                && !record.output_truncated
+                && record.revision == "revision-test"
+        }));
+    }
+
+    #[test]
+    fn observe_stop_and_finalize_are_bounded() {
+        if !sandbox_available() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let (pipeline, _) = test_pipeline(
+            directory.path(),
+            vec![definition(
+                "observe",
+                HookEvent::ToolCompleted,
+                CoreHookKind::Observe,
+                vec!["/usr/bin/true".to_owned()],
+            )],
+        );
+        let started = Instant::now();
+        pipeline.observe(HookObservation::new(
+            HookEvent::ToolCompleted,
+            actor(),
+            json!({"tool":"read","success":true}),
+        ));
+        pipeline.stop_observers();
+        pipeline.observe(HookObservation::new(
+            HookEvent::ToolCompleted,
+            actor(),
+            json!({"tool":"read","success":false}),
+        ));
+        pipeline.finalize(HookObservation::new(
+            HookEvent::ToolCompleted,
+            actor(),
+            json!({"tool":"read","success":true}),
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn authenticated_context_is_separate_and_private_arguments_are_restored() {
+        if !sandbox_available() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("inspect.sh");
+        write_executable(
+            &script,
+            "#!/bin/sh\nread request\ncase \"$request\" in *approval-secret*|*capability-secret*) printf '{\"decision\":\"deny\",\"message\":\"secret leaked\"}\\n' ;; *) printf '{}\\n' ;; esac\n",
+        );
+        let (pipeline, _) = test_pipeline(
+            directory.path(),
+            vec![definition(
+                "inspect",
+                HookEvent::ToolDispatching,
+                CoreHookKind::Gate,
+                vec![script.to_string_lossy().into_owned()],
+            )],
+        );
+        let original = json!({
+            "command":"echo ok",
+            "approval_ticket":"approval-secret",
+            "nested":{"capability":"capability-secret"}
+        });
+        assert_eq!(
+            pipeline
+                .control_tool_dispatch(tool_input("bash", original.clone()), validate_object)
+                .unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn gate_observes_final_transformed_payload_not_pretransform_payload() {
+        if !sandbox_available() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let gate_script = directory.path().join("gate.sh");
+        write_executable(
+            &gate_script,
+            "#!/bin/sh\nread request\ncase \"$request\" in *\\\"changed\\\":true*) printf '{\"decision\":\"deny\",\"message\":\"saw final payload\"}\\n' ;; *) printf '{}\\n' ;; esac\n",
+        );
+        let hooks = vec![
+            definition(
+                "gate",
+                HookEvent::ToolDispatching,
+                CoreHookKind::Gate,
+                vec![gate_script.to_string_lossy().into_owned()],
+            ),
+            definition(
+                "transform",
+                HookEvent::ToolDispatching,
+                CoreHookKind::Transform,
+                vec![
+                    "/bin/echo".to_owned(),
+                    r#"{"arguments":{"changed":true}}"#.to_owned(),
+                ],
+            ),
+        ];
+        let (pipeline, _) = test_pipeline(directory.path(), hooks);
+        assert!(matches!(
+            pipeline.control_tool_dispatch(
+                tool_input("read", json!({"changed":false})),
+                validate_object
+            ),
+            Err(HookControlError::Denied(message)) if message.contains("saw final payload")
+        ));
+    }
+
+    #[test]
+    fn same_event_reentrancy_fails_closed_without_recursive_invocation() {
+        if !sandbox_available() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let (pipeline, _) = test_pipeline(
+            directory.path(),
+            vec![definition(
+                "allow",
+                HookEvent::ToolDispatching,
+                CoreHookKind::Gate,
+                vec!["/bin/echo".to_owned(), "{}".to_owned()],
+            )],
+        );
+        let _guard = ReentrancyGuard::enter(
+            ReentrancyKind::Invocation,
+            event_name(HookEvent::ToolDispatching),
+        )
+        .unwrap();
+        assert!(
+            pipeline
+                .control_tool_dispatch(tool_input("read", json!({})), validate_object)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn entrypoint_fingerprint_uses_sha256_contract() {
+        let fingerprint = Sha256::digest(b"#!/bin/sh\nprintf '{}\\n'\n")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(fingerprint.len(), 64);
+        assert!(fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn external_executor_is_not_duplicated_in_agent_team() {
+        let source = include_str!("hooks.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        assert!(!production.contains(&["Command", "::new"].concat()));
+        assert!(!production.contains(&["sandbox", "_profile"].concat()));
+        assert!(!production.contains(&["std::", "process"].concat()));
+        assert!(!production.contains(&["fn ", "invoke("].concat()));
     }
 }

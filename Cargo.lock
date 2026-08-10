@@ -4641,6 +4641,7 @@ dependencies = [
  "image",
  "libc",
  "pi-whim-core",
+ "pi-whim-hook-host",
  "pi-whim-tool-protocol",
  "serde",
  "serde_json",
