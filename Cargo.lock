@@ -4728,6 +4728,7 @@ dependencies = [
  "gpui_platform",
  "pi-whim-core",
  "pi-whim-engine",
+ "pi-whim-signal",
  "pi-whim-theme",
  "serde_json",
  "uuid",

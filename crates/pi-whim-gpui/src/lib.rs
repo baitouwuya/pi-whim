@@ -16,10 +16,12 @@ pub mod fonts;
 pub mod icons;
 pub mod pump;
 pub mod settings;
+pub mod signal_bridge;
 pub mod theme;
 
 mod workspace;
 
+pub use signal_bridge::{SignalBridge, StateSignalBridge};
 pub use workspace::{Request, RequestsRaised, Workspace};
 
 use gpui::{App, Bounds, WindowBounds, WindowOptions, px, size};
