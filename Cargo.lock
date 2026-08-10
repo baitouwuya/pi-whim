@@ -4668,6 +4668,7 @@ dependencies = [
  "pi-whim-core",
  "pi-whim-engine",
  "pi-whim-gpui",
+ "pi-whim-hook-host",
  "pi-whim-one-shot-ai",
  "pi-whim-persistence",
  "pi-whim-runtime",
