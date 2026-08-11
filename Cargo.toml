@@ -14,6 +14,7 @@ members = [
   "crates/pi-whim-signal",
   "crates/pi-whim-theme",
   "crates/pi-whim-tool-protocol",
+  "crates/pi-whim-wait",
   "xtask",
 ]
 resolver = "2"
