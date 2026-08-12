@@ -1,73 +1,126 @@
 # Pi-Whim
 
-Pi-Whim is a native Rust desktop workbench for the [Pi coding agent](https://pi.dev).
-It owns project navigation, session history, credentials, and presentation while Pi
-continues to own the agent loop and JSONL session format.
+> A native Rust desktop workbench for the [Pi coding agent](https://pi.dev).
 
-## Development
+[English](#english) | [中文](#chinese)
 
-1. Install Rust stable, Node.js 22.19 or newer, and Bun.
-2. Initialise the source dependency: `git submodule update --init --recursive`.
-3. Build Pi once: `cargo run -p xtask -- pi-build`.
-4. Start the application: `cargo run -p pi-whim-app`.
+---
 
-`PI_WHIM_PI_BIN` can point to a standalone Pi binary during development. Otherwise
-the application looks for the Pi build under `vendor/pi-mono`.
+## English
 
-## Architecture
+Pi-Whim is a macOS desktop application that wraps the Pi coding agent in a native
+Rust UI built with [gpui](https://github.com/zed-industries/zed). It owns project
+navigation, session history, credential storage, and presentation, while Pi
+continues to own the agent loop and its JSONL session format.
 
-- `pi-whim-core`: application domain and reducer.
-- `pi-whim-agent-team`: authenticated team topology, routing, quotas, and Pi process supervision.
-- `pi-whim-persistence`: SQLite project/session index and Keychain secrets.
-- `pi-whim-pi-rpc`: strict LF JSONL transport for Pi RPC mode.
-- `pi-whim-runtime`: UI-facing `AgentRuntime` abstraction and Pi adapter.
-- `pi-whim-tool-protocol`: versioned JSONL protocol used by the local agent tool host.
-- `pi-whim-catalog`: model capability lookup, online and bundled.
-- `pi-whim-engine`: session pool, Pi protocol translation, and state ownership.
-- `pi-whim-theme`: design tokens for both themes.
-- `pi-whim-gpui`: gpui views.
-- `pi-whim-app`: native executable, window, and wiring.
+### Features
 
-Pi is kept as a Git submodule in `vendor/pi-mono`. The initial checkout uses upstream
-unchanged; a project-owned fork can later replace its `origin` while `upstream` stays
-pointed to the official repository.
+- **Multi-agent teams** — subagents run under `sandbox-exec` with capability-based
+  auth, per-process API keys, and a hierarchical permission model.
+- **Provider agnostic** — add OpenAI, Anthropic, Google, or any OpenAI-compatible
+  proxy. Discovery is optional; model IDs can be added manually.
+- **Web search & fetch** — pluggable SearXNG engines and a bounded `fetch` tool
+  (HTTP, TCP, UDP, WebSocket).
+- **Supervisor hooks** — sandboxed external gate, transform, and observe commands
+  for policy, telemetry, and audit.
+- **Session persistence** — SQLite metadata index with JSONL session files owned
+  by Pi under the macOS application support directory.
+- **Keychain integration** — API keys are stored only in macOS Keychain and
+  injected by environment variable name at process launch.
 
-See [Agent teams](docs/agent-teams.md) for hierarchy, communication, model selection,
-and concurrency rules.
+### Prerequisites
 
-## Providers
+- Rust stable (edition 2024)
+- Node.js 22.19+ and Bun
+- macOS (the UI uses gpui, which is macOS-native)
 
-Open Settings > Providers to add a provider with a name, Base URL, API key, request
-protocol, and one or more models. The presets only fill these fields; they do not add
-credentials or make network requests.
+### Quick Start
 
-- `OpenAI Chat Completions` is the broadest OpenAI-compatible choice and discovers
-  models from `GET <base-url>/models` using `Authorization: Bearer <key>`.
-- `OpenAI Responses` uses the same discovery endpoint but selects Pi's
-  `openai-responses` request shape.
-- `Anthropic Messages` discovers through `GET <base-url>/v1/models`, with
-  `x-api-key` and `anthropic-version: 2023-06-01`.
-- `Google Generative AI` discovers through `GET <base-url>/models`, with
-  `x-goog-api-key`; `models/` prefixes are removed from returned IDs.
+```bash
+git submodule update --init --recursive
+cargo run -p xtask -- pi-build
+cargo run -p pi-whim-app
+```
 
-Discovery is optional: proxies do not always expose a catalogue, so a model ID can
-always be added manually. Provider metadata and model IDs are stored in SQLite; the
-API key is stored only in macOS Keychain. Before Pi starts, Pi-Whim writes an
-application-owned `models.json` containing environment-variable references, then
-injects each key only into that Pi process.
+Set `PI_WHIM_PI_BIN` to a standalone Pi binary for development. Otherwise the
+application looks for the Pi build under `vendor/pi-mono`.
 
-## Web Search
+### Architecture
 
-Open Settings > Web Search to add one or more SearXNG base URLs. Engines are tried in
-the displayed order: temporary errors (including timeouts, HTTP 429, and 5xx responses)
-fall through to the next enabled engine, while valid empty results are returned as-is.
-Use the test action to verify an endpoint before saving; the `web_search` agent tool
-returns only result titles, URLs, and snippets.
+The workspace contains 15 crates in a strict acyclic layering enforced by Cargo
+dependency edges:
 
-## Network Fetch
+| Layer | Crates |
+|-------|--------|
+| Foundation | `pi-whim-core`, `pi-whim-tool-protocol`, `pi-whim-pi-rpc`, `pi-whim-theme`, `pi-whim-signal`, `pi-whim-wait` |
+| Hook foundation | `pi-whim-hook-host` |
+| Mid | `pi-whim-persistence`, `pi-whim-catalog`, `pi-whim-one-shot-ai`, `pi-whim-agent-team` |
+| Upper | `pi-whim-runtime`, `pi-whim-engine`, `pi-whim-gpui`, `pi-whim-app` |
 
-The agent `fetch` tool makes a bounded one-shot HTTP(S), TCP, UDP, or WebSocket request.
-It supports text and Base64 payloads, limits request bodies to 256 KiB and responses to 1 MiB,
-and caps a call at 30 seconds. WebSocket calls send at most one message and read one reply, so
-they do not retain sockets or state between agent tool calls. `fetch` is available to controlled
-and full agents; read-only agents retain access to `web_search` only.
+The UI talks only to `AgentRuntime`; the engine produces results on a background
+thread and re-posts onto the gpui async loop. Subagents run Pi with `--no-session`
+so the level-0 session index remains non-recursive.
+
+See [docs/architecture.md](docs/architecture.md) for the full design rationale.
+
+### License
+
+MIT
+
+---
+
+## 中文
+
+Pi-Whim 是一个 macOS 桌面应用，使用 Rust 和 [gpui](https://github.com/zed-industries/zed)
+构建，为 [Pi 编程助手](https://pi.dev) 提供原生桌面体验。它管理项目导航、会话历史、
+凭据存储和界面展示，而 Pi 继续负责代理循环和 JSONL 会话格式。
+
+### 功能特性
+
+- **多代理团队** — 子代理在 `sandbox-exec` 下运行，使用基于能力的认证、进程级 API
+  密钥注入和分层权限模型。
+- **多提供商支持** — 可添加 OpenAI、Anthropic、Google 或任意 OpenAI 兼容代理。
+  模型发现是可选的，支持手动添加模型 ID。
+- **网络搜索与抓取** — 可插拔的 SearXNG 搜索引擎，以及受限的 `fetch` 工具
+  （HTTP、TCP、UDP、WebSocket）。
+- **监督者钩子** — 沙盒化的外部网关、转换和观察命令，用于策略、遥测和审计。
+- **会话持久化** — SQLite 元数据索引 + Pi 管理的 JSONL 会话文件，
+  存储在 macOS 应用支持目录下。
+- **钥匙串集成** — API 密钥仅存储在 macOS 钥匙串中，在进程启动时以环境变量名注入。
+
+### 环境要求
+
+- Rust stable（edition 2024）
+- Node.js 22.19+ 和 Bun
+- macOS（UI 基于 gpui，仅支持 macOS）
+
+### 快速开始
+
+```bash
+git submodule update --init --recursive
+cargo run -p xtask -- pi-build
+cargo run -p pi-whim-app
+```
+
+开发时可设置 `PI_WHIM_PI_BIN` 指向独立的 Pi 二进制文件。否则应用会在 `vendor/pi-mono`
+下查找 Pi 构建产物。
+
+### 架构
+
+工作区包含 15 个 crate，通过 Cargo 依赖边强制实现严格的无环分层：
+
+| 层 | Crate |
+|-----|-------|
+| 基础层 | `pi-whim-core`、`pi-whim-tool-protocol`、`pi-whim-pi-rpc`、`pi-whim-theme`、`pi-whim-signal`、`pi-whim-wait` |
+| 钩子基础层 | `pi-whim-hook-host` |
+| 中间层 | `pi-whim-persistence`、`pi-whim-catalog`、`pi-whim-one-shot-ai`、`pi-whim-agent-team` |
+| 上层 | `pi-whim-runtime`、`pi-whim-engine`、`pi-whim-gpui`、`pi-whim-app` |
+
+UI 仅与 `AgentRuntime` 通信；引擎在后台线程生成结果，然后重新投递到 gpui 异步循环。
+子代理以 `--no-session` 运行 Pi，因此 level-0 会话索引保持非递归。
+
+详见 [docs/architecture.md](docs/architecture.md)。
+
+### 许可证
+
+MIT
